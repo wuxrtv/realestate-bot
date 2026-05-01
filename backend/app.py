@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from admin_agent import AdminAgent, is_admin
 from claude_agent import ConversationManager
 from database import SessionLocal, get_db, init_db
 from models import Appointment, Lead, Property
@@ -36,6 +37,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 conversation_manager = ConversationManager()
+admin_agent = AdminAgent()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 
@@ -212,8 +214,8 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     if not text:
         return {"ok": True}
 
-    # /start — show language selection buttons
-    if text.strip() == "/start":
+    # /start — show language selection buttons (only for regular users)
+    if text.strip() == "/start" and not is_admin(user_id):
         agency = os.getenv("AGENCY_NAME", "Агентство недвижимости")
         await send_message_with_keyboard(
             user_id,
@@ -224,6 +226,17 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
     await send_typing(user_id)
 
+    # ── Admin route ───────────────────────────────────────────────────────────
+    if is_admin(user_id):
+        try:
+            reply = await admin_agent.process(user_id=user_id, message=text, db=db)
+            await send_message(user_id, reply)
+        except Exception as e:
+            logger.exception(f"Admin agent error: {e}")
+            await send_message(user_id, f"Ошибка: {e}")
+        return {"ok": True}
+
+    # ── Regular client route ──────────────────────────────────────────────────
     try:
         result = await conversation_manager.process_message(
             user_id=user_id,
