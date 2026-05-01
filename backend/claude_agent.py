@@ -185,7 +185,7 @@ TOOLS = [
 
 class ConversationManager:
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        self.client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         self.property_service = None
 
     def _get_property_service(self, db: Session) -> PropertyService:
@@ -342,7 +342,7 @@ class ConversationManager:
 
         max_iterations = 6
         for _ in range(max_iterations):
-            response = self.client.messages.create(
+            response = await self.client.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=1500,
                 system=[
