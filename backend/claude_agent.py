@@ -191,6 +191,16 @@ class ConversationManager:
     def _get_property_service(self, db: Session) -> PropertyService:
         return PropertyService(db)
 
+    @staticmethod
+    def _serialize_blocks(content) -> list:
+        result = []
+        for block in content:
+            if block.type == "text":
+                result.append({"type": "text", "text": block.text})
+            elif block.type == "tool_use":
+                result.append({"type": "tool_use", "id": block.id, "name": block.name, "input": block.input})
+        return result
+
     def _get_or_create_conversation(self, db: Session, user_id: str, platform: str) -> Conversation:
         conv = db.query(Conversation).filter(Conversation.user_id == user_id).first()
         if not conv:
@@ -357,7 +367,7 @@ class ConversationManager:
             )
 
             # Append assistant message to history
-            history.append({"role": "assistant", "content": response.content})
+            history.append({"role": "assistant", "content": self._serialize_blocks(response.content)})
 
             if response.stop_reason == "end_turn":
                 break
