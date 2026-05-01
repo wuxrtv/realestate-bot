@@ -23,7 +23,14 @@ from scheduler_service import (
     get_followup_leads,
     get_price_drop_notifications,
 )
-from telegram_bot import dispatch_response, send_message, send_typing, set_webhook
+from telegram_bot import (
+    answer_callback_query,
+    dispatch_response,
+    send_message,
+    send_message_with_keyboard,
+    send_typing,
+    set_webhook,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -146,12 +153,54 @@ app.add_middleware(
 
 # ─── Telegram webhook endpoint ────────────────────────────────────────────────
 
+WELCOME_KEYBOARD = [
+    [
+        {"text": "🇷🇺 Здравствуйте", "callback_data": "greet_ru"},
+        {"text": "🇺🇿 Салом", "callback_data": "greet_uz"},
+    ]
+]
+
+WELCOME_TEXT = (
+    "👋 Добро пожаловать в *{agency}*!\n"
+    "Xush kelibsiz *{agency}*ga!\n\n"
+    "Выберите язык / Tilni tanlang:"
+)
+
+
 @app.post("/telegram/webhook")
 async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     """Telegram sends every user message here."""
     data = await request.json()
 
-    # Support message and edited_message
+    # ── Handle inline button presses ──────────────────────────────────────────
+    if callback := data.get("callback_query"):
+        user_id = str(callback["from"]["id"])
+        first_name = callback["from"].get("first_name", "")
+        cb_data = callback.get("data", "")
+        await answer_callback_query(callback["id"])
+
+        text_map = {
+            "greet_ru": "Здравствуйте",
+            "greet_uz": "Салом",
+        }
+        text = text_map.get(cb_data)
+        if not text:
+            return {"ok": True}
+
+        await send_typing(user_id)
+        try:
+            result = await conversation_manager.process_message(
+                user_id=user_id,
+                message=text,
+                platform="telegram",
+                db=db,
+            )
+            await dispatch_response(user_id, result, client_name=first_name)
+        except Exception as e:
+            logger.exception(f"Callback error for user {user_id}: {e}")
+        return {"ok": True}
+
+    # ── Handle regular messages ────────────────────────────────────────────────
     message = data.get("message") or data.get("edited_message")
     if not message:
         return {"ok": True}
@@ -163,7 +212,16 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     if not text:
         return {"ok": True}
 
-    # Show typing indicator while Claude thinks
+    # /start — show language selection buttons
+    if text.strip() == "/start":
+        agency = os.getenv("AGENCY_NAME", "Агентство недвижимости")
+        await send_message_with_keyboard(
+            user_id,
+            WELCOME_TEXT.format(agency=agency),
+            WELCOME_KEYBOARD,
+        )
+        return {"ok": True}
+
     await send_typing(user_id)
 
     try:
@@ -178,7 +236,7 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         logger.exception(f"Error for user {user_id}: {e}")
         await send_message(
             user_id,
-            "Извините, произошла ошибка. Попробуйте написать ещё раз или позвоните нам.",
+            "Извините, произошла ошибка. Попробуйте написать ещё раз.",
         )
 
     return {"ok": True}

@@ -256,7 +256,21 @@ class ConversationManager:
 
         if tool_name == "save_lead":
             self._upsert_lead(db, user_id, tool_input)
-            return {"saved": True, "message": "Данные клиента сохранены в CRM"}
+            result = {"saved": True, "message": "Данные клиента сохранены в CRM"}
+            if tool_input.get("phone"):
+                goal_map = {"buy": "покупка", "rent": "аренда", "sell": "продажа", "lease_out": "сдача"}
+                goal_label = goal_map.get(tool_input.get("goal", ""), tool_input.get("goal", "—"))
+                result["_notify_agent"] = True
+                result["_agent_summary"] = (
+                    f"📋 *Новый лид*\n"
+                    f"👤 Имя: {tool_input.get('name', '—')}\n"
+                    f"📞 Телефон: {tool_input.get('phone', '—')}\n"
+                    f"🎯 Цель: {goal_label}\n"
+                    f"📍 Район: {tool_input.get('area', '—')}\n"
+                    f"💰 Бюджет: {tool_input.get('budget_max', '—')}\n"
+                    f"🏠 Тип: {tool_input.get('property_type', '—')}"
+                )
+            return result
 
         if tool_name == "book_viewing":
             result = self._create_appointment(db, user_id, tool_input)
@@ -411,6 +425,10 @@ class ConversationManager:
                     if block.name == "transfer_to_agent":
                         transfer_to_agent = True
                         agent_summary = block.input.get("summary", "")
+
+                    if block.name == "save_lead" and result.get("_notify_agent"):
+                        transfer_to_agent = True
+                        agent_summary = result.get("_agent_summary", "")
 
                     if block.name == "book_viewing" and result.get("booked"):
                         appointment_confirmed = True

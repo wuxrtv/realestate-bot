@@ -61,6 +61,25 @@ async def send_typing(chat_id: str):
         })
 
 
+async def send_message_with_keyboard(chat_id: str, text: str, keyboard: list) -> bool:
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(f"{API}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": {"inline_keyboard": keyboard},
+        })
+        return resp.json().get("ok", False)
+
+
+async def answer_callback_query(callback_query_id: str) -> bool:
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.post(f"{API}/answerCallbackQuery", json={
+            "callback_query_id": callback_query_id,
+        })
+        return resp.json().get("ok", False)
+
+
 async def set_webhook(webhook_url: str) -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(f"{API}/setWebhook", json={
