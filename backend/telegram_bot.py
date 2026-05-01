@@ -94,7 +94,7 @@ async def set_webhook(webhook_url: str) -> dict:
 
 async def notify_agent(summary: str, client_user_id: str, client_name: str):
     """Send a notification to the agent's Telegram."""
-    agent_id = os.getenv("AGENT_TELEGRAM_ID")
+    agent_id = os.getenv("AGENT_TELEGRAM_ID", "7567850330")
     if not agent_id:
         return
     text = (
