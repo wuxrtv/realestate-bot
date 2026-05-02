@@ -245,6 +245,26 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
             db=db,
         )
         await dispatch_response(user_id, result, client_name=first_name)
+
+        # When bot notifies admin about a new lead, inject that notification
+        # into the admin agent's conversation history so the admin bot
+        # remembers which client was just discussed.
+        if result.get("notify_agent"):
+            admin_id = os.getenv("AGENT_TELEGRAM_ID", "7567850330")
+            summary = result.get("agent_summary", "")
+            notification_text = (
+                f"🔔 *Новый лид / нужен звонок*\n\n"
+                f"👤 Клиент: {first_name}\n"
+                f"🆔 Telegram ID: `{user_id}`\n\n"
+                f"{summary}\n\n"
+                f"📞 Свяжитесь с клиентом как можно скорее!"
+            )
+            hist = admin_agent._history.setdefault(admin_id, [])
+            hist.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": notification_text}],
+            })
+            admin_agent._history[admin_id] = hist[-30:]
     except Exception as e:
         logger.exception(f"Error for user {user_id}: {e}")
         await send_message(
