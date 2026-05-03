@@ -32,6 +32,10 @@ from telegram_bot import (
     send_typing,
     set_webhook,
 )
+from whatsapp import (
+    send_message as wa_send_message,
+    set_webhook as wa_set_webhook,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,6 +91,36 @@ async def job_followups():
         db.close()
 
 
+async def job_whatsapp_broadcast():
+    group_id = os.getenv("WHATSAPP_GROUP_ID", "")
+    if not group_id:
+        return
+    db = SessionLocal()
+    try:
+        props = (
+            db.query(Property)
+            .filter(Property.status == "active")
+            .order_by(Property.id.desc())
+            .limit(3)
+            .all()
+        )
+        if not props:
+            return
+        lines = ["🏠 *Актуальные объекты недвижимости:*\n"]
+        for p in props:
+            if p.listing_type == "rent" and p.rent_price:
+                price = f"{p.rent_price:,.0f} $/мес".replace(",", " ")
+            elif p.price:
+                price = f"{p.price:,.0f} $".replace(",", " ")
+            else:
+                price = "цена по запросу"
+            lines.append(f"• {p.title}\n  📍 {p.area or p.address or '—'}\n  💰 {price}\n")
+        lines.append("Напишите нам, чтобы узнать подробности или записаться на просмотр!")
+        await wa_send_message(group_id, "\n".join(lines))
+    finally:
+        db.close()
+
+
 async def job_price_drops():
     db = SessionLocal()
     try:
@@ -127,10 +161,17 @@ async def lifespan(app: FastAPI):
         await set_webhook(webhook_url)
         logger.info(f"Telegram webhook set: {webhook_url}")
 
+    # Register WhatsApp webhook
+    if railway_url and os.getenv("GREEN_API_TOKEN"):
+        wa_webhook_url = f"https://{railway_url}/whatsapp/webhook"
+        await wa_set_webhook(wa_webhook_url)
+        logger.info(f"WhatsApp webhook set: {wa_webhook_url}")
+
     # Start background scheduler
     scheduler.add_job(job_reminders, "interval", minutes=15, id="reminders")
     scheduler.add_job(job_followups, "interval", hours=1, id="followups")
     scheduler.add_job(job_price_drops, "cron", hour=9, minute=0, id="price_drops")
+    scheduler.add_job(job_whatsapp_broadcast, "interval", hours=3, id="wa_broadcast")
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -271,6 +312,75 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
             user_id,
             "Извините, произошла ошибка. Попробуйте написать ещё раз.",
         )
+
+    return {"ok": True}
+
+
+# ─── WhatsApp webhook ────────────────────────────────────────────────────────
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
+    """Green API sends every incoming WhatsApp message here."""
+    data = await request.json()
+
+    # Only process incoming text messages
+    if data.get("typeWebhook") != "incomingMessageReceived":
+        return {"ok": True}
+
+    msg_data = data.get("messageData", {})
+    if msg_data.get("typeMessage") != "textMessage":
+        return {"ok": True}
+
+    text = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
+    if not text:
+        return {"ok": True}
+
+    sender = data.get("senderData", {})
+    chat_id = sender.get("chatId", "")
+    sender_name = sender.get("senderName", "") or sender.get("chatName", "")
+
+    if not chat_id:
+        return {"ok": True}
+
+    # Prefix with "wa_" to keep WhatsApp histories separate from Telegram
+    wa_user_id = f"wa_{chat_id}"
+
+    try:
+        result = await conversation_manager.process_message(
+            user_id=wa_user_id,
+            message=text,
+            platform="whatsapp",
+            db=db,
+        )
+
+        for msg in result.get("messages", []):
+            if msg["type"] == "text":
+                await wa_send_message(chat_id, msg["content"])
+            elif msg["type"] == "photo":
+                caption = msg.get("caption", "")
+                if caption:
+                    await wa_send_message(chat_id, caption)
+
+        if result.get("notify_agent"):
+            admin_id = os.getenv("AGENT_TELEGRAM_ID", "7567850330")
+            summary = result.get("agent_summary", "")
+            notification_text = (
+                f"🔔 *Новый лид из WhatsApp*\n\n"
+                f"👤 Клиент: {sender_name}\n"
+                f"📱 WhatsApp: `{chat_id}`\n\n"
+                f"{summary}\n\n"
+                f"📞 Свяжитесь с клиентом как можно скорее!"
+            )
+            await send_message(admin_id, notification_text)
+            hist = admin_agent._history.setdefault(admin_id, [])
+            hist.append({
+                "role": "assistant",
+                "content": [{"type": "text", "text": notification_text}],
+            })
+            admin_agent._history[admin_id] = hist[-30:]
+
+    except Exception as e:
+        logger.exception(f"WA error for {chat_id}: {e}")
 
     return {"ok": True}
 
