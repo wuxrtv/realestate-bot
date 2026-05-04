@@ -271,6 +271,32 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
     await send_typing(user_id)
 
+    # ── Admin: /watest — WhatsApp diagnostics ─────────────────────────────────
+    if text.strip() == "/watest" and is_admin(user_id):
+        try:
+            state = await wa_get_state()
+            instance_state = state.get("stateInstance", "unknown")
+            group_id = os.getenv("WHATSAPP_GROUP_ID", "")
+            token_ok = bool(os.getenv("GREEN_API_TOKEN"))
+
+            test_ok = False
+            if group_id and token_ok:
+                test_ok = await wa_send_message(group_id, "🔧 Тест бота — если видите это, отправка работает!")
+
+            report = (
+                f"📊 *WhatsApp Диагностика*\n\n"
+                f"🔌 Инстанс: `{instance_state}`\n"
+                f"🔑 Токен: {'✅' if token_ok else '❌ не задан'}\n"
+                f"👥 Group ID: `{group_id or 'не задан'}`\n"
+                f"📤 Тест группы: {'✅ сообщение отправлено' if test_ok else '❌ ошибка отправки'}\n\n"
+                f"Инстанс должен быть `authorized`.\n"
+                f"Если тест ✅ — посмотри появилось ли сообщение в группе."
+            )
+            await send_message(user_id, report)
+        except Exception as e:
+            await send_message(user_id, f"❌ Ошибка диагностики: {e}")
+        return {"ok": True}
+
     # ── Admin route ───────────────────────────────────────────────────────────
     if is_admin(user_id):
         try:
