@@ -18,6 +18,7 @@ from admin_agent import AdminAgent, is_admin
 from claude_agent import ConversationManager
 from database import SessionLocal, get_db, init_db
 from models import Appointment, Lead, Property
+import toni_bot
 from property_service import PropertyService
 from scheduler_service import (
     get_appointment_reminders,
@@ -174,12 +175,18 @@ async def lifespan(app: FastAPI):
         await wa_set_webhook(wa_webhook_url)
         logger.info(f"WhatsApp webhook set: {wa_webhook_url}")
 
+    # Register Toni bot webhook
+    if railway_url and os.getenv("TONI_BOT_TOKEN"):
+        await toni_bot.set_webhook(railway_url)
+
     # Start background scheduler
     scheduler.add_job(job_reminders, "interval", minutes=15, id="reminders")
     scheduler.add_job(job_followups, "interval", hours=1, id="followups")
     scheduler.add_job(job_price_drops, "cron", hour=9, minute=0, id="price_drops")
     scheduler.add_job(job_whatsapp_broadcast, "interval", hours=3, id="wa_broadcast")
     scheduler.add_job(job_whatsapp_poll, "interval", seconds=10, id="wa_poll")
+    scheduler.add_job(toni_bot.send_morning_report, "cron", hour=9, minute=0,
+                      timezone="Asia/Tashkent", id="toni_morning")
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -591,6 +598,16 @@ async def debug_wa():
         "instance_state": state,
         "pending_notification": notif,
     }
+
+
+# ─── Toni webhook ─────────────────────────────────────────────────────────────
+
+@app.post("/toni/webhook")
+async def toni_webhook(request: Request):
+    """Telegram sends all Toni bot updates here (group messages + channel posts)."""
+    data = await request.json()
+    await toni_bot.handle_update(data)
+    return {"ok": True}
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────

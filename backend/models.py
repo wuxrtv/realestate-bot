@@ -93,3 +93,30 @@ class Conversation(Base):
     last_message_at = Column(DateTime, default=func.now(), onupdate=func.now())
     follow_up_sent = Column(Boolean, default=False)
     created_at = Column(DateTime, default=func.now())
+
+
+class ToniFile(Base):
+    """File indexed from the private database channel for Toni bot."""
+    __tablename__ = "toni_files"
+
+    id = Column(Integer, primary_key=True, index=True)
+    file_id = Column(String)
+    file_unique_id = Column(String, unique=True, index=True)
+    file_name = Column(String)
+    caption = Column(Text)
+    file_type = Column(String)            # document | photo | video
+    unit_numbers = Column(_json_type, default=list)   # extracted unit numbers
+    message_id = Column(Integer)          # original message_id in the channel
+    channel_chat_id = Column(String)      # channel chat ID for copyMessage
+    created_at = Column(DateTime, default=func.now())
+
+
+class ToniGroup(Base):
+    """Agent group where Toni is present."""
+    __tablename__ = "toni_groups"
+
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(String, unique=True, index=True)
+    title = Column(String)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
