@@ -70,6 +70,8 @@ async def set_webhook(webhook_url: str) -> bool:
                 "incomingWebhook": "yes",
                 "outgoingMessageWebhook": "no",
                 "outgoingAPIMessageWebhook": "no",
+                "pollMessageWebhook": "yes",
+                "incomingCallWebhook": "no",
             },
         )
         logger.info(f"WA setWebhook result: {resp.text}")
