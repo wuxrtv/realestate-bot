@@ -17,7 +17,7 @@ from models import Property, ToniFile, ToniGroup
 
 logger = logging.getLogger(__name__)
 
-TONI_TOKEN = os.getenv("TONI_BOT_TOKEN", "")
+TONI_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TONI_API = f"https://api.telegram.org/bot{TONI_TOKEN}"
 DB_CHANNEL_ID = os.getenv("TONI_DB_CHANNEL", "")   # private channel numeric ID, e.g. "-100123456789"
 UMAR_CONTACT = os.getenv("TONI_UMAR_CONTACT", "@Umar")
@@ -314,16 +314,3 @@ async def send_morning_report():
     finally:
         db.close()
 
-
-# ─── Webhook setup ────────────────────────────────────────────────────────────
-
-async def set_webhook(base_url: str) -> bool:
-    webhook_url = f"https://{base_url}/toni/webhook"
-    data = await _tg(
-        "setWebhook",
-        url=webhook_url,
-        allowed_updates=["message", "channel_post"],
-        drop_pending_updates=True,
-    )
-    logger.info(f"Toni setWebhook → {webhook_url}: {data.get('ok')}")
-    return data.get("ok", False)

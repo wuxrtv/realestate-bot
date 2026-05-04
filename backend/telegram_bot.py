@@ -84,7 +84,7 @@ async def set_webhook(webhook_url: str) -> dict:
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(f"{API}/setWebhook", json={
             "url": webhook_url,
-            "allowed_updates": ["message", "callback_query"],
+            "allowed_updates": ["message", "callback_query", "channel_post"],
             "drop_pending_updates": True,
         })
         result = resp.json()
