@@ -47,6 +47,9 @@ conversation_manager = ConversationManager()
 admin_agent = AdminAgent()
 scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
+# Stores last 10 WA notifications for /walast debug command
+_recent_wa_notifications: list = []
+
 
 # ─── Scheduled jobs ──────────────────────────────────────────────────────────
 
@@ -271,6 +274,30 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
     await send_typing(user_id)
 
+    # ── Admin: /walast — show last WA notifications ───────────────────────────
+    if text.strip() == "/walast" and is_admin(user_id):
+        if not _recent_wa_notifications:
+            await send_message(user_id, "📭 Нет уведомлений с момента запуска сервера.\n\nНапиши что-нибудь в WA группу и подожди 15 сек, потом повтори /walast")
+        else:
+            lines = [f"📱 Последние {len(_recent_wa_notifications)} WA уведомлений:\n"]
+            for n in _recent_wa_notifications[-5:]:
+                body = n.get("body", {})
+                sender = body.get("senderData", {})
+                msg = body.get("messageData", {})
+                text_content = (
+                    msg.get("textMessageData", {}).get("textMessage")
+                    or msg.get("extendedTextMessageData", {}).get("text")
+                    or "—"
+                )
+                lines.append(
+                    f"• `{body.get('typeWebhook', '—')}`\n"
+                    f"  chatId: `{sender.get('chatId', '—')}`\n"
+                    f"  type: `{msg.get('typeMessage', '—')}`\n"
+                    f"  text: {str(text_content)[:60]}\n"
+                )
+            await send_message(user_id, "\n".join(lines))
+        return {"ok": True}
+
     # ── Admin: /watest — WhatsApp diagnostics ─────────────────────────────────
     if text.strip() == "/watest" and is_admin(user_id):
         try:
@@ -428,6 +455,7 @@ async def _handle_wa_message(data: dict, db: Session):
 
 async def job_whatsapp_poll():
     """Poll Green API every 10 seconds for new messages (fallback if webhook fails)."""
+    global _recent_wa_notifications
     if not os.getenv("GREEN_API_TOKEN"):
         return
     db = SessionLocal()
@@ -439,6 +467,9 @@ async def job_whatsapp_poll():
             receipt_id = notification.get("receiptId")
             body = notification.get("body", {})
             logger.info(f"WA poll: receiptId={receipt_id}, typeWebhook={body.get('typeWebhook')}")
+            # Keep last 10 notifications for /walast debug
+            _recent_wa_notifications.append(notification)
+            _recent_wa_notifications = _recent_wa_notifications[-10:]
             await _handle_wa_message(body, db)
             if receipt_id:
                 await wa_delete_notification(receipt_id)
