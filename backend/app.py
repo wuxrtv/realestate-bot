@@ -35,6 +35,8 @@ from telegram_bot import (
 from whatsapp import (
     send_message as wa_send_message,
     set_webhook as wa_set_webhook,
+    receive_notification as wa_receive_notification,
+    delete_notification as wa_delete_notification,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -172,6 +174,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(job_followups, "interval", hours=1, id="followups")
     scheduler.add_job(job_price_drops, "cron", hour=9, minute=0, id="price_drops")
     scheduler.add_job(job_whatsapp_broadcast, "interval", hours=3, id="wa_broadcast")
+    scheduler.add_job(job_whatsapp_poll, "interval", seconds=10, id="wa_poll")
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -316,33 +319,28 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     return {"ok": True}
 
 
-# ─── WhatsApp webhook ────────────────────────────────────────────────────────
+# ─── WhatsApp shared message handler ─────────────────────────────────────────
 
-@app.post("/whatsapp/webhook")
-async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
-    """Green API sends every incoming WhatsApp message here."""
-    data = await request.json()
-
-    # Only process incoming text messages
+async def _handle_wa_message(data: dict, db: Session):
+    """Process one incoming WhatsApp message. Used by both webhook and polling."""
     if data.get("typeWebhook") != "incomingMessageReceived":
-        return {"ok": True}
+        return
 
     msg_data = data.get("messageData", {})
     if msg_data.get("typeMessage") != "textMessage":
-        return {"ok": True}
+        return
 
     text = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
     if not text:
-        return {"ok": True}
+        return
 
     sender = data.get("senderData", {})
     chat_id = sender.get("chatId", "")
     sender_name = sender.get("senderName", "") or sender.get("chatName", "")
 
     if not chat_id:
-        return {"ok": True}
+        return
 
-    # Prefix with "wa_" to keep WhatsApp histories separate from Telegram
     wa_user_id = f"wa_{chat_id}"
 
     try:
@@ -382,6 +380,35 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     except Exception as e:
         logger.exception(f"WA error for {chat_id}: {e}")
 
+
+# ─── WhatsApp polling job ─────────────────────────────────────────────────────
+
+async def job_whatsapp_poll():
+    """Poll Green API every 10 seconds for new messages (fallback if webhook fails)."""
+    if not os.getenv("GREEN_API_TOKEN"):
+        return
+    db = SessionLocal()
+    try:
+        for _ in range(10):
+            notification = await wa_receive_notification()
+            if not notification:
+                break
+            receipt_id = notification.get("receiptId")
+            body = notification.get("body", {})
+            await _handle_wa_message(body, db)
+            if receipt_id:
+                await wa_delete_notification(receipt_id)
+    finally:
+        db.close()
+
+
+# ─── WhatsApp webhook ────────────────────────────────────────────────────────
+
+@app.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
+    """Green API sends every incoming WhatsApp message here."""
+    data = await request.json()
+    await _handle_wa_message(data, db)
     return {"ok": True}
 
 
