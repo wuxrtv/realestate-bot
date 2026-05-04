@@ -54,6 +54,13 @@ async def delete_notification(receipt_id: int) -> bool:
         return resp.json().get("result", False)
 
 
+async def reboot_instance() -> dict:
+    """Reboot the Green API instance so it reconnects to WhatsApp and receives group messages."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(f"{_base}/reboot/{API_TOKEN}")
+        return resp.json()
+
+
 async def get_state() -> dict:
     """Return current state of the Green API instance (authorized / notAuthorized / etc.)."""
     async with httpx.AsyncClient(timeout=10) as client:

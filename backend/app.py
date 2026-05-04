@@ -38,6 +38,7 @@ from whatsapp import (
     receive_notification as wa_receive_notification,
     delete_notification as wa_delete_notification,
     get_state as wa_get_state,
+    reboot_instance as wa_reboot,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -298,6 +299,15 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
             await send_message(user_id, "\n".join(lines))
         return {"ok": True}
 
+    # ── Admin: /wareboot — reboot Green API instance ─────────────────────────
+    if text.strip() == "/wareboot" and is_admin(user_id):
+        try:
+            result = await wa_reboot()
+            await send_message(user_id, f"🔄 Инстанс перезагружен: `{result}`\n\nПодожди 30 секунд и попробуй написать в группу.")
+        except Exception as e:
+            await send_message(user_id, f"❌ Ошибка: {e}")
+        return {"ok": True}
+
     # ── Admin: /watest — WhatsApp diagnostics ─────────────────────────────────
     if text.strip() == "/watest" and is_admin(user_id):
         try:
@@ -377,8 +387,14 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
 async def _handle_wa_message(data: dict, db: Session):
     """Process one incoming WhatsApp message. Used by both webhook and polling."""
+    global _recent_wa_notifications
     type_webhook = data.get("typeWebhook")
     logger.info(f"WA incoming: typeWebhook={type_webhook}")
+
+    # Always store for /walast (regardless of type)
+    if type_webhook:
+        _recent_wa_notifications.append({"body": data})
+        _recent_wa_notifications = _recent_wa_notifications[-10:]
 
     if type_webhook != "incomingMessageReceived":
         return
