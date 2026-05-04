@@ -37,6 +37,7 @@ from whatsapp import (
     set_webhook as wa_set_webhook,
     receive_notification as wa_receive_notification,
     delete_notification as wa_delete_notification,
+    get_state as wa_get_state,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -323,25 +324,41 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
 async def _handle_wa_message(data: dict, db: Session):
     """Process one incoming WhatsApp message. Used by both webhook and polling."""
-    if data.get("typeWebhook") != "incomingMessageReceived":
+    type_webhook = data.get("typeWebhook")
+    logger.info(f"WA incoming: typeWebhook={type_webhook}")
+
+    if type_webhook != "incomingMessageReceived":
         return
 
     msg_data = data.get("messageData", {})
-    if msg_data.get("typeMessage") != "textMessage":
+    type_message = msg_data.get("typeMessage")
+
+    # Groups often send extendedTextMessage (links, replies, formatting)
+    if type_message == "textMessage":
+        text = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
+    elif type_message == "extendedTextMessage":
+        text = msg_data.get("extendedTextMessageData", {}).get("text", "").strip()
+    else:
+        logger.info(f"WA: unsupported typeMessage={type_message}, skipping")
         return
 
-    text = msg_data.get("textMessageData", {}).get("textMessage", "").strip()
     if not text:
         return
 
     sender = data.get("senderData", {})
-    chat_id = sender.get("chatId", "")
+    chat_id = sender.get("chatId", "")          # group or personal chat id
+    sender_id = sender.get("sender", "")         # individual sender phone
     sender_name = sender.get("senderName", "") or sender.get("chatName", "")
+
+    logger.info(f"WA message: chat_id={chat_id}, sender={sender_id}, text={text[:60]!r}")
 
     if not chat_id:
         return
 
-    wa_user_id = f"wa_{chat_id}"
+    # For groups (chatId ends @g.us) track context per sender, reply to group
+    is_group = chat_id.endswith("@g.us")
+    conv_key = sender_id if (is_group and sender_id) else chat_id
+    wa_user_id = f"wa_{conv_key}"
 
     try:
         result = await conversation_manager.process_message(
@@ -395,9 +412,12 @@ async def job_whatsapp_poll():
                 break
             receipt_id = notification.get("receiptId")
             body = notification.get("body", {})
+            logger.info(f"WA poll: receiptId={receipt_id}, typeWebhook={body.get('typeWebhook')}")
             await _handle_wa_message(body, db)
             if receipt_id:
                 await wa_delete_notification(receipt_id)
+    except Exception as e:
+        logger.exception(f"WA poll error: {e}")
     finally:
         db.close()
 
@@ -483,6 +503,21 @@ async def list_appointments(db: Session = Depends(get_db)):
         }
         for a in appts
     ]}
+
+
+# ─── Debug ───────────────────────────────────────────────────────────────────
+
+@app.get("/debug/wa")
+async def debug_wa():
+    """Check Green API instance state and grab one pending notification."""
+    state = await wa_get_state()
+    notif = await wa_receive_notification()
+    token_set = bool(os.getenv("GREEN_API_TOKEN"))
+    return {
+        "token_set": token_set,
+        "instance_state": state,
+        "pending_notification": notif,
+    }
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────

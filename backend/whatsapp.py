@@ -54,6 +54,13 @@ async def delete_notification(receipt_id: int) -> bool:
         return resp.json().get("result", False)
 
 
+async def get_state() -> dict:
+    """Return current state of the Green API instance (authorized / notAuthorized / etc.)."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(f"{_base}/getStateInstance/{API_TOKEN}")
+        return resp.json()
+
+
 async def set_webhook(webhook_url: str) -> bool:
     """Tell Green API to POST incoming messages to our webhook URL."""
     if not API_TOKEN:
