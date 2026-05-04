@@ -6,7 +6,6 @@ Routes Telegram updates: groups/channel → Toni, private admin chat → AdminAg
 import logging
 import os
 from contextlib import asynccontextmanager
-from typing import Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, Request
@@ -14,7 +13,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 
 from admin_agent import AdminAgent, is_admin
-from database import SessionLocal, get_db, init_db
+from database import get_db, init_db
+from models import ToniFile, ToniGroup
 import toni_bot
 from telegram_bot import (
     answer_callback_query,
@@ -99,7 +99,6 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
     # /tonigroups — list registered agent groups
     if text == "/tonigroups":
-        from models import ToniGroup
         groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
         if not groups:
             await send_message(user_id, "Бот ещё не добавлен ни в одну группу.")
@@ -112,7 +111,6 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
 
     # /tonifiles — list indexed files
     if text == "/tonifiles":
-        from models import ToniFile
         files = db.query(ToniFile).order_by(ToniFile.id.desc()).limit(10).all()
         if not files:
             await send_message(user_id, "База файлов пуста. Загрузи файлы в канал-базу данных.")
@@ -127,7 +125,6 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     # /toniannounce <текст> — ручная рассылка во все группы
     if text.startswith("/toniannounce "):
         msg_text = text[len("/toniannounce "):].strip()
-        from models import ToniGroup
         groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
         for g in groups:
             await toni_bot._send(g.chat_id, msg_text)

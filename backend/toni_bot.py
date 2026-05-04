@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 
 import anthropic
 import httpx
@@ -52,7 +53,7 @@ _SYSTEM = """Ты — Тони, AI-помощник агентов по прод
 
 async def _tg(method: str, **kwargs) -> dict:
     if not TONI_TOKEN:
-        logger.warning("TONI_BOT_TOKEN not set")
+        logger.warning("TELEGRAM_BOT_TOKEN not set")
         return {}
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(f"{_TONI_API}/{method}", json=kwargs)
@@ -177,7 +178,6 @@ async def _handle_channel_post(message: dict, db: Session):
     db.commit()
     logger.info(f"Toni indexed file: {file_name}, units={units}")
 
-    from datetime import datetime
     date_str = datetime.utcnow().strftime("%d.%m.%Y")
     label = caption if caption else file_name
     announcement = f"🆕 Новое обновление {date_str}: {label}. Доступно уже сейчас!"
