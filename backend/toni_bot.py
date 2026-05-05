@@ -116,7 +116,11 @@ async def handle_update(update: dict):
                 return
 
         if chat_type in ("group", "supergroup"):
-            await _handle_group_message(message, chat_id, chat.get("title", ""), db)
+            # Messages from the database group → index files, not treat as agent query
+            if DB_CHANNEL_ID and chat_id == DB_CHANNEL_ID:
+                await _handle_channel_post(message, db)
+            else:
+                await _handle_group_message(message, chat_id, chat.get("title", ""), db)
     except Exception:
         logger.exception("Toni handle_update error")
     finally:
