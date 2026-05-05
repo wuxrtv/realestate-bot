@@ -35,13 +35,14 @@ _SYSTEM = """Ты — Тони, AI-помощник агентов по прод
 
 Определи намерение агента и ответь ТОЛЬКО валидным JSON без markdown:
 {
-  "intent": "unit_query" | "brochure_request" | "other_real_estate" | "off_topic",
+  "intent": "greeting" | "unit_query" | "brochure_request" | "other_real_estate" | "off_topic",
   "unit_numbers": ["1507", "1435"],
   "project_name": "название проекта если есть, иначе null",
-  "reply": "твой ответ агенту (только для other_real_estate)"
+  "reply": "твой ответ агенту"
 }
 
 Правила:
+- greeting: агент здоровается (salom, привет, hello, hi, ассалому алайкум и т.д.) — ответь приветствием и коротко напомни что умеешь
 - unit_query: агент спрашивает конкретный юнит ("есть ли юнит 1507?", "покажи 1435", "unit 2301")
 - brochure_request: просят брошюру, прайс, презентацию, информацию по проекту
 - other_real_estate: вопрос о недвижимости, ценах, районах — ответь кратко в поле reply
@@ -230,7 +231,7 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
         await _respond_unit(chat_id, unit_numbers, db)
     elif intent == "brochure_request":
         await _respond_brochure(chat_id, project_name, db)
-    elif intent == "other_real_estate":
+    elif intent in ("greeting", "other_real_estate"):
         reply = (parsed.get("reply") or "").strip()
         if reply:
             await _send(chat_id, reply)
