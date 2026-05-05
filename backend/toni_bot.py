@@ -37,23 +37,23 @@ _SYSTEM = """Ты — Тони, AI-помощник агентов по недв
 
 Ответь ТОЛЬКО валидным JSON без markdown:
 {
-  "intent": "unit_query" | "brochure_request" | "direct_question" | "silent",
+  "intent": "unit_query" | "brochure_request" | "property_search" | "direct_question" | "silent",
   "unit_numbers": ["1507", "1435"],
   "project_name": "название проекта или null",
-  "reply": "твой ответ (только для direct_question)"
+  "keywords": ["2 qavvat", "uy", "villa"],
+  "reply": "твой ответ (для direct_question)"
 }
 
 КОГДА ОТВЕЧАТЬ:
-- unit_query: кто-то спрашивает конкретный юнит ("есть юнит 1507?", "покажи 1435", "unit 2301 бор ми")
+- unit_query: спрашивают конкретный юнит ("есть юнит 1507?", "покажи 1435", "unit 2301 bor mi")
 - brochure_request: просят брошюру, прайс-лист, презентацию проекта
-- direct_question: агент обращается напрямую к тебе — пишет "@" с упоминанием бота, говорит "бот", "тони", задаёт тебе вопрос лично
+- property_search: описывают что ищут — тип, этажность, комнаты, район, цена ("2 qavvatan uy kerakan", "3 комнатная нужна", "villa bor mi", "нужна квартира в Юнусабаде")
+- direct_question: агент обращается напрямую к тебе — пишет "@botname", "тони", "бот", задаёт тебе вопрос лично
 
 КОГДА МОЛЧАТЬ (silent):
-- люди просто общаются друг с другом, даже если тема — недвижимость
-- обсуждают цены, проекты, районы в разговоре между собой
-- делятся новостями, мнениями, рассказывают что-то
-- здороваются друг с другом (не с тобой лично)
-- пишут "salom", "ok", "ha", "понял", "спасибо" без вопроса к тебе
+- люди общаются друг с другом, даже если тема — недвижимость
+- обсуждают цены, проекты, новости между собой
+- пишут "ok", "ha", "понял", "спасибо", "salom" — не тебе
 
 Отвечай на языке агента (русский, узбекский, английский)"""
 
@@ -239,6 +239,9 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
         await _respond_unit(chat_id, unit_numbers, db)
     elif intent == "brochure_request":
         await _respond_brochure(chat_id, project_name, db)
+    elif intent == "property_search":
+        keywords: list[str] = parsed.get("keywords") or []
+        await _respond_property_search(chat_id, keywords, db)
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
@@ -293,6 +296,31 @@ async def _respond_brochure(chat_id: str, project_name: str, db: Session):
         await _send(
             chat_id,
             f"Брошюра не найдена в базе. Обратитесь напрямую к {UMAR_CONTACT}."
+        )
+
+
+# ─── Property search response ────────────────────────────────────────────────
+
+async def _respond_property_search(chat_id: str, keywords: list[str], db: Session):
+    """Search files by keywords from description, send matches or ask to specify."""
+    all_files = db.query(ToniFile).all()
+    matched = []
+
+    if keywords:
+        for f in all_files:
+            searchable = f"{f.file_name or ''} {f.caption or ''}".lower()
+            if any(kw.lower() in searchable for kw in keywords):
+                matched.append(f)
+
+    if matched:
+        for f in matched[:3]:
+            await _copy(chat_id, f.channel_chat_id, f.message_id)
+    else:
+        await _send(
+            chat_id,
+            f"Bazada mos variant topilmadi. "
+            f"Aniq loyiha yoki unit raqamini yozing — tezroq topamiz. "
+            f"Yoki {UMAR_CONTACT} bilan bog'laning."
         )
 
 
