@@ -191,7 +191,7 @@ async def _handle_channel_post(message: dict, db: Session):
     db.commit()
     logger.info(f"Toni indexed file: {file_name}, units={units}")
 
-    date_str = datetime.utcnow().strftime("%d.%m.%Y")
+    date_str = datetime.now().strftime("%d.%m.%Y")
     label = caption if caption else file_name
     announcement = f"🆕 Новое обновление {date_str}: {label}. Доступно уже сейчас!"
 
@@ -222,11 +222,11 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
 
     try:
         raw = resp.content[0].text.strip()
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        parsed = json.loads(raw.strip())
+        match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not match:
+            logger.warning(f"Toni: no JSON in response: {raw[:100]}")
+            return
+        parsed = json.loads(match.group())
     except Exception:
         logger.warning(f"Toni: failed to parse AI response: {resp.content[0].text[:100]}")
         return
