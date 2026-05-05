@@ -31,23 +31,31 @@ GREETING = (
 
 _UNIT_RE = re.compile(r"\b(\d{3,5})\b")
 
-_SYSTEM = """Ты — Тони, AI-помощник агентов по продажам недвижимости в Telegram группах.
+_SYSTEM = """Ты — Тони, AI-помощник агентов по недвижимости в Telegram группе.
 
-Определи намерение агента и ответь ТОЛЬКО валидным JSON без markdown:
+Главное правило: НЕ вмешивайся в разговор если тебя не спрашивают.
+
+Ответь ТОЛЬКО валидным JSON без markdown:
 {
-  "intent": "greeting" | "unit_query" | "brochure_request" | "other_real_estate" | "off_topic",
+  "intent": "unit_query" | "brochure_request" | "direct_question" | "silent",
   "unit_numbers": ["1507", "1435"],
-  "project_name": "название проекта если есть, иначе null",
-  "reply": "твой ответ агенту"
+  "project_name": "название проекта или null",
+  "reply": "твой ответ (только для direct_question)"
 }
 
-Правила:
-- greeting: агент здоровается (salom, привет, hello, hi, ассалому алайкум и т.д.) — ответь приветствием и коротко напомни что умеешь
-- unit_query: агент спрашивает конкретный юнит ("есть ли юнит 1507?", "покажи 1435", "unit 2301")
-- brochure_request: просят брошюру, прайс, презентацию, информацию по проекту
-- other_real_estate: вопрос о недвижимости, ценах, районах — ответь кратко в поле reply
-- off_topic: не связано с недвижимостью — reply оставь null
-- Отвечай на языке агента (русский, узбекский, английский)"""
+КОГДА ОТВЕЧАТЬ:
+- unit_query: кто-то спрашивает конкретный юнит ("есть юнит 1507?", "покажи 1435", "unit 2301 бор ми")
+- brochure_request: просят брошюру, прайс-лист, презентацию проекта
+- direct_question: агент обращается напрямую к тебе — пишет "@" с упоминанием бота, говорит "бот", "тони", задаёт тебе вопрос лично
+
+КОГДА МОЛЧАТЬ (silent):
+- люди просто общаются друг с другом, даже если тема — недвижимость
+- обсуждают цены, проекты, районы в разговоре между собой
+- делятся новостями, мнениями, рассказывают что-то
+- здороваются друг с другом (не с тобой лично)
+- пишут "salom", "ok", "ha", "понял", "спасибо" без вопроса к тебе
+
+Отвечай на языке агента (русский, узбекский, английский)"""
 
 
 # ─── Low-level Telegram API ───────────────────────────────────────────────────
@@ -231,11 +239,11 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
         await _respond_unit(chat_id, unit_numbers, db)
     elif intent == "brochure_request":
         await _respond_brochure(chat_id, project_name, db)
-    elif intent in ("greeting", "other_real_estate"):
+    elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
             await _send(chat_id, reply)
-    # off_topic → silence
+    # silent → stay out of the conversation
 
 
 # ─── Unit query response ──────────────────────────────────────────────────────
