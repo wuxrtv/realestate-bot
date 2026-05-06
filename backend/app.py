@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -30,6 +30,7 @@ from models import ToniFile, ToniGroup, ToniProject
 import toni_bot
 from telegram_bot import (
     answer_callback_query,
+    get_file_bytes,
     send_message,
     send_typing,
     set_webhook,
@@ -104,24 +105,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-
         margin-bottom: 20px; box-shadow: 0 1px 6px rgba(0,0,0,.08); }
 .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 16px;
            color: #1a1a2e; border-bottom: 1px solid #e8eaf0; padding-bottom: 10px; }
-.upload-zone { border: 2px dashed #c8d0e0; border-radius: 10px; padding: 28px 20px;
-               text-align: center; cursor: pointer; transition: .2s; }
-.upload-zone:hover, .upload-zone.drag { border-color: #4f6ef7; background: #f5f7ff; }
-.upload-zone p { color: #718096; font-size: .9rem; margin-top: 6px; }
-.upload-zone input { display: none; }
-.name-row { display: flex; gap: 12px; margin-top: 14px; align-items: center; }
-.name-row input[type=text] { flex: 1; border: 1px solid #d1d9e6; border-radius: 8px;
-                              padding: 9px 14px; font-size: .9rem; outline: none; }
-.name-row input[type=text]:focus { border-color: #4f6ef7; }
-.btn { padding: 9px 22px; border: none; border-radius: 8px; cursor: pointer;
-       font-size: .9rem; font-weight: 500; transition: .15s; }
-.btn-blue { background: #4f6ef7; color: #fff; }
-.btn-blue:hover { background: #3d5ce5; }
-.alert { padding: 14px 18px; border-radius: 8px; margin-bottom: 18px;
-         font-size: .9rem; white-space: pre-line; }
-.alert-ok  { background: #f0fff4; border: 1px solid #9ae6b4; color: #276749; }
-.alert-upd { background: #ebf8ff; border: 1px solid #90cdf4; color: #1a365d; }
-.alert-err { background: #fff5f5; border: 1px solid #fc8181; color: #742a2a; }
+.hint { background: #f0f4ff; border: 1px solid #c3d0f0; border-radius: 8px;
+        padding: 14px 18px; font-size: .9rem; color: #2d3a8c; line-height: 1.6; }
 table { width: 100%; border-collapse: collapse; font-size: .88rem; }
 th { text-align: left; padding: 9px 14px; background: #f7f9fc;
      border-bottom: 2px solid #e8eaf0; color: #4a5568; font-weight: 600; }
@@ -135,27 +120,10 @@ tr:last-child td { border-bottom: none; }
 .empty { text-align: center; padding: 28px; color: #a0aec0; font-size: .9rem; }
 """
 
-_ADMIN_JS = """
-const zone = document.getElementById('zone');
-const inp  = document.getElementById('file-inp');
-const lbl  = document.getElementById('file-lbl');
-zone.onclick = () => inp.click();
-zone.ondragover = e => { e.preventDefault(); zone.classList.add('drag'); };
-zone.ondragleave = () => zone.classList.remove('drag');
-zone.ondrop = e => {
-  e.preventDefault(); zone.classList.remove('drag');
-  if (e.dataTransfer.files[0]) { inp.files = e.dataTransfer.files; updateLabel(); }
-};
-inp.onchange = updateLabel;
-function updateLabel() {
-  lbl.textContent = inp.files[0] ? '📄 ' + inp.files[0].name : '📁 Нажмите или перетащите файл';
-}
-"""
-
 
 def _projects_table(projects: list) -> str:
     if not projects:
-        return '<div class="empty">Проекты не загружены. Загрузите первый Excel-файл.</div>'
+        return '<div class="empty">Проекты пока не загружены. Отправьте Excel-файл боту в личку.</div>'
 
     rows = ""
     for p in projects:
@@ -169,7 +137,7 @@ def _projects_table(projects: list) -> str:
         rows += f"""
         <tr>
           <td><strong>{p.project_name}</strong></td>
-          <td><span class="badge badge-green">{p.unit_count} юнит.</span></td>
+          <td><span class="badge badge-green">{p.unit_count} юн.</span></td>
           <td><span class="badge badge-blue">v{p.version}</span></td>
           <td class="sheet-list">{sheets_html or "—"}</td>
           <td>{dt}</td>
@@ -184,57 +152,43 @@ def _projects_table(projects: list) -> str:
     </table>"""
 
 
-def _admin_html(projects: list, alert: str = "", alert_type: str = "ok") -> str:
-    alert_html = ""
-    if alert:
-        alert_html = f'<div class="alert alert-{alert_type}">{alert}</div>'
-
+def _admin_html(projects: list) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Тони — Admin Panel</title>
+  <title>Тони — Projects</title>
   <style>{_ADMIN_CSS}</style>
 </head>
 <body>
   <div class="header">
     <div>🤖</div>
     <div>
-      <h1>Тони — Admin Panel</h1>
-      <span>Управление проектами недвижимости</span>
+      <h1>Тони — База проектов</h1>
+      <span>Только просмотр • загрузка через Telegram</span>
     </div>
   </div>
   <div class="container">
-    {alert_html}
-
     <div class="card">
-      <h2>📤 Загрузить Excel-файл проекта</h2>
-      <form method="post" action="/admin/upload" enctype="multipart/form-data">
-        <div class="upload-zone" id="zone">
-          <div style="font-size:2rem">📊</div>
-          <strong id="file-lbl">📁 Нажмите или перетащите файл</strong>
-          <p>Поддерживаются .xlsx и .xls с несколькими листами</p>
-          <input type="file" name="file" id="file-inp" accept=".xlsx,.xls" required>
-        </div>
-        <div class="name-row">
-          <input type="text" name="project_name" placeholder="Название проекта (необязательно — определится из файла)">
-          <button type="submit" class="btn btn-blue">Загрузить и обработать</button>
-        </div>
-      </form>
+      <h2>📲 Как загрузить проект</h2>
+      <div class="hint">
+        Отправьте Excel-файл (<strong>.xlsx</strong> или <strong>.xls</strong>) боту в личный чат в Telegram.<br>
+        • Бот прочитает все листы и запомнит данные.<br>
+        • Если проект уже был загружен — бот покажет что изменилось.<br>
+        • Подпись к файлу станет названием проекта (необязательно).
+      </div>
     </div>
-
     <div class="card">
-      <h2>📋 Активные проекты ({len(projects)})</h2>
+      <h2>📋 Активные проекты в памяти бота ({len(projects)})</h2>
       {_projects_table(projects)}
     </div>
   </div>
-  <script>{_ADMIN_JS}</script>
 </body>
 </html>"""
 
 
-# ─── Admin panel routes ───────────────────────────────────────────────────────
+# ─── Admin panel route (read-only view) ──────────────────────────────────────
 
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(
@@ -250,33 +204,39 @@ async def admin_page(
     return _admin_html(projects)
 
 
-@app.post("/admin/upload", response_class=HTMLResponse)
-async def admin_upload(
-    _: None = Depends(_verify_admin),
-    db: Session = Depends(get_db),
-    file: UploadFile = File(...),
-    project_name: str = Form(default=""),
+# ─── Telegram Excel upload handler ───────────────────────────────────────────
+
+async def _process_excel_upload(
+    user_id: str,
+    file_id: str,
+    file_name: str,
+    project_name_override: str,
+    db: Session,
 ):
-    if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
-        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
-        return _admin_html(projects, "❌ Загрузите файл Excel (.xlsx или .xls)", "err")
+    """Download Excel from Telegram, parse, save/update ToniProject, reply to admin."""
+    await send_typing(user_id)
+    await send_message(user_id, f"📊 Читаю файл *{file_name}*...")
+
+    file_bytes = await get_file_bytes(file_id)
+    if not file_bytes:
+        await send_message(user_id, "❌ Не удалось скачать файл. Попробуй ещё раз.")
+        return
 
     try:
-        content = await file.read()
-        sheets_data = parse_excel(content)
+        sheets_data = parse_excel(file_bytes)
     except Exception as e:
         logger.exception("Excel parse error")
-        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
-        return _admin_html(projects, f"❌ Ошибка чтения файла: {e}", "err")
+        await send_message(user_id, f"❌ Ошибка чтения Excel: {e}")
+        return
 
     if not sheets_data:
-        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
-        return _admin_html(projects, "❌ Файл пустой или не содержит данных.", "err")
+        await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.")
+        return
 
-    name = (project_name.strip() or normalize_project_name(file.filename))
+    name = project_name_override.strip() or normalize_project_name(file_name)
     unit_index = build_unit_index(sheets_data)
+    sheet_names = list(sheets_data.keys())
 
-    # Check if project with same name already exists
     existing = (
         db.query(ToniProject)
         .filter(ToniProject.project_name == name, ToniProject.is_active == True)
@@ -284,15 +244,15 @@ async def admin_upload(
     )
 
     if existing:
+        # Update existing project: diff + replace
         diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
         report = format_diff_report(diff, name)
         new_version = existing.version + 1
 
-        # Deactivate old version
         existing.is_active = False
         db.flush()
 
-        proj = ToniProject(
+        db.add(ToniProject(
             project_name=name,
             version=new_version,
             sheet_count=len(sheets_data),
@@ -301,15 +261,20 @@ async def admin_upload(
             unit_index=unit_index,
             is_active=True,
             uploaded_at=datetime.now(),
-            uploaded_by="web",
-        )
-        db.add(proj)
+            uploaded_by=user_id,
+        ))
         db.commit()
 
-        alert = f"✅ Проект «{name}» обновлён до версии {new_version}\n\n{report}"
-        alert_type = "upd"
+        await send_message(
+            user_id,
+            f"✅ Проект *{name}* обновлён → v{new_version}\n"
+            f"Листов: {len(sheet_names)} ({', '.join(sheet_names[:3])}{'...' if len(sheet_names) > 3 else ''})\n"
+            f"Юнитов в памяти: {len(unit_index)}\n\n"
+            f"{report}"
+        )
     else:
-        proj = ToniProject(
+        # New project
+        db.add(ToniProject(
             project_name=name,
             version=1,
             sheet_count=len(sheets_data),
@@ -318,30 +283,27 @@ async def admin_upload(
             unit_index=unit_index,
             is_active=True,
             uploaded_at=datetime.now(),
-            uploaded_by="web",
-        )
-        db.add(proj)
+            uploaded_by=user_id,
+        ))
         db.commit()
 
         # Announce to all agent groups
+        groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
         announce = (
             f"📁 Новый проект добавлен: *{name}*\n"
-            f"Юнитов: {len(unit_index)}, листов: {len(sheets_data)}\n"
+            f"Юнитов: {len(unit_index)}, листов: {len(sheet_names)}\n"
             f"Спрашивайте по номеру юнита!"
         )
-        for group in db.query(ToniGroup).filter(ToniGroup.active == True).all():
-            await toni_bot._send(group.chat_id, announce)
+        for g in groups:
+            await toni_bot._send(g.chat_id, announce)
 
-        alert = f"✅ Проект «{name}» добавлен: {len(unit_index)} юнитов, {len(sheets_data)} листов."
-        alert_type = "ok"
-
-    projects = (
-        db.query(ToniProject)
-        .filter(ToniProject.is_active == True)
-        .order_by(ToniProject.uploaded_at.desc())
-        .all()
-    )
-    return _admin_html(projects, alert, alert_type)
+        await send_message(
+            user_id,
+            f"✅ Проект *{name}* сохранён в память бота!\n"
+            f"Листов: {len(sheet_names)} ({', '.join(sheet_names[:3])}{'...' if len(sheet_names) > 3 else ''})\n"
+            f"Юнитов: {len(unit_index)}\n"
+            f"Объявление разослано в {len(groups)} групп(ы)."
+        )
 
 
 # ─── Telegram webhook ─────────────────────────────────────────────────────────
@@ -371,7 +333,19 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         await toni_bot.handle_update(data)
         return {"ok": True}
 
-    if not text or not is_admin(user_id):
+    if not is_admin(user_id):
+        return {"ok": True}
+
+    # Excel document from admin → parse and save to memory
+    doc = message.get("document")
+    if doc:
+        fname = doc.get("file_name", "")
+        if fname.lower().endswith((".xlsx", ".xls")):
+            caption = (message.get("caption") or "").strip()
+            await _process_excel_upload(user_id, doc["file_id"], fname, caption, db)
+            return {"ok": True}
+
+    if not text:
         return {"ok": True}
 
     await send_typing(user_id)

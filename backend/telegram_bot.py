@@ -92,6 +92,22 @@ async def set_webhook(webhook_url: str) -> dict:
         return result
 
 
+async def get_file_bytes(file_id: str) -> bytes | None:
+    """Download a file from Telegram by file_id. Returns raw bytes or None on failure."""
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(f"{API}/getFile", json={"file_id": file_id})
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning(f"getFile failed: {resp.text[:200]}")
+            return None
+        file_path = data["result"]["file_path"]
+        dl = await client.get(f"https://api.telegram.org/file/bot{TOKEN}/{file_path}")
+        if dl.status_code != 200:
+            logger.warning(f"File download failed: status {dl.status_code}")
+            return None
+        return dl.content
+
+
 async def notify_agent(summary: str, client_user_id: str, client_name: str):
     """Send a notification to the agent's Telegram."""
     agent_id = os.getenv("AGENT_TELEGRAM_ID", "7567850330")
