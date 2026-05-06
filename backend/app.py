@@ -4,12 +4,15 @@ Routes Telegram updates: groups/channel → Toni, private admin chat → AdminAg
 Admin panel at /admin for uploading Excel project files.
 """
 
+import base64
+import json
 import logging
 import os
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
 
+import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,6 +27,7 @@ from excel_parser import (
     diff_unit_indexes,
     format_diff_report,
     normalize_project_name,
+    parse_csv,
     parse_excel,
 )
 from models import ToniFile, ToniGroup, ToniProject
@@ -204,7 +208,76 @@ async def admin_page(
     return _admin_html(projects)
 
 
-# ─── Telegram Excel upload handler ───────────────────────────────────────────
+# ─── Admin helper utilities ──────────────────────────────────────────────────
+
+async def _transcribe_voice(audio_bytes: bytes) -> str | None:
+    """Transcribe a voice OGG file via Groq Whisper."""
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
+        return None
+    try:
+        from groq import AsyncGroq
+        client = AsyncGroq(api_key=key)
+        transcription = await client.audio.transcriptions.create(
+            file=("voice.ogg", audio_bytes),
+            model="whisper-large-v3",
+        )
+        return transcription.text
+    except Exception as e:
+        logger.warning(f"Voice transcription failed: {e}")
+        return None
+
+
+async def _analyze_image(image_bytes: bytes, caption: str, media_type: str = "image/jpeg") -> str:
+    """Analyze an image with Claude vision and return a text description."""
+    try:
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        img_b64 = base64.standard_b64encode(image_bytes).decode()
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                    {"type": "text", "text": (
+                        f"Подпись администратора: «{caption}»\n\n"
+                        "Опиши что изображено. Если это документ о недвижимости — извлеки: "
+                        "название проекта, номера юнитов, цены, характеристики. "
+                        "Отвечай на русском языке."
+                    )},
+                ],
+            }],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"Image analysis failed: {e}")
+        return caption or "Изображение получено."
+
+
+async def _detect_project_name_ai(sheets_data: dict, filename: str) -> str:
+    """Ask Claude to identify the project name from spreadsheet content."""
+    try:
+        first_sheet = next(iter(sheets_data.values()), [])
+        headers = list(first_sheet[0].keys()) if first_sheet else []
+        sample = first_sheet[:2]
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=60,
+            messages=[{"role": "user", "content": (
+                f"Файл: {filename}\nЛисты: {list(sheets_data.keys())}\n"
+                f"Заголовки: {headers}\nПример строк: {json.dumps(sample, ensure_ascii=False, default=str)}\n"
+                "Как называется этот проект недвижимости? Ответь только названием."
+            )}],
+        )
+        name = resp.content[0].text.strip()
+        return name if name and len(name) < 80 else normalize_project_name(filename)
+    except Exception:
+        return normalize_project_name(filename)
+
+
+# ─── Telegram spreadsheet upload handler ─────────────────────────────────────
 
 async def _process_excel_upload(
     user_id: str,
@@ -223,17 +296,23 @@ async def _process_excel_upload(
         return
 
     try:
-        sheets_data = parse_excel(file_bytes)
+        if file_name.lower().endswith(".csv"):
+            sheets_data = parse_csv(file_bytes)
+        else:
+            sheets_data = parse_excel(file_bytes)
     except Exception as e:
-        logger.exception("Excel parse error")
-        await send_message(user_id, f"❌ Ошибка чтения Excel: {e}")
+        logger.exception("Spreadsheet parse error")
+        await send_message(user_id, f"❌ Ошибка чтения файла: {e}")
         return
 
     if not sheets_data:
         await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.")
         return
 
-    name = project_name_override.strip() or normalize_project_name(file_name)
+    if project_name_override.strip():
+        name = project_name_override.strip()
+    else:
+        name = await _detect_project_name_ai(sheets_data, file_name)
     unit_index = build_unit_index(sheets_data)
     sheet_names = list(sheets_data.keys())
 
@@ -336,14 +415,68 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
     if not is_admin(user_id):
         return {"ok": True}
 
-    # Excel document from admin → parse and save to memory
+    # ── 1. Voice / audio message → transcribe → treat as text ────────────────
+    voice = message.get("voice") or message.get("audio")
+    if voice and not text:
+        await send_typing(user_id)
+        file_bytes = await get_file_bytes(voice["file_id"])
+        if file_bytes:
+            transcript = await _transcribe_voice(file_bytes)
+            if transcript:
+                await send_message(user_id, f"🎤 _{transcript}_")
+                text = transcript  # fall through to admin_agent below
+            else:
+                await send_message(
+                    user_id,
+                    "❌ Не могу распознать голосовое — добавь GROQ\\_API\\_KEY в переменные окружения."
+                )
+                return {"ok": True}
+        else:
+            return {"ok": True}
+
+    # ── 2. Photo → Claude vision analysis ────────────────────────────────────
+    photos = message.get("photo")
+    if photos:
+        await send_typing(user_id)
+        photo = photos[-1]
+        file_bytes = await get_file_bytes(photo["file_id"])
+        if file_bytes:
+            caption = (message.get("caption") or "").strip()
+            result = await _analyze_image(file_bytes, caption, "image/jpeg")
+            await send_message(user_id, result)
+        return {"ok": True}
+
+    # ── 3. Document ───────────────────────────────────────────────────────────
     doc = message.get("document")
     if doc:
         fname = doc.get("file_name", "")
-        if fname.lower().endswith((".xlsx", ".xls")):
-            caption = (message.get("caption") or "").strip()
+        caption = (message.get("caption") or "").strip()
+        fname_lower = fname.lower()
+
+        # Spreadsheet → project memory
+        if fname_lower.endswith((".xlsx", ".xls", ".csv")):
             await _process_excel_upload(user_id, doc["file_id"], fname, caption, db)
             return {"ok": True}
+
+        # Image document → Claude vision
+        if fname_lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            await send_typing(user_id)
+            file_bytes = await get_file_bytes(doc["file_id"])
+            if file_bytes:
+                media_type = "image/png" if fname_lower.endswith(".png") else "image/jpeg"
+                result = await _analyze_image(file_bytes, caption, media_type)
+                await send_message(user_id, result)
+            return {"ok": True}
+
+        # Any other file → pass description to admin_agent
+        await send_typing(user_id)
+        file_desc = f"[Получил файл: {fname}. Подпись: {caption or 'нет'}]"
+        try:
+            reply = await admin_agent.process(user_id=user_id, message=file_desc, db=db)
+            await send_message(user_id, reply)
+        except Exception as e:
+            logger.exception(f"Admin agent error on file: {e}")
+        return {"ok": True}
 
     if not text:
         return {"ok": True}

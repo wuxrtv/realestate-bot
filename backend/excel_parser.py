@@ -202,6 +202,23 @@ def format_diff_report(diff: dict, project_name: str) -> str:
     return "\n".join(parts)
 
 
+def parse_csv(file_bytes: bytes) -> dict[str, list[dict[str, Any]]]:
+    """Parse CSV file into sheets_data format compatible with parse_excel output."""
+    import csv
+    import io
+    for enc in ("utf-8-sig", "utf-8", "cp1251", "latin-1"):
+        try:
+            text = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        return {}
+    reader = csv.DictReader(io.StringIO(text))
+    rows = [dict(row) for row in reader if any(str(v).strip() for v in row.values())]
+    return {"Sheet1": rows} if rows else {}
+
+
 def format_unit_card(unit_num: str, data: dict, project_name: str) -> str:
     """Format unit data as a readable Telegram message."""
     sheet = data.get("_sheet", "")
