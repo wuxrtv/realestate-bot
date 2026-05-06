@@ -32,7 +32,7 @@ GREETING = (
 
 _UNIT_RE = re.compile(r"\b(\d{3,5})\b")
 
-_SYSTEM = """Ты — Тони, AI-помощник агентов по недвижимости в Telegram группе.
+_SYSTEM_BASE = """Ты — Тони, AI-помощник агентов по недвижимости в Telegram группе.
 
 Главное правило: НЕ вмешивайся в разговор если тебя не спрашивают.
 
@@ -48,8 +48,8 @@ _SYSTEM = """Ты — Тони, AI-помощник агентов по недв
 КОГДА ОТВЕЧАТЬ:
 - unit_query: спрашивают конкретный юнит ("есть юнит 1507?", "покажи 1435", "unit 2301 bor mi")
 - brochure_request: просят брошюру, прайс-лист, презентацию проекта
-- property_search: описывают что ищут — тип, этажность, комнаты, район, цена ("2 qavvatan uy kerakan", "3 комнатная нужна", "villa bor mi", "нужна квартира в Юнусабаде")
-- direct_question: агент обращается напрямую к тебе — пишет "@botname", "тони", "бот", задаёт тебе вопрос лично
+- property_search: клиент или агент ищет вариант — по типу, этажу, комнатам, цене, бюджету, ИЛИ называет конкретный проект ("Bugatti проект бор ми", "Breez да 3-комнатная", "20 этаж бюджет 2M", "villa bor mi", "3 комнатная нужна")
+- direct_question: агент обращается напрямую к тебе ("тони", "@bot", "бот"), или спрашивает что есть в базе, какие проекты доступны. В поле "reply" ответь используя список проектов из контекста.
 
 КОГДА МОЛЧАТЬ (silent):
 - люди общаются друг с другом, даже если тема — недвижимость
@@ -213,11 +213,19 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
         db.add(ToniGroup(chat_id=chat_id, title=chat_title, active=True))
         db.commit()
 
+    # Build dynamic system prompt — inject available project names so Claude can answer
+    projects_snapshot = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+    if projects_snapshot:
+        proj_lines = "\n".join(f"  • {p.project_name} — {p.unit_count} юн." for p in projects_snapshot)
+        system = _SYSTEM_BASE + f"\n\nДоступные проекты в базе:\n{proj_lines}"
+    else:
+        system = _SYSTEM_BASE
+
     ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     resp = await ai.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=_SYSTEM,
+        max_tokens=400,
+        system=system,
         messages=[{"role": "user", "content": text}],
     )
 
@@ -242,6 +250,9 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
         await _respond_brochure(chat_id, project_name, db)
     elif intent == "property_search":
         keywords: list[str] = parsed.get("keywords") or []
+        # Prepend project_name so the search matches it against project names
+        if project_name and project_name not in keywords:
+            keywords = [project_name] + keywords
         await _respond_property_search(chat_id, keywords, db)
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
@@ -324,15 +335,33 @@ async def _respond_brochure(chat_id: str, project_name: str, db: Session):
 async def _respond_property_search(chat_id: str, keywords: list[str], db: Session):
     """Search Excel projects and legacy files by keywords, send top matches."""
     matched_units: list[tuple[str, dict, str]] = []
+    projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
 
     if keywords:
-        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
         for proj in projects:
             idx: dict = proj.unit_index or {}
+
+            # If a keyword matches the project name → prioritize units from this project
+            proj_hit = any(kw.lower() in proj.project_name.lower() for kw in keywords)
+            other_kws = [kw for kw in keywords if kw.lower() not in proj.project_name.lower()]
+
             for unit_num, data in idx.items():
-                searchable = " ".join(str(v) for v in data.values()).lower()
-                if any(kw.lower() in searchable for kw in keywords):
+                if proj_hit:
+                    # Only apply remaining keywords (floor, budget, rooms…) if any
+                    if other_kws:
+                        searchable = " ".join(str(v) for v in data.values()).lower()
+                        if not any(kw.lower() in searchable for kw in other_kws):
+                            continue
                     matched_units.append((unit_num, data, proj.project_name))
+                else:
+                    searchable = " ".join(str(v) for v in data.values()).lower()
+                    if any(kw.lower() in searchable for kw in keywords):
+                        matched_units.append((unit_num, data, proj.project_name))
+
+                if len(matched_units) >= 3:
+                    break
+            if len(matched_units) >= 3:
+                break
 
     if matched_units:
         for unit_num, data, proj_name in matched_units[:3]:
@@ -352,11 +381,21 @@ async def _respond_property_search(chat_id: str, keywords: list[str], db: Sessio
                 await _copy(chat_id, f.channel_chat_id, f.message_id)
             return
 
+    # Last resort: show sample units from any available project
+    if projects:
+        proj = projects[0]
+        idx = proj.unit_index or {}
+        sample = list(idx.items())[:3]
+        if sample:
+            await _send(chat_id, f"Точного совпадения не нашёл, вот доступные варианты из *{proj.project_name}*:")
+            for unit_num, data in sample:
+                await _send(chat_id, format_unit_card(unit_num, data, proj.project_name))
+            return
+
     await _send(
         chat_id,
-        f"Bazada mos variant topilmadi. "
-        f"Aniq loyiha yoki unit raqamini yozing — tezroq topamiz. "
-        f"Yoki {UMAR_CONTACT} bilan bog'laning."
+        f"Вариантов по запросу не нашёл. Уточните название проекта, этаж или количество комнат — помогу точнее. "
+        f"Или напишите {UMAR_CONTACT}."
     )
 
 
