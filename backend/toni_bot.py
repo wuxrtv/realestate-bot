@@ -14,7 +14,8 @@ import httpx
 from sqlalchemy.orm import Session
 
 from database import SessionLocal
-from models import Property, ToniFile, ToniGroup
+from excel_parser import format_unit_card
+from models import Property, ToniFile, ToniGroup, ToniProject
 
 logger = logging.getLogger(__name__)
 
@@ -252,19 +253,38 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
 # ─── Unit query response ──────────────────────────────────────────────────────
 
 async def _respond_unit(chat_id: str, unit_numbers: list[str], db: Session):
-    all_files = db.query(ToniFile).all()
-    found: list[ToniFile] = []
+    projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
     not_found: list[str] = []
+    sent = 0
 
     for unit in unit_numbers:
-        matches = [f for f in all_files if unit in (f.unit_numbers or [])]
-        if matches:
-            found.extend(matches)
-        else:
+        found = False
+
+        # Search in Excel projects first
+        for proj in projects:
+            idx: dict = proj.unit_index or {}
+            if unit in idx:
+                card = format_unit_card(unit, idx[unit], proj.project_name)
+                await _send(chat_id, card)
+                sent += 1
+                found = True
+                break
+
+        # Fallback: search in ToniFile (legacy channel files)
+        if not found:
+            all_files = db.query(ToniFile).all()
+            matches = [f for f in all_files if unit in (f.unit_numbers or [])]
+            if matches:
+                for f in matches[:1]:
+                    await _copy(chat_id, f.channel_chat_id, f.message_id)
+                    sent += 1
+                found = True
+
+        if not found:
             not_found.append(unit)
 
-    for f in found[:3]:
-        await _copy(chat_id, f.channel_chat_id, f.message_id)
+        if sent >= 3:
+            break
 
     if not_found:
         units_str = ", ".join(not_found)
@@ -302,26 +322,42 @@ async def _respond_brochure(chat_id: str, project_name: str, db: Session):
 # ─── Property search response ────────────────────────────────────────────────
 
 async def _respond_property_search(chat_id: str, keywords: list[str], db: Session):
-    """Search files by keywords from description, send matches or ask to specify."""
-    all_files = db.query(ToniFile).all()
-    matched = []
+    """Search Excel projects and legacy files by keywords, send top matches."""
+    matched_units: list[tuple[str, dict, str]] = []
 
     if keywords:
-        for f in all_files:
-            searchable = f"{f.file_name or ''} {f.caption or ''}".lower()
-            if any(kw.lower() in searchable for kw in keywords):
-                matched.append(f)
+        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+        for proj in projects:
+            idx: dict = proj.unit_index or {}
+            for unit_num, data in idx.items():
+                searchable = " ".join(str(v) for v in data.values()).lower()
+                if any(kw.lower() in searchable for kw in keywords):
+                    matched_units.append((unit_num, data, proj.project_name))
 
-    if matched:
-        for f in matched[:3]:
-            await _copy(chat_id, f.channel_chat_id, f.message_id)
-    else:
-        await _send(
-            chat_id,
-            f"Bazada mos variant topilmadi. "
-            f"Aniq loyiha yoki unit raqamini yozing — tezroq topamiz. "
-            f"Yoki {UMAR_CONTACT} bilan bog'laning."
-        )
+    if matched_units:
+        for unit_num, data, proj_name in matched_units[:3]:
+            card = format_unit_card(unit_num, data, proj_name)
+            await _send(chat_id, card)
+        return
+
+    # Fallback: search legacy ToniFile records
+    if keywords:
+        all_files = db.query(ToniFile).all()
+        matched_files = [
+            f for f in all_files
+            if any(kw.lower() in f"{f.file_name or ''} {f.caption or ''}".lower() for kw in keywords)
+        ]
+        if matched_files:
+            for f in matched_files[:3]:
+                await _copy(chat_id, f.channel_chat_id, f.message_id)
+            return
+
+    await _send(
+        chat_id,
+        f"Bazada mos variant topilmadi. "
+        f"Aniq loyiha yoki unit raqamini yozing — tezroq topamiz. "
+        f"Yoki {UMAR_CONTACT} bilan bog'laning."
+    )
 
 
 # ─── Morning report (called by scheduler at 9:00) ────────────────────────────

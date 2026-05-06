@@ -120,3 +120,19 @@ class ToniGroup(Base):
     title = Column(String)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
+
+
+class ToniProject(Base):
+    """Excel project file uploaded via admin panel."""
+    __tablename__ = "toni_projects"
+
+    id = Column(Integer, primary_key=True, index=True)
+    project_name = Column(String, index=True)   # human-readable name (from filename or override)
+    version = Column(Integer, default=1)
+    sheet_count = Column(Integer, default=0)
+    unit_count = Column(Integer, default=0)
+    sheets_data = Column(_json_type)            # {sheet_name: [row_dicts]}
+    unit_index = Column(_json_type)             # {unit_num: {_sheet, col: val, ...}}
+    is_active = Column(Boolean, default=True)
+    uploaded_at = Column(DateTime, default=func.now())
+    uploaded_by = Column(String, default="web")

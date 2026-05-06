@@ -15,7 +15,7 @@ class Base(DeclarativeBase):
 
 
 def init_db():
-    from models import Lead, Property, Appointment, Conversation  # noqa: F401
+    from models import Lead, Property, Appointment, Conversation, ToniFile, ToniGroup, ToniProject  # noqa: F401
     Base.metadata.create_all(bind=engine)
 
 
