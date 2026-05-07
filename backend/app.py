@@ -711,7 +711,10 @@ async def _process_excel_upload(
 
 # ─── Pending broadcast state (in-memory, cleared on restart) ─────────────────
 
+# pending[uid] = {agency_id, admin_id, from_chat_id, message_id, description}
 _pending_broadcasts: dict[str, dict] = {}
+# waiting_for_edit[admin_id] = uid  — admin is typing a new description
+_waiting_for_edit: dict[str, str] = {}
 
 
 def _is_urgent(text: str) -> bool:
@@ -726,7 +729,6 @@ def _wants_broadcast(caption: str) -> bool:
 
 
 def _is_inventory_file(fname: str, caption: str) -> bool:
-    """Excel/CSV without explicit brochure caption = inventory/project data."""
     f, c = fname.lower(), (caption or "").lower()
     if f.endswith((".xlsx", ".xls", ".csv")):
         return True
@@ -734,22 +736,32 @@ def _is_inventory_file(fname: str, caption: str) -> bool:
     return any(w in c or w in f for w in inv_kw)
 
 
-def _store_pending(agency_id: int, admin_id: str, message_id: int) -> str:
+def _store_pending(agency_id: int, admin_id: str, message_id: int, description: str = "") -> str:
     uid = uuid.uuid4().hex[:8]
     _pending_broadcasts[uid] = {
         "agency_id": agency_id,
         "admin_id": admin_id,
         "from_chat_id": admin_id,
         "message_id": message_id,
+        "description": description,
     }
     return uid
 
 
-def _confirm_keyboard(uid: str) -> dict:
-    return {"inline_keyboard": [[
-        {"text": "✅ Отправить в группы", "callback_data": f"confirm:{uid}"},
-        {"text": "❌ Отмена", "callback_data": f"cancel:{uid}"},
-    ]]}
+def _confirm_keyboard(uid: str, has_caption: bool = False) -> dict:
+    """has_caption=True → 2 buttons (admin wrote own description, no AI edit needed)."""
+    if has_caption:
+        return {"inline_keyboard": [[
+            {"text": "✅ Отправить", "callback_data": f"confirm:{uid}"},
+            {"text": "❌ Отмена", "callback_data": f"cancel:{uid}"},
+        ]]}
+    return {"inline_keyboard": [
+        [{"text": "✅ Отправить с описанием", "callback_data": f"confirm:{uid}"}],
+        [
+            {"text": "✏️ Изменить описание", "callback_data": f"edit:{uid}"},
+            {"text": "❌ Отмена", "callback_data": f"cancel:{uid}"},
+        ],
+    ]}
 
 
 def _save_brochure(db: Session, agency_id: int, file_id: str, fuid: str,
@@ -768,7 +780,7 @@ def _save_brochure(db: Session, agency_id: int, file_id: str, fuid: str,
 
 
 async def _analyze_brochure(file_bytes: bytes | None, fname: str, caption: str, file_type: str) -> str:
-    """Analyze brochure content with Claude. Returns formatted description."""
+    """Read file content with Claude. Returns formatted description for agents."""
     fname_lower = fname.lower()
     try:
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -782,12 +794,12 @@ async def _analyze_brochure(file_bytes: bytes | None, fname: str, caption: str, 
                     text += (page.extract_text() or "") + "\n"
             if text.strip():
                 resp = await ai.messages.create(
-                    model="claude-haiku-4-5-20251001", max_tokens=500,
+                    model="claude-haiku-4-5-20251001", max_tokens=600,
                     messages=[{"role": "user", "content": (
-                        f"Файл: {fname}\nПодпись: {caption or 'нет'}\n\n"
-                        f"Содержимое (первые страницы):\n{text[:3000]}\n\n"
-                        "Составь краткое описание (3-5 строк) для команды агентов. "
-                        "Выдели: проект, цены, типы юнитов, ключевые особенности. Ответь на русском."
+                        f"Файл: {fname}\n\nСодержимое PDF:\n{text[:4000]}\n\n"
+                        "Составь краткое профессиональное описание (4-6 строк) для команды агентов Dubai. "
+                        "Выдели: название проекта, цены, типы юнитов, ключевые особенности, ROI если есть. "
+                        "Используй эмодзи. Ответь на русском языке."
                     )}],
                 )
                 return resp.content[0].text.strip()
@@ -799,7 +811,7 @@ async def _analyze_brochure(file_bytes: bytes | None, fname: str, caption: str, 
             model="claude-haiku-4-5-20251001", max_tokens=200,
             messages=[{"role": "user", "content": (
                 f"Файл: {fname}\nПодпись: {caption or 'нет'}\n"
-                "Составь 2 строки описания для отправки агентам. Ответ на русском."
+                "Составь 2-3 строки описания для агентов недвижимости. Ответ на русском."
             )}],
         )
         return resp.content[0].text.strip()
@@ -809,47 +821,85 @@ async def _analyze_brochure(file_bytes: bytes | None, fname: str, caption: str, 
 
 
 async def _execute_broadcast(agency: Agency, from_chat_id: str, message_id: int,
-                              db: Session, tok: str) -> int:
-    """Forward a file to all active Telegram groups with 20-second intervals."""
+                              description: str, db: Session, tok: str) -> tuple[list, list]:
+    """Send description text → forward original file → footer to every active group.
+    Returns (success_group_names, failed_group_names)."""
     groups = db.query(ToniGroup).filter(
         ToniGroup.active == True, ToniGroup.agency_id == agency.id
     ).all()
-    count = 0
+    footer = f"💬 Есть вопросы? Пишите — отвечу!\n📞 {agency.umar_contact}"
+    success, failed = [], []
+
     for i, g in enumerate(groups):
         if i > 0:
             await asyncio.sleep(20)
-        ok = await toni_bot._copy(g.chat_id, from_chat_id, message_id, tok)
-        if ok:
-            count += 1
-    return count
+        try:
+            if description:
+                await toni_bot._send(g.chat_id, description, tok)
+            ok = await toni_bot._copy(g.chat_id, from_chat_id, message_id, tok)
+            await toni_bot._send(g.chat_id, footer, tok)
+            (success if ok else failed).append(g.title or g.chat_id)
+        except Exception:
+            failed.append(g.title or g.chat_id)
+
+    return success, failed
 
 
 async def _handle_brochure_file(agency: Agency, user_id: str, file_id: str, fuid: str,
                                  fname: str, caption: str, msg_id: int, file_type: str,
                                  db: Session, tok: str):
-    """Save brochure and either broadcast or ask confirmation."""
+    """Core brochure flow: save → urgent/auto-send or analyze → confirm."""
     _save_brochure(db, agency.id, file_id, fuid, fname, caption, file_type, msg_id, user_id)
 
+    # ── URGENT: no confirmation, broadcast immediately ────────────────────────
     if _is_urgent(caption):
-        count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
-        await send_message(user_id, f"⚡ Отправлено всем {count} группам!", token=tok)
+        success, failed = await _execute_broadcast(agency, user_id, msg_id, caption, db, tok)
+        lines = [f"⚡ Отправлено {len(success)} группам мгновенно!"]
+        if failed:
+            lines.append(f"❌ Ошибка: {', '.join(failed)}")
+        await send_message(user_id, "\n".join(lines), token=tok)
         return
 
-    fname_lower = fname.lower()
-    skip_download = fname_lower.endswith((".mp4", ".avi", ".mov", ".mkv"))
-    file_bytes = None if skip_download else await get_file_bytes(file_id, token=tok)
-    desc = await _analyze_brochure(file_bytes, fname, caption, file_type)
+    # ── Admin wrote own caption: use it, skip Claude ──────────────────────────
+    has_caption = bool(caption.strip())
+    if has_caption:
+        description = caption
+    else:
+        # Download and analyze with Claude
+        fname_lower = fname.lower()
+        is_video = fname_lower.endswith((".mp4", ".avi", ".mov", ".mkv"))
+        file_bytes = None if is_video else await get_file_bytes(file_id, token=tok)
+        await send_message(user_id, "📖 Читаю файл через Claude...", token=tok)
+        description = await _analyze_brochure(file_bytes, fname, caption, file_type)
 
+    # ── "Скинь всем" in caption: auto-broadcast without confirmation ──────────
     if _wants_broadcast(caption):
-        count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
-        await send_message(user_id, f"{desc}\n\n✅ Отправлено в {count} групп!", token=tok)
+        success, failed = await _execute_broadcast(agency, user_id, msg_id, description, db, tok)
+        lines = [f"✅ Отправлено: {len(success)} групп"]
+        if failed:
+            lines.append(f"❌ Ошибка: {', '.join(failed)}")
+        await send_message(user_id, "\n".join(lines), token=tok)
         return
 
-    uid = _store_pending(agency.id, user_id, msg_id)
-    await send_message(user_id, desc, token=tok)
-    await send_message_with_keyboard(
-        user_id, "Готово. Отправляем? ✅ / ❌", _confirm_keyboard(uid), token=tok
-    )
+    # ── Normal: show description + ask confirmation ───────────────────────────
+    uid = _store_pending(agency.id, user_id, msg_id, description)
+
+    if has_caption:
+        # Admin wrote own description — just confirm
+        await send_message_with_keyboard(
+            user_id,
+            f"📎 *{fname}*\n\n_{description}_\n\nГотово. Отправляем?",
+            _confirm_keyboard(uid, has_caption=True),
+            token=tok,
+        )
+    else:
+        # AI-generated — show it and offer edit option
+        await send_message(user_id, f"📝 *Описание для рассылки:*\n\n{description}", token=tok)
+        await send_message_with_keyboard(
+            user_id, "Отправляем с этим описанием?",
+            _confirm_keyboard(uid, has_caption=False),
+            token=tok,
+        )
 
 
 # ─── Telegram webhook (per-agency) ────────────────────────────────────────────
@@ -876,16 +926,33 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
             pending = _pending_broadcasts.pop(uid, None)
             if pending and pending["agency_id"] == agency.id:
                 await edit_message_text(cb_from_id, cb_msg_id, "⏳ Рассылаю по группам...", token=tok)
-                count = await _execute_broadcast(
-                    agency, pending["from_chat_id"], pending["message_id"], db, tok
+                success, failed = await _execute_broadcast(
+                    agency, pending["from_chat_id"], pending["message_id"],
+                    pending.get("description", ""), db, tok,
                 )
-                await edit_message_text(cb_from_id, cb_msg_id, f"✅ Отправлено в {count} групп!", token=tok)
+                lines = [f"✅ Отправлено: {len(success)} групп"]
+                if failed:
+                    lines.append(f"❌ Ошибка: {', '.join(failed)}")
+                await edit_message_text(cb_from_id, cb_msg_id, "\n".join(lines), token=tok)
+            else:
+                await edit_message_text(cb_from_id, cb_msg_id, "❌ Запрос устарел.", token=tok)
+
+        elif cb_data.startswith("edit:"):
+            uid = cb_data[5:]
+            if uid in _pending_broadcasts:
+                _waiting_for_edit[cb_from_id] = uid
+                await edit_message_text(
+                    cb_from_id, cb_msg_id,
+                    "✏️ Введите новое описание — я обновлю и спрошу снова:",
+                    token=tok,
+                )
             else:
                 await edit_message_text(cb_from_id, cb_msg_id, "❌ Запрос устарел.", token=tok)
 
         elif cb_data.startswith("cancel:"):
             uid = cb_data[7:]
             _pending_broadcasts.pop(uid, None)
+            _waiting_for_edit.pop(cb_from_id, None)
             await edit_message_text(cb_from_id, cb_msg_id, "❌ Отменено.", token=tok)
         return
 
@@ -1002,7 +1069,24 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
 
     await send_typing(user_id, token=tok)
 
-    # Urgent text → execute any pending broadcast for this admin
+    # ── Admin is editing a description (after clicking ✏️) ──────────────────
+    if user_id in _waiting_for_edit:
+        uid = _waiting_for_edit.pop(user_id)
+        pending = _pending_broadcasts.get(uid)
+        if pending and pending["agency_id"] == agency.id:
+            # Update description and re-ask confirmation
+            _pending_broadcasts[uid]["description"] = text
+            await send_message(user_id, f"📝 *Новое описание:*\n\n{text}", token=tok)
+            await send_message_with_keyboard(
+                user_id, "Отправляем с обновлённым описанием?",
+                _confirm_keyboard(uid, has_caption=True),
+                token=tok,
+            )
+        else:
+            await send_message(user_id, "❌ Файл не найден — отправьте его заново.", token=tok)
+        return
+
+    # ── Urgent text → execute pending broadcast immediately ──────────────────
     if _is_urgent(text):
         uid_found = next(
             (k for k, v in _pending_broadcasts.items()
@@ -1011,10 +1095,14 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         )
         if uid_found:
             pending = _pending_broadcasts.pop(uid_found)
-            count = await _execute_broadcast(
-                agency, pending["from_chat_id"], pending["message_id"], db, tok
+            success, failed = await _execute_broadcast(
+                agency, pending["from_chat_id"], pending["message_id"],
+                pending.get("description", ""), db, tok,
             )
-            await send_message(user_id, f"⚡ Отправлено всем {count} группам!", token=tok)
+            lines = [f"⚡ Отправлено всем {len(success)} группам мгновенно!"]
+            if failed:
+                lines.append(f"❌ Ошибка: {', '.join(failed)}")
+            await send_message(user_id, "\n".join(lines), token=tok)
             return
 
     if text == "/tonigroups":
