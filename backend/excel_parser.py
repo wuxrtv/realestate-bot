@@ -225,6 +225,42 @@ def parse_csv(file_bytes: bytes) -> dict[str, list[dict[str, Any]]]:
     return {"Sheet1": rows} if rows else {}
 
 
+def parse_pdf(file_bytes: bytes) -> dict[str, list[dict[str, Any]]]:
+    """Extract tables from PDF. Returns sheets_data format or empty dict if no tables found."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return {}
+
+    result: dict[str, list[dict[str, Any]]] = {}
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            tables = page.extract_tables()
+            for t_idx, table in enumerate(tables):
+                if not table or len(table) < 2:
+                    continue
+                headers = [str(c).strip() if c else f"col_{i}" for i, c in enumerate(table[0])]
+                seen: dict[str, int] = {}
+                clean_headers = []
+                for h in headers:
+                    if h in seen:
+                        seen[h] += 1
+                        clean_headers.append(f"{h}_{seen[h]}")
+                    else:
+                        seen[h] = 0
+                        clean_headers.append(h)
+                rows = []
+                for row in table[1:]:
+                    row_dict = {clean_headers[i]: (str(row[i]).strip() if i < len(row) and row[i] else "")
+                                for i in range(len(clean_headers))}
+                    if any(v for v in row_dict.values()):
+                        rows.append(row_dict)
+                if rows:
+                    key = f"Page{page_num}" if len(tables) == 1 else f"Page{page_num}_T{t_idx+1}"
+                    result[key] = rows
+    return result
+
+
 def _format_aed(v: str) -> str:
     """Format a numeric string as AED price with thousand separators."""
     try:

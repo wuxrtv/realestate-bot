@@ -152,12 +152,12 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
     import re as _re
     from datetime import datetime as _dt
     from excel_parser import (build_unit_index, diff_unit_indexes, format_diff_report,
-                              normalize_project_name, parse_csv, parse_excel)
+                              normalize_project_name, parse_csv, parse_excel, parse_pdf)
 
     fname_lower = file_name.lower()
-    if not fname_lower.endswith((".xlsx", ".xls", ".csv")):
+    if not fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
         await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
-                       "Поддерживаются файлы: .xlsx, .xls, .csv")
+                       "Поддерживаются файлы: .xlsx, .xls, .csv, .pdf")
         return
 
     await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"📊 Читаю файл {file_name}...")
@@ -172,7 +172,12 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         return
 
     try:
-        sheets_data = parse_csv(file_bytes) if fname_lower.endswith(".csv") else parse_excel(file_bytes)
+        if fname_lower.endswith(".csv"):
+            sheets_data = parse_csv(file_bytes)
+        elif fname_lower.endswith(".pdf"):
+            sheets_data = parse_pdf(file_bytes)
+        else:
+            sheets_data = parse_excel(file_bytes)
     except Exception as e:
         await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"❌ Ошибка чтения файла: {e}")
         return

@@ -32,6 +32,7 @@ from excel_parser import (
     normalize_project_name,
     parse_csv,
     parse_excel,
+    parse_pdf,
 )
 from models import Agency, ToniFile, ToniGroup, ToniProject, WhatsAppGroup
 import toni_bot
@@ -613,8 +614,11 @@ async def _process_excel_upload(
         return
 
     try:
-        if file_name.lower().endswith(".csv"):
+        fname_lower = file_name.lower()
+        if fname_lower.endswith(".csv"):
             sheets_data = parse_csv(file_bytes)
+        elif fname_lower.endswith(".pdf"):
+            sheets_data = parse_pdf(file_bytes)
         else:
             sheets_data = parse_excel(file_bytes)
     except Exception as e:
@@ -770,7 +774,7 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         caption = (message.get("caption") or "").strip()
         fname_lower = fname.lower()
 
-        if fname_lower.endswith((".xlsx", ".xls", ".csv")):
+        if fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
             await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
             return
 
