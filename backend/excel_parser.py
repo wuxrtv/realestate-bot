@@ -17,6 +17,12 @@ _UNIT_KEYS = frozenset({
 
 _UNIT_RE = re.compile(r"^\d{3,5}$")
 
+_PRICE_COL_RE = re.compile(
+    r"(price|cost|цена|стоимость|прайс|total|amount|сумма|value|aed|dirham)",
+    re.IGNORECASE,
+)
+_NUMERIC_RE = re.compile(r"^[\d,.\s]+$")
+
 
 def normalize_project_name(filename: str) -> str:
     """'Breez Tower Units v2.xlsx' → 'Breez Tower'"""
@@ -219,6 +225,18 @@ def parse_csv(file_bytes: bytes) -> dict[str, list[dict[str, Any]]]:
     return {"Sheet1": rows} if rows else {}
 
 
+def _format_aed(v: str) -> str:
+    """Format a numeric string as AED price with thousand separators."""
+    try:
+        num = float(str(v).replace(",", "").replace(" ", ""))
+        if num >= 1000:
+            formatted = f"{int(num):,}".replace(",", " ") if num == int(num) else f"{num:,.2f}".replace(",", " ")
+            return f"{formatted} AED"
+    except (ValueError, TypeError):
+        pass
+    return str(v)
+
+
 def format_unit_card(unit_num: str, data: dict, project_name: str) -> str:
     """Format unit data as a readable Telegram message."""
     sheet = data.get("_sheet", "")
@@ -230,6 +248,9 @@ def format_unit_card(unit_num: str, data: dict, project_name: str) -> str:
     for k, v in data.items():
         if k in skip or not v or v in ("None", "nan", ""):
             continue
+        # Auto-format price columns with AED currency
+        if _PRICE_COL_RE.search(str(k)) and _NUMERIC_RE.match(str(v).strip()):
+            v = _format_aed(str(v))
         lines.append(f"• {k}: {v}")
 
     return "\n".join(lines)

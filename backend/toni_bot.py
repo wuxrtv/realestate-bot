@@ -416,9 +416,9 @@ async def send_morning_report():
             lines = ["📊 Доброе утро! Актуальный инвентарь на сегодня:\n"]
             for p in props[:20]:
                 if p.listing_type == "rent" and p.rent_price:
-                    price = f"{p.rent_price:,.0f} $/мес".replace(",", " ")
+                    price = f"{p.rent_price:,.0f} AED/мес".replace(",", " ")
                 elif p.price:
-                    price = f"{p.price:,.0f} $".replace(",", " ")
+                    price = f"{p.price:,.0f} AED".replace(",", " ")
                 else:
                     price = "цена по запросу"
                 rooms = f"{p.rooms}к " if p.rooms else ""
