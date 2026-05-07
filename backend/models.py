@@ -55,6 +55,17 @@ class ToniGroup(Base):
     created_at = Column(DateTime, default=func.now())
 
 
+class AdminConversation(Base):
+    """Persistent conversation history for admin ↔ AdminAgent chat."""
+    __tablename__ = "admin_conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    agency_id = Column(Integer, index=True)
+    user_id = Column(String, index=True)
+    history = Column(_json_type, default=list)   # list of {role, content} dicts
+    updated_at = Column(DateTime, default=func.now())
+
+
 class ToniProject(Base):
     """Excel project file uploaded via admin."""
     __tablename__ = "toni_projects"

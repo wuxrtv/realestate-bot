@@ -10,7 +10,7 @@ import os
 import anthropic
 from sqlalchemy.orm import Session
 
-from models import ToniProject
+from models import AdminConversation, ToniProject
 
 logger = logging.getLogger(__name__)
 
@@ -68,11 +68,27 @@ def is_admin(user_id: str, agency) -> bool:
 class AdminAgent:
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        self._history: dict[str, list] = {}
+
+    def _load_history(self, db: Session, agency_id: int, user_id: str) -> tuple[AdminConversation, list]:
+        conv = db.query(AdminConversation).filter(
+            AdminConversation.agency_id == agency_id,
+            AdminConversation.user_id == user_id,
+        ).first()
+        if not conv:
+            conv = AdminConversation(agency_id=agency_id, user_id=user_id, history=[])
+            db.add(conv)
+            db.flush()
+        return conv, list(conv.history or [])
+
+    def _save_history(self, db: Session, conv: AdminConversation, history: list):
+        from sqlalchemy.orm.attributes import flag_modified
+        conv.history = history[-30:]
+        conv.updated_at = __import__("datetime").datetime.now()
+        flag_modified(conv, "history")
+        db.commit()
 
     async def process(self, agency, user_id: str, message: str, db: Session) -> str:
-        history_key = f"{agency.id}:{user_id}"
-        history = self._history.get(history_key, [])
+        conv, history = self._load_history(db, agency.id, user_id)
         history.append({"role": "user", "content": message})
 
         try:
@@ -105,7 +121,7 @@ class AdminAgent:
                     continue
                 break
 
-            self._history[history_key] = history[-30:]
+            self._save_history(db, conv, history)
 
             final = ""
             for block in response.content:
@@ -114,7 +130,8 @@ class AdminAgent:
             return final or "Готово."
 
         except Exception:
-            self._history.pop(history_key, None)
+            conv.history = []
+            db.commit()
             logger.exception(f"AdminAgent API error for user {user_id}")
             raise
 
