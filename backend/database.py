@@ -19,6 +19,7 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     _migrate()
     _seed_default_agency()
+    _sync_env_to_default_agency()
 
 
 def _migrate():
@@ -69,6 +70,34 @@ def _seed_default_agency():
             umar_contact=os.getenv("TONI_UMAR_CONTACT", "@support"),
             db_channel_id=os.getenv("TONI_DB_CHANNEL", ""),
         ))
+        db.commit()
+    finally:
+        db.close()
+
+
+def _sync_env_to_default_agency():
+    """Sync WA env vars to the default agency on every startup."""
+    wa_instance_id = os.getenv("WA_INSTANCE_ID", "")
+    wa_token = os.getenv("WA_TOKEN", "")
+    wa_admin_numbers_raw = os.getenv("WA_ADMIN_NUMBERS", "")
+
+    if not wa_instance_id and not wa_token:
+        return
+
+    db = SessionLocal()
+    try:
+        from models import Agency
+        agency = db.query(Agency).filter(Agency.slug == "default").first()
+        if not agency:
+            return
+        if wa_instance_id:
+            agency.wa_instance_id = wa_instance_id
+        if wa_token:
+            agency.wa_token = wa_token
+        if wa_admin_numbers_raw:
+            agency.wa_admin_numbers = [
+                n.strip().lstrip("+") for n in wa_admin_numbers_raw.split(",") if n.strip()
+            ]
         db.commit()
     finally:
         db.close()
