@@ -17,7 +17,7 @@ from datetime import datetime
 
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -866,36 +866,74 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         await send_message(user_id, f"Ошибка: {e}", token=tok)
 
 
+async def _bg_telegram_webhook(data: dict, agency_id: int):
+    """Background task — processes Telegram update with its own DB session."""
+    db = SessionLocal()
+    try:
+        agency = db.query(Agency).filter(Agency.id == agency_id, Agency.is_active == True).first()
+        if agency:
+            await _handle_webhook(data, agency, db)
+    except Exception:
+        logger.exception("TG webhook background error")
+    finally:
+        db.close()
+
+
+async def _bg_wa_webhook(data: dict, agency_id: int):
+    """Background task — processes WhatsApp update with its own DB session."""
+    db = SessionLocal()
+    try:
+        agency = db.query(Agency).filter(Agency.id == agency_id, Agency.is_active == True).first()
+        if agency:
+            await whatsapp_bot.handle_update(data, agency)
+    except Exception:
+        logger.exception("WA webhook background error")
+    finally:
+        db.close()
+
+
 @app.post("/telegram/webhook/{slug}")
-async def telegram_webhook_agency(slug: str, request: Request, db: Session = Depends(get_db)):
-    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
-    if not agency:
-        return {"ok": True}
+async def telegram_webhook_agency(slug: str, request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
-    await _handle_webhook(data, agency, db)
+    db = SessionLocal()
+    try:
+        agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+        agency_id = agency.id if agency else None
+    finally:
+        db.close()
+    if agency_id:
+        background_tasks.add_task(_bg_telegram_webhook, data, agency_id)
     return {"ok": True}
 
 
 @app.post("/telegram/webhook")
-async def telegram_webhook_default(request: Request, db: Session = Depends(get_db)):
+async def telegram_webhook_default(request: Request, background_tasks: BackgroundTasks):
     """Backward-compat route — uses the 'default' agency slug."""
-    agency = db.query(Agency).filter(Agency.slug == "default", Agency.is_active == True).first()
-    if not agency:
-        return {"ok": True}
     data = await request.json()
-    await _handle_webhook(data, agency, db)
+    db = SessionLocal()
+    try:
+        agency = db.query(Agency).filter(Agency.slug == "default", Agency.is_active == True).first()
+        agency_id = agency.id if agency else None
+    finally:
+        db.close()
+    if agency_id:
+        background_tasks.add_task(_bg_telegram_webhook, data, agency_id)
     return {"ok": True}
 
 
 # ─── WhatsApp webhook (Green API) ────────────────────────────────────────────
 
 @app.post("/whatsapp/webhook/{slug}")
-async def whatsapp_webhook(slug: str, request: Request, db: Session = Depends(get_db)):
-    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
-    if not agency:
-        return {"ok": True}
+async def whatsapp_webhook(slug: str, request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
-    await whatsapp_bot.handle_update(data, agency)
+    db = SessionLocal()
+    try:
+        agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+        agency_id = agency.id if agency else None
+    finally:
+        db.close()
+    if agency_id:
+        background_tasks.add_task(_bg_wa_webhook, data, agency_id)
     return {"ok": True}
 
 
