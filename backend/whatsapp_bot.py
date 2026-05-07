@@ -7,6 +7,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 
 import anthropic
@@ -16,7 +17,16 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from excel_parser import format_unit_card
 from models import Agency, ToniProject, WhatsAppGroup
-from toni_bot import _SYSTEM_BASE, _load_group_history, _save_group_history
+from toni_bot import (
+    _FOLLOWUP_MSGS,
+    _MIDDAY_MSGS,
+    _MORNING_GREETINGS,
+    _SYSTEM_BASE,
+    _day_state,
+    _load_group_history,
+    _save_group_history,
+    mark_admin_active,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +136,7 @@ async def handle_update(data: dict, agency: Agency):
             file_name = file_data.get("fileName", "file")
             caption = file_data.get("caption", "").strip()
             if download_url:
+                mark_admin_active(agency.id)
                 await _handle_admin_document(chat_id, sender_phone, download_url, file_name, caption, db, agency)
         elif msg_type == "textMessage":
             text: str = message_data.get("textMessageData", {}).get("textMessage", "").strip()
@@ -133,14 +144,85 @@ async def handle_update(data: dict, agency: Agency):
             if not text:
                 return
             if not is_group and admin_check:
+                mark_admin_active(agency.id)
                 await _handle_admin_message(chat_id, sender_phone, text, db, agency)
             elif is_group and _is_tony_mentioned(text):
                 group_title = sender_data.get("chatName", chat_id)
                 await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
+            elif not is_group and not admin_check:
+                await _handle_stranger_message(chat_id, agency)
             else:
                 logger.info(f"WA message not handled: is_group={is_group} is_admin={admin_check} tony_mentioned={_is_tony_mentioned(text)}")
     except Exception:
         logger.exception("WA handle_update error")
+    finally:
+        db.close()
+
+
+# ─── Stranger private message ────────────────────────────────────────────────
+
+_STRANGER_MSGS = [
+    "Hey! 👋 I work in the groups mostly 😄\nInterested in a project? Ask in the group or contact: {contact}",
+    "Hi there! 👋 I'm mainly active in group chats.\nFor personal assistance, reach out to: {contact}",
+    "Hey! 😊 I handle group requests — for direct help, message: {contact}",
+    "Привет! 👋 Я работаю в группах, а для личного общения лучше написать: {contact}",
+]
+
+
+async def _handle_stranger_message(chat_id: str, agency: Agency):
+    msg = random.choice(_STRANGER_MSGS).format(contact=agency.umar_contact or "@support")
+    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, msg)
+
+
+# ─── WhatsApp scheduled jobs ──────────────────────────────────────────────────
+
+async def send_wa_morning_greeting():
+    """08:00 — morning greeting to WA admins."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not agency.wa_instance_id or not agency.wa_token:
+                continue
+            greeting = random.choice(_MORNING_GREETINGS)
+            for phone in (agency.wa_admin_numbers or []):
+                await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", greeting)
+    finally:
+        db.close()
+
+
+async def send_wa_morning_followup():
+    """08:45 — follow up once if WA admin hasn't replied."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not agency.wa_instance_id or not agency.wa_token:
+                continue
+            state = _day_state(agency.id)
+            if state["morning_replied"] or state["follow_up_sent"]:
+                continue
+            state["follow_up_sent"] = True
+            msg = random.choice(_FOLLOWUP_MSGS)
+            for phone in (agency.wa_admin_numbers or []):
+                await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", msg)
+    finally:
+        db.close()
+
+
+async def send_wa_midday_checkin():
+    """14:00 — midday check-in if admin hasn't been active today."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not agency.wa_instance_id or not agency.wa_token:
+                continue
+            if _day_state(agency.id)["morning_replied"]:
+                continue
+            msg = random.choice(_MIDDAY_MSGS)
+            for phone in (agency.wa_admin_numbers or []):
+                await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", msg)
     finally:
         db.close()
 

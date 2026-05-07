@@ -79,7 +79,12 @@ async def lifespan(app: FastAPI):
 
     scheduler.add_job(toni_bot.send_morning_greeting_to_admin, "cron", hour=8, minute=0, id="toni_morning_admin")
     scheduler.add_job(toni_bot.send_morning_report, "cron", hour=8, minute=0, id="toni_morning_groups")
+    scheduler.add_job(toni_bot.send_morning_followup, "cron", hour=8, minute=45, id="toni_followup")
+    scheduler.add_job(toni_bot.send_midday_checkin, "cron", hour=14, minute=0, id="toni_midday")
     scheduler.add_job(toni_bot.send_end_of_day_report, "cron", hour=20, minute=0, id="toni_evening_report")
+    scheduler.add_job(whatsapp_bot.send_wa_morning_greeting, "cron", hour=8, minute=0, id="wa_morning_admin")
+    scheduler.add_job(whatsapp_bot.send_wa_morning_followup, "cron", hour=8, minute=45, id="wa_followup")
+    scheduler.add_job(whatsapp_bot.send_wa_midday_checkin, "cron", hour=14, minute=0, id="wa_midday")
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -734,6 +739,8 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
 
     if not is_admin(user_id, agency):
         return
+
+    toni_bot.mark_admin_active(agency.id)
 
     # ── 1. Voice ──────────────────────────────────────────────────────────────
     voice = message.get("voice") or message.get("audio")

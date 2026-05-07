@@ -31,6 +31,21 @@ GREETING = (
 _UNIT_RE = re.compile(r"\b(\d{3,5})\b")
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
 
+# Daily state — tracks whether admin responded/was active today (resets on restart)
+_daily: dict[str, dict] = {}
+
+
+def _day_state(agency_id: int) -> dict:
+    key = f"{agency_id}_{datetime.now().strftime('%Y-%m-%d')}"
+    if key not in _daily:
+        _daily[key] = {"morning_replied": False, "follow_up_sent": False}
+    return _daily[key]
+
+
+def mark_admin_active(agency_id: int):
+    """Call whenever admin sends any message to mark them as active today."""
+    _day_state(agency_id)["morning_replied"] = True
+
 _SYSTEM_BASE = """You are TONY — an AI Sales Assistant for a real estate agency in Dubai.
 You are in a group chat with real estate agents. Your name is Tony.
 
@@ -488,6 +503,22 @@ _MORNING_GREETINGS = [
     "Morning! The groups are waiting — what do we broadcast today?",
 ]
 
+_FOLLOWUP_MSGS = [
+    "Hey, just checking — did you see my morning message? What are we working with today?",
+    "Morning! Still here whenever you're ready — anything to push out?",
+    "Just a nudge — let me know what projects we're focusing on today!",
+    "Bro, you there? Ready when you are 🙌",
+    "Hey, no rush — just checking in. Anything for the groups today?",
+]
+
+_MIDDAY_MSGS = [
+    "Hey, any offers worth sharing this afternoon?",
+    "Есть что-нибудь для рассылки после обеда?",
+    "Bro, anything new to drop? Groups are active 👀",
+    "Afternoon check-in — anything worth broadcasting today?",
+    "Hey, groups are busy — got any content to share?",
+]
+
 async def send_morning_greeting_to_admin():
     """Send a personal morning message to all admins at 08:00."""
     db = SessionLocal()
@@ -497,6 +528,38 @@ async def send_morning_greeting_to_admin():
             greeting = random.choice(_MORNING_GREETINGS)
             for admin_id in (agency.admin_ids or []):
                 await _send(admin_id, greeting, agency.bot_token)
+    finally:
+        db.close()
+
+
+async def send_morning_followup():
+    """08:45 — send one follow-up if admin hasn't replied to morning greeting."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            state = _day_state(agency.id)
+            if state["morning_replied"] or state["follow_up_sent"]:
+                continue
+            state["follow_up_sent"] = True
+            msg = random.choice(_FOLLOWUP_MSGS)
+            for admin_id in (agency.admin_ids or []):
+                await _send(admin_id, msg, agency.bot_token)
+    finally:
+        db.close()
+
+
+async def send_midday_checkin():
+    """14:00 — check in if admin hasn't been active today."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if _day_state(agency.id)["morning_replied"]:
+                continue
+            msg = random.choice(_MIDDAY_MSGS)
+            for admin_id in (agency.admin_ids or []):
+                await _send(admin_id, msg, agency.bot_token)
     finally:
         db.close()
 
