@@ -29,7 +29,7 @@ class Agency(Base):
 
 
 class ToniFile(Base):
-    """File indexed from the private database channel."""
+    """File indexed from the private database channel or sent directly by admin."""
     __tablename__ = "toni_files"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -40,6 +40,7 @@ class ToniFile(Base):
     caption = Column(Text)
     file_type = Column(String)
     unit_numbers = Column(_json_type, default=list)
+    project_name = Column(String, default="", nullable=True)   # linked project
     message_id = Column(Integer)
     channel_chat_id = Column(String)
     created_at = Column(DateTime, default=func.now())

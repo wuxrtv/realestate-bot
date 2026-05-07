@@ -409,7 +409,9 @@ async def _respond_brochure(chat_id: str, project_name: str, db: Session, agency
         pn = project_name.lower()
         matched = [
             f for f in all_files
-            if pn in (f.file_name or "").lower() or pn in (f.caption or "").lower()
+            if pn in (f.file_name or "").lower()
+            or pn in (f.caption or "").lower()
+            or pn in (f.project_name or "").lower()
         ]
     else:
         matched = sorted(all_files, key=lambda x: x.id, reverse=True)[:3]
@@ -466,7 +468,7 @@ async def _respond_property_search(chat_id: str, keywords: list[str],
         all_files = db.query(ToniFile).filter(ToniFile.agency_id == agency.id).all()
         matched_files = [
             f for f in all_files
-            if any(kw.lower() in f"{f.file_name or ''} {f.caption or ''}".lower() for kw in keywords)
+            if any(kw.lower() in f"{f.file_name or ''} {f.caption or ''} {f.project_name or ''}".lower() for kw in keywords)
         ]
         if matched_files:
             for f in matched_files[:3]:

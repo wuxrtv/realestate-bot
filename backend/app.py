@@ -395,9 +395,9 @@ def _agency_admin_html(agency: Agency, projects: list) -> str:
       <h2>📲 Как загрузить проект</h2>
       <div class="hint">
         Отправьте Excel-файл (<strong>.xlsx</strong> или <strong>.xls</strong>) боту в личный чат в Telegram.<br>
-        • Бот прочитает все листы и запомнит данные.<br>
+        • Бот прочитает все листы и сохранит как <strong>один проект</strong>.<br>
         • Если проект уже был загружен — бот покажет что изменилось.<br>
-        • Если файл с несколькими листами — каждый лист сохраняется как отдельный проект.
+        • Если название проекта не найдено в файле — бот спросит как его назвать.
       </div>
     </div>
     <div class="card">
@@ -557,6 +557,32 @@ async def _detect_project_name_ai(sheets_data: dict, filename: str) -> str:
         return normalize_project_name(filename)
 
 
+async def _detect_project_name_or_none(sheets_data: dict, filename: str) -> str | None:
+    """Returns project name or None when Claude is not confident enough to name it."""
+    try:
+        first_sheet = next(iter(sheets_data.values()), [])
+        headers = list(first_sheet[0].keys()) if first_sheet else []
+        sample = first_sheet[:2]
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=80,
+            messages=[{"role": "user", "content": (
+                f"Файл: {filename}\nЛисты: {list(sheets_data.keys())}\n"
+                f"Заголовки: {headers}\nПример строк: {json.dumps(sample, ensure_ascii=False, default=str)}\n"
+                "Как называется этот проект недвижимости? "
+                "Если НЕ УВЕРЕН — ответь только: UNKNOWN. "
+                "Если уверен — ответь только названием (без кавычек и пояснений)."
+            )}],
+        )
+        name = resp.content[0].text.strip()
+        if not name or name.upper() == "UNKNOWN" or len(name) > 80:
+            return None
+        return name
+    except Exception:
+        return None
+
+
 # ─── Telegram spreadsheet upload handler ─────────────────────────────────────
 
 _GENERIC_SHEET = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
@@ -612,99 +638,87 @@ async def _process_excel_upload(
     file_name: str,
     project_name_override: str,
     db: Session,
+    sheets_data: dict | None = None,
 ):
+    """Parse Excel/CSV and save ALL sheets as ONE project. If name unknown, ask admin."""
     tok = agency.bot_token
-    await send_typing(user_id, token=tok)
-    await send_message(user_id, f"📊 Читаю файл *{file_name}*...", token=tok)
 
-    file_bytes = await get_file_bytes(file_id, token=tok)
-    if not file_bytes:
-        await send_message(user_id, "❌ Не удалось скачать файл. Попробуй ещё раз.", token=tok)
-        return
+    if sheets_data is None:
+        await send_typing(user_id, token=tok)
+        await send_message(user_id, f"📊 Читаю файл *{file_name}*...", token=tok)
 
-    try:
-        fname_lower = file_name.lower()
-        if fname_lower.endswith(".csv"):
-            sheets_data = parse_csv(file_bytes)
-        elif fname_lower.endswith(".pdf"):
-            sheets_data = parse_pdf(file_bytes)
-        else:
-            sheets_data = parse_excel(file_bytes)
-    except Exception as e:
-        logger.exception("Spreadsheet parse error")
-        await send_message(user_id, f"❌ Ошибка чтения файла: {e}", token=tok)
-        return
+        file_bytes = await get_file_bytes(file_id, token=tok)
+        if not file_bytes:
+            await send_message(user_id, "❌ Не удалось скачать файл. Попробуй ещё раз.", token=tok)
+            return
 
-    if not sheets_data:
-        await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.", token=tok)
-        return
-
-    # Single sheet: respect caption override or detect name
-    # Multiple sheets: always split one project per sheet; caption is ignored
-    if len(sheets_data) == 1:
-        sheet_name, _ = next(iter(sheets_data.items()))
-        if project_name_override.strip():
-            name = project_name_override.strip()
-        elif _GENERIC_SHEET.match(sheet_name.strip()):
-            name = await _detect_project_name_ai(sheets_data, file_name)
-        else:
-            name = sheet_name.strip()
-        tasks = [(name, sheets_data)]
-    else:
-        file_stem = os.path.splitext(file_name)[0]
-        tasks = []
-        for sheet_name, rows in sheets_data.items():
-            single = {sheet_name: rows}
-            if _GENERIC_SHEET.match(sheet_name.strip()):
-                name = f"{normalize_project_name(file_stem)} — {sheet_name.strip()}"
+        try:
+            fname_lower = file_name.lower()
+            if fname_lower.endswith(".csv"):
+                sheets_data = parse_csv(file_bytes)
+            elif fname_lower.endswith(".pdf"):
+                sheets_data = parse_pdf(file_bytes)
             else:
-                name = sheet_name.strip()
-            tasks.append((name, single))
+                sheets_data = parse_excel(file_bytes)
+        except Exception as e:
+            logger.exception("Spreadsheet parse error")
+            await send_message(user_id, f"❌ Ошибка чтения файла: {e}", token=tok)
+            return
 
-    results = []
-    for name, sheets in tasks:
-        r = await _save_project(name, sheets, user_id, db, agency_id=agency.id)
-        results.append(r)
+        if not sheets_data:
+            await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.", token=tok)
+            return
 
-    saved = [r for r in results if r["status"] != "skipped"]
-    skipped = [r for r in results if r["status"] == "skipped"]
+    # Determine project name — all sheets become ONE project
+    if project_name_override.strip():
+        name = project_name_override.strip()
+    else:
+        non_generic = [s for s in sheets_data.keys() if not _GENERIC_SHEET.match(s.strip())]
+        if len(non_generic) == 1 and len(sheets_data) == 1:
+            name = non_generic[0].strip()
+        else:
+            name = await _detect_project_name_or_none(sheets_data, file_name)
+            if name is None:
+                # Ask admin to name the project
+                _waiting_for_project_name[user_id] = {
+                    "agency_id": agency.id,
+                    "file_name": file_name,
+                    "sheets_data": sheets_data,
+                }
+                sheet_list = ", ".join(list(sheets_data.keys())[:5])
+                await send_message(
+                    user_id,
+                    f"📊 Файл прочитан. Листов: *{len(sheets_data)}* ({sheet_list})\n\n"
+                    "Как назвать этот проект? Напишите название:",
+                    token=tok,
+                )
+                return
 
-    if not saved:
-        await send_message(user_id, "❌ Ни в одном листе не найдены юниты.", token=tok)
+    r = await _save_project(name, sheets_data, user_id, db, agency_id=agency.id)
+
+    if r["status"] == "skipped":
+        await send_message(user_id, "❌ В файле не найдены юниты (нет числовых номеров в данных).", token=tok)
         return
 
-    if len(saved) == 1:
-        r = saved[0]
-        if r["status"] == "updated":
-            await send_message(
-                user_id,
-                f"✅ Проект *{r['name']}* обновлён → v{r['version']}\n"
-                f"Юнитов: {r['units']}\n\n{r['diff_report']}",
-                token=tok,
-            )
-        else:
-            await send_message(
-                user_id,
-                f"✅ Проект *{r['name']}* сохранён!\nЮнитов: {r['units']}",
-                token=tok,
-            )
+    if r["status"] == "updated":
+        await send_message(
+            user_id,
+            f"✅ Проект *{r['name']}* обновлён → v{r['version']}\n"
+            f"Листов: {len(sheets_data)}, юнитов: {r['units']}\n\n{r['diff_report']}",
+            token=tok,
+        )
     else:
-        lines = [f"✅ Из файла *{file_name}* сохранено *{len(saved)}* проектов:\n"]
-        for r in saved:
-            icon = "🔄" if r["status"] == "updated" else "📁"
-            ver = f"→ v{r['version']}" if r["status"] == "updated" else "(новый)"
-            lines.append(f"{icon} *{r['name']}* — {r['units']} юн. {ver}")
-        if skipped:
-            lines.append(f"\n⚠️ Пропущено (нет юнитов): {', '.join(r['name'] for r in skipped)}")
-        await send_message(user_id, "\n".join(lines), token=tok)
+        await send_message(
+            user_id,
+            f"✅ Проект *{r['name']}* сохранён!\nЛистов: {len(sheets_data)}, юнитов: {r['units']}",
+            token=tok,
+        )
 
-    new_names = [r["name"] for r in saved if r["status"] == "created"]
-    if new_names:
+    if r["status"] == "created":
         groups = db.query(ToniGroup).filter(
             ToniGroup.active == True, ToniGroup.agency_id == agency.id
         ).all()
-        names_str = ", ".join(f"*{n}*" for n in new_names)
-        announce = f"📁 Новые проекты добавлены: {names_str}\nСпрашивайте по номеру юнита!"
+        announce = f"📁 Новый проект добавлен: *{r['name']}*\nСпрашивайте по номеру юнита!"
         for g in groups:
             await toni_bot._send(g.chat_id, announce, agency.bot_token)
 
@@ -715,6 +729,8 @@ async def _process_excel_upload(
 _pending_broadcasts: dict[str, dict] = {}
 # waiting_for_edit[admin_id] = uid  — admin is typing a new description
 _waiting_for_edit: dict[str, str] = {}
+# waiting_for_project_name[admin_id] = {agency_id, sheets_data, file_name}
+_waiting_for_project_name: dict[str, dict] = {}
 
 
 def _is_urgent(text: str) -> bool:
@@ -766,17 +782,21 @@ def _confirm_keyboard(uid: str, has_caption: bool = False) -> dict:
 
 def _save_brochure(db: Session, agency_id: int, file_id: str, fuid: str,
                    fname: str, caption: str, file_type: str,
-                   message_id: int, from_chat_id: str):
+                   message_id: int, from_chat_id: str) -> "ToniFile":
     key = fuid or f"admin_{from_chat_id}_{message_id}"
-    if db.query(ToniFile).filter(ToniFile.file_unique_id == key).first():
-        return
+    existing = db.query(ToniFile).filter(ToniFile.file_unique_id == key).first()
+    if existing:
+        return existing
     units = list(set(toni_bot._extract_units(fname) + toni_bot._extract_units(caption)))
-    db.add(ToniFile(
+    tf = ToniFile(
         agency_id=agency_id, file_id=file_id, file_unique_id=key,
         file_name=fname, caption=caption, file_type=file_type,
-        unit_numbers=units, message_id=message_id, channel_chat_id=from_chat_id,
-    ))
+        unit_numbers=units, project_name="",
+        message_id=message_id, channel_chat_id=from_chat_id,
+    )
+    db.add(tf)
     db.commit()
+    return tf
 
 
 async def _analyze_brochure(file_bytes: bytes | None, fname: str, caption: str, file_type: str) -> str:
@@ -848,7 +868,7 @@ async def _execute_broadcast(agency: Agency, from_chat_id: str, message_id: int,
 async def _handle_brochure_file(agency: Agency, user_id: str, file_id: str, fuid: str,
                                  fname: str, caption: str, msg_id: int, file_type: str,
                                  db: Session, tok: str):
-    """Core brochure flow: save → urgent/auto-send or analyze → confirm."""
+    """Core brochure flow: save → urgent/auto-send or analyze → link project → confirm."""
     _save_brochure(db, agency.id, file_id, fuid, fname, caption, file_type, msg_id, user_id)
 
     # ── URGENT: no confirmation, broadcast immediately ────────────────────────
@@ -865,7 +885,6 @@ async def _handle_brochure_file(agency: Agency, user_id: str, file_id: str, fuid
     if has_caption:
         description = caption
     else:
-        # Download and analyze with Claude
         fname_lower = fname.lower()
         is_video = fname_lower.endswith((".mp4", ".avi", ".mov", ".mkv"))
         file_bytes = None if is_video else await get_file_bytes(file_id, token=tok)
@@ -882,25 +901,46 @@ async def _handle_brochure_file(agency: Agency, user_id: str, file_id: str, fuid
         await send_message(user_id, "\n".join(lines), token=tok)
         return
 
-    # ── Normal: show description + ask confirmation ───────────────────────────
+    # ── Normal: store pending, ask which project, then confirm broadcast ──────
     uid = _store_pending(agency.id, user_id, msg_id, description)
 
-    if has_caption:
-        # Admin wrote own description — just confirm
+    projects = (
+        db.query(ToniProject)
+        .filter(ToniProject.is_active == True, ToniProject.agency_id == agency.id)
+        .order_by(ToniProject.uploaded_at.desc())
+        .limit(8)
+        .all()
+    )
+
+    if projects:
+        buttons = [
+            [{"text": f"📁 {p.project_name}", "callback_data": f"linkproj:{uid}:{p.id}"}]
+            for p in projects
+        ]
+        buttons.append([{"text": "⏩ Без проекта", "callback_data": f"linkproj:{uid}:0"}])
+        desc_preview = description[:200] + "…" if len(description) > 200 else description
         await send_message_with_keyboard(
             user_id,
-            f"📎 *{fname}*\n\n_{description}_\n\nГотово. Отправляем?",
-            _confirm_keyboard(uid, has_caption=True),
+            f"✅ *{fname}* сохранён в базу данных.\n\n📝 _{desc_preview}_\n\nК какому проекту относится этот материал?",
+            {"inline_keyboard": buttons},
             token=tok,
         )
     else:
-        # AI-generated — show it and offer edit option
-        await send_message(user_id, f"📝 *Описание для рассылки:*\n\n{description}", token=tok)
-        await send_message_with_keyboard(
-            user_id, "Отправляем с этим описанием?",
-            _confirm_keyboard(uid, has_caption=False),
-            token=tok,
-        )
+        # No projects yet — go straight to broadcast confirmation
+        if has_caption:
+            await send_message_with_keyboard(
+                user_id,
+                f"📎 *{fname}*\n\n_{description}_\n\nГотово. Отправляем?",
+                _confirm_keyboard(uid, has_caption=True),
+                token=tok,
+            )
+        else:
+            await send_message(user_id, f"📝 *Описание для рассылки:*\n\n{description}", token=tok)
+            await send_message_with_keyboard(
+                user_id, "Отправляем с этим описанием?",
+                _confirm_keyboard(uid, has_caption=False),
+                token=tok,
+            )
 
 
 # ─── Telegram webhook (per-agency) ────────────────────────────────────────────
@@ -949,6 +989,51 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
                 )
             else:
                 await edit_message_text(cb_from_id, cb_msg_id, "❌ Запрос устарел.", token=tok)
+
+        elif cb_data.startswith("linkproj:"):
+            # linkproj:{pending_uid}:{project_id} — link brochure to a project
+            rest = cb_data[9:]
+            uid, pid_str = rest.rsplit(":", 1)
+            pid = int(pid_str)
+
+            pending = _pending_broadcasts.get(uid)
+            if not pending or pending["agency_id"] != agency.id:
+                await edit_message_text(cb_from_id, cb_msg_id, "❌ Запрос устарел.", token=tok)
+                return
+
+            proj_name = ""
+            if pid > 0:
+                proj = db.query(ToniProject).filter(
+                    ToniProject.id == pid, ToniProject.agency_id == agency.id
+                ).first()
+                if proj:
+                    tf = db.query(ToniFile).filter(
+                        ToniFile.message_id == pending["message_id"],
+                        ToniFile.channel_chat_id == pending["from_chat_id"],
+                        ToniFile.agency_id == agency.id,
+                    ).first()
+                    if tf:
+                        tf.project_name = proj.project_name
+                        db.commit()
+                    proj_name = proj.project_name
+
+            description = pending.get("description", "")
+            if proj_name:
+                header = f"✅ Привязан к проекту *{proj_name}*.\n\n"
+            else:
+                header = "✅ Сохранено без проекта.\n\n"
+            desc_preview = description[:200] + "…" if len(description) > 200 else description
+            await edit_message_text(
+                cb_from_id, cb_msg_id,
+                header + f"📝 _{desc_preview}_",
+                token=tok,
+            )
+            await send_message_with_keyboard(
+                cb_from_id,
+                "Отправляем описание и файл в группы?",
+                _confirm_keyboard(uid, has_caption=True),
+                token=tok,
+            )
 
         elif cb_data.startswith("cancel:"):
             uid = cb_data[7:]
@@ -1008,14 +1093,10 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         msg_id = message.get("message_id")
         await send_typing(user_id, token=tok)
 
-        if _is_urgent(caption):
-            count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
-            await send_message(user_id, f"⚡ Отправлено всем {count} группам!", token=tok)
-        else:
-            await _handle_brochure_file(
-                agency, user_id, photo["file_id"], photo.get("file_unique_id", ""),
-                caption or "Фото", caption, msg_id, "photo", db, tok
-            )
+        await _handle_brochure_file(
+            agency, user_id, photo["file_id"], photo.get("file_unique_id", ""),
+            caption or "Фото", caption, msg_id, "photo", db, tok
+        )
         return
 
     # ── 3. Document ───────────────────────────────────────────────────────────
@@ -1031,9 +1112,6 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         # Excel / CSV → inventory/project data
         if fname_lower.endswith((".xlsx", ".xls", ".csv")):
             await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
-            if _is_urgent(caption) or _wants_broadcast(caption):
-                count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
-                await send_message(user_id, f"📤 Инвентарь отправлен в {count} групп!", token=tok)
             return
 
         # PDF → if explicit inventory keyword: project data. Otherwise: brochure
@@ -1043,9 +1121,6 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
                 for kw in ("инвентарь", "inventory", "прайс", "price list", "availability")
             ):
                 await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
-                if _is_urgent(caption) or _wants_broadcast(caption):
-                    count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
-                    await send_message(user_id, f"📤 Отправлено в {count} групп!", token=tok)
             else:
                 await _handle_brochure_file(
                     agency, user_id, doc["file_id"], fuid, fname, caption, msg_id, "document", db, tok
@@ -1069,6 +1144,35 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         return
 
     await send_typing(user_id, token=tok)
+
+    # ── Admin is naming a newly-uploaded project ─────────────────────────────
+    if user_id in _waiting_for_project_name:
+        pending = _waiting_for_project_name.pop(user_id)
+        if pending["agency_id"] == agency.id:
+            name = text.strip()
+            r = await _save_project(name, pending["sheets_data"], user_id, db, agency_id=agency.id)
+            if r["status"] == "skipped":
+                await send_message(user_id, "❌ В файле не найдены юниты.", token=tok)
+            elif r["status"] == "updated":
+                await send_message(
+                    user_id,
+                    f"✅ Проект *{r['name']}* обновлён → v{r['version']}\n"
+                    f"Листов: {len(pending['sheets_data'])}, юнитов: {r['units']}\n\n{r['diff_report']}",
+                    token=tok,
+                )
+            else:
+                await send_message(
+                    user_id,
+                    f"✅ Проект *{r['name']}* сохранён!\n"
+                    f"Листов: {len(pending['sheets_data'])}, юнитов: {r['units']}",
+                    token=tok,
+                )
+                groups = db.query(ToniGroup).filter(
+                    ToniGroup.active == True, ToniGroup.agency_id == agency.id
+                ).all()
+                for g in groups:
+                    await toni_bot._send(g.chat_id, f"📁 Новый проект: *{r['name']}*\nСпрашивайте по номеру юнита!", agency.bot_token)
+        return
 
     # ── Admin is editing a description (after clicking ✏️) ──────────────────
     if user_id in _waiting_for_edit:

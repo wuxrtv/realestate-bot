@@ -31,6 +31,7 @@ def _migrate():
         ("agencies",       "wa_instance_id",    "TEXT"),
         ("agencies",       "wa_token",          "TEXT"),
         ("agencies",       "wa_admin_numbers",  "TEXT"),
+        ("toni_files",     "project_name",      "TEXT"),
     ]
     with engine.connect() as conn:
         for table, col, typedef in additions:
