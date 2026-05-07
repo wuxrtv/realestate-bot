@@ -11,11 +11,11 @@ from datetime import datetime
 
 import anthropic
 import httpx
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, flag_modified
 
 from database import SessionLocal
 from excel_parser import format_unit_card
-from models import Agency, ToniFile, ToniGroup, ToniProject
+from models import Agency, GroupConversation, ToniFile, ToniGroup, ToniProject
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +216,27 @@ async def _handle_channel_post(message: dict, db: Session, agency: Agency):
         await _copy(gid, chat_id, message_id, agency.bot_token)
 
 
+# ─── Group conversation history helpers ──────────────────────────────────────
+
+def _load_group_history(db: Session, agency_id: int, chat_id: str) -> tuple[GroupConversation, list]:
+    conv = db.query(GroupConversation).filter(
+        GroupConversation.agency_id == agency_id,
+        GroupConversation.chat_id == chat_id,
+    ).first()
+    if not conv:
+        conv = GroupConversation(agency_id=agency_id, chat_id=chat_id, history=[])
+        db.add(conv)
+        db.flush()
+    return conv, list(conv.history or [])
+
+
+def _save_group_history(db: Session, conv: GroupConversation, history: list):
+    conv.history = history[-20:]  # keep last 10 exchanges
+    conv.updated_at = __import__("datetime").datetime.now()
+    flag_modified(conv, "history")
+    db.commit()
+
+
 # ─── Group message handler ────────────────────────────────────────────────────
 
 async def _handle_group_message(message: dict, chat_id: str, chat_title: str,
@@ -246,18 +267,24 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str,
     else:
         system = _SYSTEM_BASE
 
+    # Load group history and append current message (with sender name for context)
+    sender = (message.get("from", {}).get("first_name") or "Agent").strip()
+    conv, history = _load_group_history(db, agency.id, chat_id)
+    history.append({"role": "user", "content": f"[{sender}]: {text}"})
+
     try:
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = await ai.messages.create(
             model="claude-haiku-4-5-20251001",
             max_tokens=400,
             system=system,
-            messages=[{"role": "user", "content": text}],
+            messages=history,
         )
         raw = resp.content[0].text.strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not match:
             logger.warning(f"Toni: no JSON in response: {raw[:100]}")
+            _save_group_history(db, conv, history)
             return
         parsed = json.loads(match.group())
     except Exception:
@@ -281,6 +308,10 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str,
         reply = (parsed.get("reply") or "").strip()
         if reply:
             await _send(chat_id, reply, agency.bot_token)
+
+    # Save assistant turn so next message has context
+    history.append({"role": "assistant", "content": raw})
+    _save_group_history(db, conv, history)
 
 
 # ─── Unit query response ──────────────────────────────────────────────────────

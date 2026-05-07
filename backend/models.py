@@ -66,6 +66,17 @@ class AdminConversation(Base):
     updated_at = Column(DateTime, default=func.now())
 
 
+class GroupConversation(Base):
+    """Conversation history per group chat, shared across all agents in the group."""
+    __tablename__ = "group_conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    agency_id = Column(Integer, index=True)
+    chat_id = Column(String, index=True)
+    history = Column(_json_type, default=list)   # [{role, content}] last N exchanges
+    updated_at = Column(DateTime, default=func.now())
+
+
 class ToniProject(Base):
     """Excel project file uploaded via admin."""
     __tablename__ = "toni_projects"

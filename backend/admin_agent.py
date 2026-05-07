@@ -8,7 +8,7 @@ import logging
 import os
 
 import anthropic
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, flag_modified
 
 from models import AdminConversation, ToniProject
 
@@ -81,7 +81,6 @@ class AdminAgent:
         return conv, list(conv.history or [])
 
     def _save_history(self, db: Session, conv: AdminConversation, history: list):
-        from sqlalchemy.orm.attributes import flag_modified
         conv.history = history[-30:]
         conv.updated_at = __import__("datetime").datetime.now()
         flag_modified(conv, "history")

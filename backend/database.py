@@ -15,7 +15,7 @@ class Base(DeclarativeBase):
 
 
 def init_db():
-    from models import Agency, AdminConversation, ToniFile, ToniGroup, ToniProject  # noqa: F401
+    from models import Agency, AdminConversation, GroupConversation, ToniFile, ToniGroup, ToniProject  # noqa: F401
     Base.metadata.create_all(bind=engine)
     _migrate()
     _seed_default_agency()
