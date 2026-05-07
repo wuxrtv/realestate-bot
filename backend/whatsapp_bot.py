@@ -89,11 +89,17 @@ def _is_admin(sender_phone: str, agency: Agency) -> bool:
 # ─── Main update handler ──────────────────────────────────────────────────────
 
 async def handle_update(data: dict, agency: Agency):
-    if data.get("typeWebhook") != "incomingMessageReceived":
+    webhook_type = data.get("typeWebhook")
+    logger.info(f"WA webhook received: type={webhook_type}")
+
+    if webhook_type != "incomingMessageReceived":
         return
 
     message_data = data.get("messageData", {})
-    if message_data.get("typeMessage") != "textMessage":
+    msg_type = message_data.get("typeMessage")
+    logger.info(f"WA message type: {msg_type}")
+
+    if msg_type != "textMessage":
         return
 
     sender_data = data.get("senderData", {})
@@ -102,23 +108,30 @@ async def handle_update(data: dict, agency: Agency):
     sender_name: str = sender_data.get("senderName", "Agent")
     text: str = message_data.get("textMessageData", {}).get("textMessage", "").strip()
 
+    logger.info(f"WA from={sender_wid} chat={chat_id} text={text[:50]!r}")
+
     if not text or not chat_id:
         return
 
     # Ignore own messages
     if sender_wid == data.get("instanceData", {}).get("wid", ""):
+        logger.info("WA ignored own message")
         return
 
     is_group = chat_id.endswith("@g.us")
     sender_phone = _normalize_phone(sender_wid)
+    admin_check = _is_admin(sender_phone, agency)
+    logger.info(f"WA is_group={is_group} sender_phone={sender_phone} is_admin={admin_check} wa_admin_numbers={agency.wa_admin_numbers}")
 
     db = SessionLocal()
     try:
-        if not is_group and _is_admin(sender_phone, agency):
+        if not is_group and admin_check:
             await _handle_admin_message(chat_id, sender_phone, text, db, agency)
         elif is_group and _is_tony_mentioned(text):
             group_title = sender_data.get("chatName", chat_id)
             await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
+        else:
+            logger.info(f"WA message not handled: is_group={is_group} is_admin={admin_check} tony_mentioned={_is_tony_mentioned(text)}")
     except Exception:
         logger.exception("WA handle_update error")
     finally:
