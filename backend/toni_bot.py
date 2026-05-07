@@ -204,6 +204,10 @@ async def _handle_channel_post(message: dict, db: Session):
 # ─── Group message handler ────────────────────────────────────────────────────
 
 async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db: Session):
+    # Ignore bot messages (including our own replies)
+    if message.get("from", {}).get("is_bot"):
+        return
+
     text = (message.get("text") or "").strip()
     if not text:
         return
@@ -221,15 +225,14 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
     else:
         system = _SYSTEM_BASE
 
-    ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-    resp = await ai.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        system=system,
-        messages=[{"role": "user", "content": text}],
-    )
-
     try:
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system,
+            messages=[{"role": "user", "content": text}],
+        )
         raw = resp.content[0].text.strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not match:
@@ -237,7 +240,7 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
             return
         parsed = json.loads(match.group())
     except Exception:
-        logger.warning(f"Toni: failed to parse AI response: {resp.content[0].text[:100]}")
+        logger.exception(f"Toni: Claude API error for message: {text[:80]}")
         return
 
     intent = parsed.get("intent", "off_topic")

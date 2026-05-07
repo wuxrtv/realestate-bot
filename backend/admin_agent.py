@@ -81,42 +81,49 @@ class AdminAgent:
         history = self._history.get(user_id, [])
         history.append({"role": "user", "content": message})
 
-        for _ in range(5):
-            response = await self.client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=2000,
-                system=ADMIN_SYSTEM_PROMPT,
-                tools=ADMIN_TOOLS,
-                messages=history,
-            )
+        try:
+            for _ in range(5):
+                response = await self.client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=2000,
+                    system=ADMIN_SYSTEM_PROMPT,
+                    tools=ADMIN_TOOLS,
+                    messages=history,
+                )
 
-            history.append({"role": "assistant", "content": self._serialize(response.content)})
+                history.append({"role": "assistant", "content": self._serialize(response.content)})
 
-            if response.stop_reason == "end_turn":
+                if response.stop_reason == "end_turn":
+                    break
+
+                if response.stop_reason == "tool_use":
+                    tool_results = []
+                    for block in response.content:
+                        if block.type != "tool_use":
+                            continue
+                        result = await self._run_tool(block.name, block.input, db)
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(result, ensure_ascii=False, default=str),
+                        })
+                    history.append({"role": "user", "content": tool_results})
+                    continue
                 break
 
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type != "tool_use":
-                        continue
-                    result = await self._run_tool(block.name, block.input, db)
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": json.dumps(result, ensure_ascii=False, default=str),
-                    })
-                history.append({"role": "user", "content": tool_results})
-                continue
-            break
+            self._history[user_id] = history[-30:]
 
-        self._history[user_id] = history[-30:]
+            final = ""
+            for block in response.content:
+                if hasattr(block, "text"):
+                    final += block.text
+            return final or "Готово."
 
-        final = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                final += block.text
-        return final or "Готово."
+        except Exception:
+            # Clear corrupted history so the next message starts fresh
+            self._history.pop(user_id, None)
+            logger.exception(f"AdminAgent API error for user {user_id}")
+            raise
 
     async def _run_tool(self, name: str, inp: dict, db: Session) -> dict:
         if name == "announce_to_groups":

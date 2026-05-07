@@ -399,8 +399,16 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         await answer_callback_query(callback["id"])
         return {"ok": True}
 
-    message = data.get("message") or data.get("edited_message")
+    # Ignore edited messages — they re-trigger Claude unnecessarily
+    if data.get("edited_message"):
+        return {"ok": True}
+
+    message = data.get("message")
     if not message:
+        return {"ok": True}
+
+    # Ignore messages from bots (including the bot itself)
+    if message.get("from", {}).get("is_bot"):
         return {"ok": True}
 
     chat_type = message.get("chat", {}).get("type", "")
