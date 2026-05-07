@@ -8,7 +8,8 @@ import logging
 import os
 
 import anthropic
-from sqlalchemy.orm import Session, flag_modified
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from models import AdminConversation, ToniProject
 

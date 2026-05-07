@@ -13,7 +13,8 @@ from datetime import datetime
 
 import anthropic
 import httpx
-from sqlalchemy.orm import Session, flag_modified
+from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 
 from database import SessionLocal
 from excel_parser import format_unit_card
