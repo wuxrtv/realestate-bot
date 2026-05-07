@@ -21,8 +21,10 @@ logger = logging.getLogger(__name__)
 
 TONI_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 _TONI_API = f"https://api.telegram.org/bot{TONI_TOKEN}"
-DB_CHANNEL_ID = os.getenv("TONI_DB_CHANNEL", "")   # private channel numeric ID, e.g. "-100123456789"
+DB_CHANNEL_ID = os.getenv("TONI_DB_CHANNEL", "")
 UMAR_CONTACT = os.getenv("TONI_UMAR_CONTACT", "@Umar")
+# Bot username without @, e.g. "ToniRealtyBot" — used to detect @mentions in groups
+_BOT_USERNAME = os.getenv("TONI_BOT_USERNAME", "").lower().lstrip("@")
 
 GREETING = (
     "Привет! Я Тони AI-помощник. "
@@ -31,32 +33,51 @@ GREETING = (
 )
 
 _UNIT_RE = re.compile(r"\b(\d{3,5})\b")
+_BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
 
-_SYSTEM_BASE = """Ты — Тони, AI-помощник агентов по недвижимости в Telegram группе.
-
-Главное правило: НЕ вмешивайся в разговор если тебя не спрашивают.
+_SYSTEM_BASE = """Ты — Тони, AI-помощник агентов по недвижимости. К тебе обратились напрямую.
 
 Ответь ТОЛЬКО валидным JSON без markdown:
 {
-  "intent": "unit_query" | "brochure_request" | "property_search" | "direct_question" | "silent",
+  "intent": "unit_query" | "brochure_request" | "property_search" | "direct_question",
   "unit_numbers": ["1507", "1435"],
   "project_name": "название проекта или null",
-  "keywords": ["2 qavvat", "uy", "villa"],
-  "reply": "твой ответ (для direct_question)"
+  "keywords": ["2 комнаты", "villa", "20 этаж"],
+  "reply": "твой ответ (только для direct_question)"
 }
 
-КОГДА ОТВЕЧАТЬ:
-- unit_query: спрашивают конкретный юнит ("есть юнит 1507?", "покажи 1435", "unit 2301 bor mi")
+ПРАВИЛА ВЫБОРА intent:
+- unit_query: спрашивают конкретный номер юнита ("юнит 1507", "покажи 1435", "2301 bormi")
 - brochure_request: просят брошюру, прайс-лист, презентацию проекта
-- property_search: клиент или агент ищет вариант — по типу, этажу, комнатам, цене, бюджету, ИЛИ называет конкретный проект ("Bugatti проект бор ми", "Breez да 3-комнатная", "20 этаж бюджет 2M", "villa bor mi", "3 комнатная нужна")
-- direct_question: агент обращается напрямую к тебе ("тони", "@bot", "бот"), или спрашивает что есть в базе, какие проекты доступны. В поле "reply" ответь используя список проектов из контекста.
+- property_search: ищут вариант по параметрам или называют проект ("Bugatti", "Breez 3-комнатная", "вилла", "бюджет 2M", "20 этаж")
+- direct_question: любой другой вопрос — что есть в базе, сколько юнитов, общие вопросы. В "reply" ответь сам, используя список проектов из контекста.
 
-КОГДА МОЛЧАТЬ (silent):
-- люди общаются друг с другом, даже если тема — недвижимость
-- обсуждают цены, проекты, новости между собой
-- пишут "ok", "ha", "понял", "спасибо", "salom" — не тебе
+Отвечай на языке агента (русский, узбекский, английский)."""
 
-Отвечай на языке агента (русский, узбекский, английский)"""
+
+# ─── Bot mention detection ───────────────────────────────────────────────────
+
+def _is_bot_mentioned(message: dict) -> bool:
+    """Return True if the message is directed at the bot."""
+    text = (message.get("text") or "").lower()
+
+    # Name mention: "тони", "toni", "tony"
+    if _BOT_NAMES.search(text):
+        return True
+
+    # @username mention via Telegram entities
+    if _BOT_USERNAME:
+        for ent in message.get("entities") or []:
+            if ent.get("type") == "mention":
+                mention = text[ent["offset"]: ent["offset"] + ent["length"]].lstrip("@")
+                if mention == _BOT_USERNAME:
+                    return True
+
+    # Reply to the bot's own message
+    if message.get("reply_to_message", {}).get("from", {}).get("is_bot"):
+        return True
+
+    return False
 
 
 # ─── Low-level Telegram API ───────────────────────────────────────────────────
@@ -210,6 +231,10 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
 
     text = (message.get("text") or "").strip()
     if not text:
+        return
+
+    # Only respond when explicitly addressed
+    if not _is_bot_mentioned(message):
         return
 
     # Register group if first encounter
