@@ -15,7 +15,7 @@ class Base(DeclarativeBase):
 
 
 def init_db():
-    from models import Agency, AdminConversation, GroupConversation, ToniFile, ToniGroup, ToniProject  # noqa: F401
+    from models import Agency, AdminConversation, GroupConversation, ToniFile, ToniGroup, ToniProject, WhatsAppGroup  # noqa: F401
     Base.metadata.create_all(bind=engine)
     _migrate()
     _seed_default_agency()
@@ -24,9 +24,12 @@ def init_db():
 def _migrate():
     """Add new columns to existing tables without dropping data."""
     additions = [
-        ("toni_projects", "agency_id", "INTEGER"),
-        ("toni_groups",   "agency_id", "INTEGER"),
-        ("toni_files",    "agency_id", "INTEGER"),
+        ("toni_projects",  "agency_id",        "INTEGER"),
+        ("toni_groups",    "agency_id",         "INTEGER"),
+        ("toni_files",     "agency_id",         "INTEGER"),
+        ("agencies",       "wa_instance_id",    "TEXT"),
+        ("agencies",       "wa_token",          "TEXT"),
+        ("agencies",       "wa_admin_numbers",  "TEXT"),
     ]
     with engine.connect() as conn:
         for table, col, typedef in additions:

@@ -3,9 +3,11 @@ Toni — AI assistant for real estate sales agents.
 All public functions accept an `agency` model instance for multi-agency support.
 """
 
+import asyncio
 import json
 import logging
 import os
+import random
 import re
 from datetime import datetime
 
@@ -28,25 +30,44 @@ GREETING = (
 _UNIT_RE = re.compile(r"\b(\d{3,5})\b")
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
 
-_SYSTEM_BASE = """Ты — Тони, AI-помощник агентов по недвижимости. К тебе обратились напрямую.
+_SYSTEM_BASE = """You are TONY — an AI Sales Assistant for a real estate agency in Dubai.
+You are in a group chat with real estate agents. Your name is Tony.
 
-Ответь ТОЛЬКО валидным JSON без markdown:
+Respond ONLY with valid JSON (no markdown, no code blocks):
 {
-  "intent": "unit_query" | "brochure_request" | "property_search" | "direct_question",
+  "intent": "unit_query" | "brochure_request" | "property_search" | "direct_question" | "off_topic",
   "unit_numbers": ["1507", "1435"],
-  "project_name": "название проекта или null",
-  "keywords": ["2 комнаты", "villa", "20 этаж"],
-  "reply": "твой ответ (только для direct_question)"
+  "project_name": "project name or null",
+  "keywords": ["2 rooms", "villa", "floor 20"],
+  "reply": "your reply (only for direct_question, empty string otherwise)"
 }
 
-ПРАВИЛА ВЫБОРА intent:
-- unit_query: спрашивают конкретный номер юнита ("юнит 1507", "покажи 1435", "2301 bormi")
-- brochure_request: просят брошюру, прайс-лист, презентацию проекта
-- property_search: ищут вариант по параметрам или называют проект ("Bugatti", "Breez 3-комнатная", "вилла", "бюджет 2M", "20 этаж")
-- direct_question: любой другой вопрос — что есть в базе, сколько юнитов, общие вопросы. В "reply" ответь сам, используя список проектов из контекста.
+━━━ WHEN TO RESPOND ━━━
+✅ Respond when:
+• Someone mentions "Tony" or "Тони"
+• Someone asks about units, prices, availability, projects in the database
+• Question is clearly real-estate related
 
-ЯЗЫК ОТВЕТА: определи язык сообщения и отвечай ТОЛЬКО на нём.
-Если сообщение на русском — отвечай по-русски. Если на английском — отвечай по-английски."""
+❌ Do NOT respond (use "off_topic" intent) when:
+• People are having personal conversations
+• Topics unrelated to real estate
+• You don't have accurate data to answer
+• When in doubt — don't respond
+
+━━━ INTENT RULES ━━━
+• unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
+• brochure_request: asking for brochure, price list, or project presentation
+• property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
+• direct_question: any other work question — answer in "reply" using the project context below
+• off_topic: personal talk or unrelated topic — leave reply as empty string
+
+━━━ STYLE ━━━
+• Professional but friendly — like a reliable colleague
+• Never guess facts. Never improvise prices or availability.
+• Be accurate and concise. If unsure — say so.
+
+LANGUAGE: Detect the language of the message. Respond ONLY in that same language.
+Russian → Russian. English → English. Uzbek → Uzbek."""
 
 
 # ─── Bot mention detection ───────────────────────────────────────────────────
@@ -211,7 +232,10 @@ async def _handle_channel_post(message: dict, db: Session, agency: Agency):
     label = caption if caption else file_name
     announcement = f"🆕 Новое обновление {date_str}: {label}. Доступно уже сейчас!"
 
-    for gid in _all_group_ids(db, agency.id):
+    group_ids = _all_group_ids(db, agency.id)
+    for i, gid in enumerate(group_ids):
+        if i > 0:
+            await asyncio.sleep(30)
         await _send(gid, announcement, agency.bot_token)
         await _copy(gid, chat_id, message_id, agency.bot_token)
 
@@ -451,7 +475,32 @@ async def _respond_property_search(chat_id: str, keywords: list[str],
     )
 
 
-# ─── Morning report (called by scheduler at 9:00) ────────────────────────────
+# ─── Morning greeting to admin (08:00) ───────────────────────────────────────
+
+_MORNING_GREETINGS = [
+    "Morning! What are we pushing to the groups today? 💼",
+    "Good morning! Ready when you are — what's the plan for today?",
+    "Morning boss! What's on the agenda? Any new projects to broadcast?",
+    "Rise and shine! What files are we sending out today?",
+    "Good morning! Got everything ready — what are we working with today?",
+    "Hey, morning! What do you need from me today?",
+    "Morning! The groups are waiting — what do we broadcast today?",
+]
+
+async def send_morning_greeting_to_admin():
+    """Send a personal morning message to all admins at 08:00."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            greeting = random.choice(_MORNING_GREETINGS)
+            for admin_id in (agency.admin_ids or []):
+                await _send(admin_id, greeting, agency.bot_token)
+    finally:
+        db.close()
+
+
+# ─── Morning report to groups (08:00) ────────────────────────────────────────
 
 async def send_morning_report():
     db = SessionLocal()
@@ -464,16 +513,50 @@ async def send_morning_report():
             ).all()
 
             if not projects:
-                text = "📊 Доброе утро! Проекты в базе пока не загружены."
+                text = "📊 Good morning! No projects loaded in the database yet."
             else:
                 total_units = sum(p.unit_count for p in projects)
-                lines = [f"📊 Доброе утро! В базе {len(projects)} проект(а), {total_units} юнитов:\n"]
+                lines = [f"📊 Good morning! Database has {len(projects)} project(s), {total_units} units:\n"]
                 for p in projects:
-                    lines.append(f"• *{p.project_name}* — {p.unit_count} юн.")
-                lines.append("\nЗадайте номер юнита или параметры поиска!")
+                    lines.append(f"• *{p.project_name}* — {p.unit_count} units")
+                lines.append("\nAsk me a unit number or search parameters!")
                 text = "\n".join(lines)
 
             for gid in _all_group_ids(db, agency.id):
                 await _send(gid, text, agency.bot_token)
+    finally:
+        db.close()
+
+
+# ─── End of day report to admin (20:00) ──────────────────────────────────────
+
+async def send_end_of_day_report():
+    """Send daily wrap-up report to all admins at 20:00."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            projects = db.query(ToniProject).filter(
+                ToniProject.is_active == True,
+                ToniProject.agency_id == agency.id,
+            ).all()
+            groups = db.query(ToniGroup).filter(
+                ToniGroup.active == True,
+                ToniGroup.agency_id == agency.id,
+            ).all()
+
+            date_str = datetime.now().strftime("%d.%m.%Y")
+            proj_lines = "\n".join(f"  • {p.project_name} ({p.unit_count} units)" for p in projects) or "  — none"
+            group_list = "\n".join(f"  • {g.title or g.chat_id}" for g in groups) or "  — none"
+
+            report = (
+                f"📊 Daily wrap — {date_str}\n\n"
+                f"👥 Active groups: {len(groups)}\n{group_list}\n\n"
+                f"📁 Projects in database: {len(projects)}\n{proj_lines}\n\n"
+                f"📌 System running smoothly. Check group chats for any pending questions."
+            )
+
+            for admin_id in (agency.admin_ids or []):
+                await _send(admin_id, report, agency.bot_token)
     finally:
         db.close()

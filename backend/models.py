@@ -21,6 +21,9 @@ class Agency(Base):
     bot_username = Column(String, default="")             # for @mention detection in groups
     umar_contact = Column(String, default="@support")     # shown when unit not found
     db_channel_id = Column(String, default="")            # private file/brochure channel
+    wa_instance_id = Column(String, default="")    # Green API instance ID
+    wa_token = Column(String, default="")           # Green API token
+    wa_admin_numbers = Column(_json_type, default=list)  # ["79001234567", ...]
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
 
@@ -75,6 +78,19 @@ class GroupConversation(Base):
     chat_id = Column(String, index=True)
     history = Column(_json_type, default=list)   # [{role, content}] last N exchanges
     updated_at = Column(DateTime, default=func.now())
+
+
+class WhatsAppGroup(Base):
+    """WhatsApp group where Tony is active."""
+    __tablename__ = "whatsapp_groups"
+    __table_args__ = (UniqueConstraint("agency_id", "chat_id", name="uq_agency_wa_group"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    agency_id = Column(Integer, nullable=True, index=True)
+    chat_id = Column(String, index=True)   # e.g. "120363000000000000@g.us"
+    title = Column(String)
+    active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
 
 
 class ToniProject(Base):

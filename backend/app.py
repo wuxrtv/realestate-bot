@@ -33,8 +33,9 @@ from excel_parser import (
     parse_csv,
     parse_excel,
 )
-from models import Agency, ToniFile, ToniGroup, ToniProject
+from models import Agency, ToniFile, ToniGroup, ToniProject, WhatsAppGroup
 import toni_bot
+import whatsapp_bot
 from telegram_bot import (
     answer_callback_query,
     get_file_bytes,
@@ -47,7 +48,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 admin_agent = AdminAgent()
-scheduler = AsyncIOScheduler(timezone="Asia/Tashkent")
+scheduler = AsyncIOScheduler(timezone="Asia/Dubai")
 http_basic = HTTPBasic()
 
 _SUPER_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "superadmin2024")
@@ -65,13 +66,19 @@ async def lifespan(app: FastAPI):
         try:
             agencies = db.query(Agency).filter(Agency.is_active == True).all()
             for agency in agencies:
-                url = f"https://{public_domain}/telegram/webhook/{agency.slug}"
-                await set_webhook(url, token=agency.bot_token)
-                logger.info(f"Webhook set for agency '{agency.slug}': {url}")
+                tg_url = f"https://{public_domain}/telegram/webhook/{agency.slug}"
+                await set_webhook(tg_url, token=agency.bot_token)
+                logger.info(f"Telegram webhook set for '{agency.slug}': {tg_url}")
+
+                if agency.wa_instance_id and agency.wa_token:
+                    wa_url = f"https://{public_domain}/whatsapp/webhook/{agency.slug}"
+                    await whatsapp_bot.set_wa_webhook(agency.wa_instance_id, agency.wa_token, wa_url)
         finally:
             db.close()
 
-    scheduler.add_job(toni_bot.send_morning_report, "cron", hour=9, minute=0, id="toni_morning")
+    scheduler.add_job(toni_bot.send_morning_greeting_to_admin, "cron", hour=8, minute=0, id="toni_morning_admin")
+    scheduler.add_job(toni_bot.send_morning_report, "cron", hour=8, minute=0, id="toni_morning_groups")
+    scheduler.add_job(toni_bot.send_end_of_day_report, "cron", hour=20, minute=0, id="toni_evening_report")
     scheduler.start()
     logger.info("Scheduler started")
 
@@ -242,6 +249,18 @@ def _super_html(agencies: list, message: str = "") -> str:
             <label>ID канала-базы файлов (необязательно)</label>
             <input name="db_channel_id" placeholder="-1001234567890">
           </div>
+          <div class="field">
+            <label>WhatsApp — Green API Instance ID</label>
+            <input name="wa_instance_id" placeholder="1234567890">
+          </div>
+          <div class="field">
+            <label>WhatsApp — Green API Token</label>
+            <input name="wa_token" placeholder="abcdef1234567890abcdef">
+          </div>
+          <div class="field field-full">
+            <label>WhatsApp номера админов (через запятую, без +)</label>
+            <input name="wa_admin_numbers" placeholder="79001234567, 971501234567">
+          </div>
           <div class="field field-full">
             <button class="btn btn-primary" type="submit">Создать агентство</button>
           </div>
@@ -277,9 +296,13 @@ async def super_admin_create_agency(
     bot_username: str = Form(""),
     umar_contact: str = Form("@support"),
     db_channel_id: str = Form(""),
+    wa_instance_id: str = Form(""),
+    wa_token: str = Form(""),
+    wa_admin_numbers: str = Form(""),
 ):
     slug = _make_slug(name, db)
     parsed_ids = [i.strip() for i in admin_ids.split(",") if i.strip()]
+    parsed_wa_admins = [n.strip().lstrip("+") for n in wa_admin_numbers.split(",") if n.strip()]
     agency = Agency(
         name=name.strip(),
         slug=slug,
@@ -289,6 +312,9 @@ async def super_admin_create_agency(
         bot_username=bot_username.strip().lstrip("@"),
         umar_contact=umar_contact.strip() or "@support",
         db_channel_id=db_channel_id.strip(),
+        wa_instance_id=wa_instance_id.strip(),
+        wa_token=wa_token.strip(),
+        wa_admin_numbers=parsed_wa_admins,
     )
     db.add(agency)
     db.commit()
@@ -365,6 +391,29 @@ def _agency_admin_html(agency: Agency, projects: list) -> str:
       </div>
     </div>
     <div class="card">
+      <h2>💬 WhatsApp (Green API)</h2>
+      {'<div class="hint" style="background:#f0fff4;border-color:#68d391">✅ Подключён — Instance ID: <strong>' + (agency.wa_instance_id or '') + '</strong></div>' if agency.wa_instance_id else '<div class="hint" style="background:#fff5f5;border-color:#fc8181">⚠️ WhatsApp не настроен</div>'}
+      <form method="post" action="/admin/{agency.slug}/whatsapp" style="margin-top:16px">
+        <div class="form-grid">
+          <div class="field">
+            <label>Green API Instance ID</label>
+            <input name="wa_instance_id" value="{agency.wa_instance_id or ''}" placeholder="1234567890">
+          </div>
+          <div class="field">
+            <label>Green API Token</label>
+            <input name="wa_token" value="{agency.wa_token or ''}" placeholder="abcdef1234...">
+          </div>
+          <div class="field field-full">
+            <label>Номера админов WhatsApp (через запятую, без +)</label>
+            <input name="wa_admin_numbers" value="{', '.join(agency.wa_admin_numbers or [])}" placeholder="79001234567, 971501234567">
+          </div>
+          <div class="field field-full">
+            <button class="btn btn-primary" type="submit">Сохранить WhatsApp настройки</button>
+          </div>
+        </div>
+      </form>
+    </div>
+    <div class="card">
       <h2>📋 Активные проекты в памяти бота ({len(projects)})</h2>
       {_projects_table(projects)}
     </div>
@@ -393,6 +442,35 @@ async def agency_admin_page(slug: str, request: Request, db: Session = Depends(g
         .all()
     )
     return _agency_admin_html(agency, projects)
+
+
+@app.post("/admin/{slug}/whatsapp")
+async def agency_admin_save_whatsapp(
+    slug: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    wa_instance_id: str = Form(""),
+    wa_token: str = Form(""),
+    wa_admin_numbers: str = Form(""),
+):
+    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+    if not agency:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    if not _check_agency_auth(request, agency):
+        return HTMLResponse(content="Unauthorized", status_code=401,
+                            headers={"WWW-Authenticate": 'Basic realm="Toni Admin"'})
+
+    agency.wa_instance_id = wa_instance_id.strip()
+    agency.wa_token = wa_token.strip()
+    agency.wa_admin_numbers = [n.strip().lstrip("+") for n in wa_admin_numbers.split(",") if n.strip()]
+    db.commit()
+
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_URL")
+    if public_domain and agency.wa_instance_id and agency.wa_token:
+        wa_url = f"https://{public_domain}/whatsapp/webhook/{agency.slug}"
+        await whatsapp_bot.set_wa_webhook(agency.wa_instance_id, agency.wa_token, wa_url)
+
+    return RedirectResponse(url=f"/admin/{slug}", status_code=303)
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -795,6 +873,18 @@ async def telegram_webhook_default(request: Request, db: Session = Depends(get_d
         return {"ok": True}
     data = await request.json()
     await _handle_webhook(data, agency, db)
+    return {"ok": True}
+
+
+# ─── WhatsApp webhook (Green API) ────────────────────────────────────────────
+
+@app.post("/whatsapp/webhook/{slug}")
+async def whatsapp_webhook(slug: str, request: Request, db: Session = Depends(get_db)):
+    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+    if not agency:
+        return {"ok": True}
+    data = await request.json()
+    await whatsapp_bot.handle_update(data, agency)
     return {"ok": True}
 
 
