@@ -15,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from excel_parser import format_unit_card
-from models import Property, ToniFile, ToniGroup, ToniProject
+from models import ToniFile, ToniGroup, ToniProject
 
 logger = logging.getLogger(__name__)
 
@@ -404,25 +404,15 @@ async def _respond_property_search(chat_id: str, keywords: list[str], db: Sessio
 async def send_morning_report():
     db = SessionLocal()
     try:
-        props = (
-            db.query(Property)
-            .filter(Property.status == "active")
-            .order_by(Property.id.desc())
-            .all()
-        )
-        if not props:
-            text = "📊 Доброе утро! На данный момент нет активных объектов в базе."
+        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+        if not projects:
+            text = "📊 Доброе утро! Проекты в базе пока не загружены."
         else:
-            lines = ["📊 Доброе утро! Актуальный инвентарь на сегодня:\n"]
-            for p in props[:20]:
-                if p.listing_type == "rent" and p.rent_price:
-                    price = f"{p.rent_price:,.0f} AED/мес".replace(",", " ")
-                elif p.price:
-                    price = f"{p.price:,.0f} AED".replace(",", " ")
-                else:
-                    price = "цена по запросу"
-                rooms = f"{p.rooms}к " if p.rooms else ""
-                lines.append(f"• {rooms}{p.title} — {price}")
+            total_units = sum(p.unit_count for p in projects)
+            lines = [f"📊 Доброе утро! В базе {len(projects)} проект(а), {total_units} юнитов:\n"]
+            for p in projects:
+                lines.append(f"• *{p.project_name}* — {p.unit_count} юн.")
+            lines.append("\nЗадайте номер юнита или параметры поиска!")
             text = "\n".join(lines)
 
         for gid in _all_group_ids(db):
