@@ -351,28 +351,27 @@ async def _process_excel_upload(
         return
 
     # ── Determine how to split into projects ─────────────────────────────────
-    # If caption provided → treat entire file as one project with that name
-    # If multiple sheets  → each sheet is its own project
-    # If single sheet     → ask Claude for the project name
+    # Single sheet  → caption (if any) is the project name, else detect from content
+    # Multiple sheets → always split one project per sheet; caption is ignored
 
-    if project_name_override.strip():
-        # Admin gave an explicit name — one project, all sheets together
-        tasks = [(project_name_override.strip(), sheets_data)]
-    elif len(sheets_data) == 1:
-        sheet_name, rows = next(iter(sheets_data.items()))
-        name = (
-            await _detect_project_name_ai(sheets_data, file_name)
-            if _GENERIC_SHEET.match(sheet_name.strip())
-            else sheet_name.strip()
-        )
+    if len(sheets_data) == 1:
+        sheet_name, _ = next(iter(sheets_data.items()))
+        if project_name_override.strip():
+            name = project_name_override.strip()
+        elif _GENERIC_SHEET.match(sheet_name.strip()):
+            name = await _detect_project_name_ai(sheets_data, file_name)
+        else:
+            name = sheet_name.strip()
         tasks = [(name, sheets_data)]
     else:
-        # Multiple sheets → determine a name for each sheet separately
+        # Multiple sheets → each sheet becomes its own project
+        # Caption is ignored; generic sheet names get "filename — SheetN" style
+        file_stem = os.path.splitext(file_name)[0]
         tasks = []
         for sheet_name, rows in sheets_data.items():
             single = {sheet_name: rows}
             if _GENERIC_SHEET.match(sheet_name.strip()):
-                name = await _detect_project_name_ai(single, sheet_name)
+                name = f"{normalize_project_name(file_stem)} — {sheet_name.strip()}"
             else:
                 name = sheet_name.strip()
             tasks.append((name, single))
