@@ -99,43 +99,151 @@ async def handle_update(data: dict, agency: Agency):
     msg_type = message_data.get("typeMessage")
     logger.info(f"WA message type: {msg_type}")
 
-    if msg_type != "textMessage":
+    if msg_type not in ("textMessage", "documentMessage"):
         return
 
     sender_data = data.get("senderData", {})
     chat_id: str = sender_data.get("chatId", "")
     sender_wid: str = sender_data.get("sender", "")
     sender_name: str = sender_data.get("senderName", "Agent")
-    text: str = message_data.get("textMessageData", {}).get("textMessage", "").strip()
 
-    logger.info(f"WA from={sender_wid} chat={chat_id} text={text[:50]!r}")
-
-    if not text or not chat_id:
+    if not chat_id:
         return
 
-    # Ignore own messages
     if sender_wid == data.get("instanceData", {}).get("wid", ""):
-        logger.info("WA ignored own message")
         return
 
     is_group = chat_id.endswith("@g.us")
     sender_phone = _normalize_phone(sender_wid)
     admin_check = _is_admin(sender_phone, agency)
-    logger.info(f"WA is_group={is_group} sender_phone={sender_phone} is_admin={admin_check} wa_admin_numbers={agency.wa_admin_numbers}")
+    logger.info(f"WA is_group={is_group} sender_phone={sender_phone} is_admin={admin_check}")
 
     db = SessionLocal()
     try:
-        if not is_group and admin_check:
-            await _handle_admin_message(chat_id, sender_phone, text, db, agency)
-        elif is_group and _is_tony_mentioned(text):
-            group_title = sender_data.get("chatName", chat_id)
-            await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
-        else:
-            logger.info(f"WA message not handled: is_group={is_group} is_admin={admin_check} tony_mentioned={_is_tony_mentioned(text)}")
+        if msg_type == "documentMessage" and not is_group and admin_check:
+            file_data = message_data.get("fileMessageData", {})
+            download_url = file_data.get("downloadUrl", "")
+            file_name = file_data.get("fileName", "file")
+            caption = file_data.get("caption", "").strip()
+            if download_url:
+                await _handle_admin_document(chat_id, sender_phone, download_url, file_name, caption, db, agency)
+        elif msg_type == "textMessage":
+            text: str = message_data.get("textMessageData", {}).get("textMessage", "").strip()
+            logger.info(f"WA from={sender_wid} chat={chat_id} text={text[:50]!r}")
+            if not text:
+                return
+            if not is_group and admin_check:
+                await _handle_admin_message(chat_id, sender_phone, text, db, agency)
+            elif is_group and _is_tony_mentioned(text):
+                group_title = sender_data.get("chatName", chat_id)
+                await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
+            else:
+                logger.info(f"WA message not handled: is_group={is_group} is_admin={admin_check} tony_mentioned={_is_tony_mentioned(text)}")
     except Exception:
         logger.exception("WA handle_update error")
     finally:
         db.close()
+
+
+# ─── Admin document upload ───────────────────────────────────────────────────
+
+async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: str,
+                                 file_name: str, caption: str, db: Session, agency: Agency):
+    import re as _re
+    from datetime import datetime as _dt
+    from excel_parser import (build_unit_index, diff_unit_indexes, format_diff_report,
+                              normalize_project_name, parse_csv, parse_excel)
+
+    fname_lower = file_name.lower()
+    if not fname_lower.endswith((".xlsx", ".xls", ".csv")):
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                       "Поддерживаются файлы: .xlsx, .xls, .csv")
+        return
+
+    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"📊 Читаю файл {file_name}...")
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(download_url)
+            file_bytes = resp.content
+    except Exception:
+        logger.exception("WA file download error")
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Не удалось скачать файл.")
+        return
+
+    try:
+        sheets_data = parse_csv(file_bytes) if fname_lower.endswith(".csv") else parse_excel(file_bytes)
+    except Exception as e:
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"❌ Ошибка чтения файла: {e}")
+        return
+
+    if not sheets_data:
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Файл пустой или без данных.")
+        return
+
+    _GENERIC = _re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", _re.IGNORECASE)
+    if len(sheets_data) == 1:
+        sheet_name = next(iter(sheets_data))
+        name = caption.strip() or (normalize_project_name(file_name) if _GENERIC.match(sheet_name.strip()) else sheet_name.strip())
+        tasks = [(name, sheets_data)]
+    else:
+        file_stem = os.path.splitext(file_name)[0]
+        tasks = [
+            (sn.strip() if not _GENERIC.match(sn.strip()) else f"{normalize_project_name(file_stem)} — {sn.strip()}",
+             {sn: rows})
+            for sn, rows in sheets_data.items()
+        ]
+
+    results = []
+    for name, sheets in tasks:
+        unit_index = build_unit_index(sheets)
+        if not unit_index:
+            results.append({"status": "skipped", "name": name})
+            continue
+        existing = (db.query(ToniProject)
+                    .filter(ToniProject.project_name == name,
+                            ToniProject.is_active == True,
+                            ToniProject.agency_id == agency.id)
+                    .first())
+        if existing:
+            diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
+            report = format_diff_report(diff, name)
+            new_ver = existing.version + 1
+            existing.is_active = False
+            db.flush()
+            db.add(ToniProject(project_name=name, version=new_ver, sheet_count=len(sheets),
+                               unit_count=len(unit_index), sheets_data=sheets, unit_index=unit_index,
+                               is_active=True, uploaded_at=_dt.now(),
+                               uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
+            db.commit()
+            results.append({"status": "updated", "name": name, "units": len(unit_index),
+                            "version": new_ver, "diff_report": report})
+        else:
+            db.add(ToniProject(project_name=name, version=1, sheet_count=len(sheets),
+                               unit_count=len(unit_index), sheets_data=sheets, unit_index=unit_index,
+                               is_active=True, uploaded_at=_dt.now(),
+                               uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
+            db.commit()
+            results.append({"status": "created", "name": name, "units": len(unit_index), "version": 1})
+
+    saved = [r for r in results if r["status"] != "skipped"]
+    if not saved:
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Юниты не найдены.")
+        return
+
+    if len(saved) == 1:
+        r = saved[0]
+        if r["status"] == "updated":
+            msg = f"✅ Проект *{r['name']}* обновлён → v{r['version']}\nЮнитов: {r['units']}\n\n{r['diff_report']}"
+        else:
+            msg = f"✅ Проект *{r['name']}* сохранён!\nЮнитов: {r['units']}"
+    else:
+        lines = [f"✅ Сохранено {len(saved)} проектов:"]
+        for r in saved:
+            lines.append(f"{'🔄' if r['status'] == 'updated' else '📁'} {r['name']} — {r['units']} юн.")
+        msg = "\n".join(lines)
+
+    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, msg)
 
 
 # ─── Admin private message ────────────────────────────────────────────────────
