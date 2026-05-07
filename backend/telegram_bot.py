@@ -33,6 +33,38 @@ async def send_message(chat_id: str, text: str, token: str = "") -> bool:
         return resp.json().get("ok", False)
 
 
+async def send_message_with_keyboard(chat_id: str, text: str, keyboard: dict, token: str = "") -> int | None:
+    """Send message with inline keyboard. Returns message_id or None."""
+    tok = token or _DEFAULT_TOKEN
+    if not tok:
+        return None
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(f"{_api(tok)}/sendMessage", json={
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "Markdown",
+            "reply_markup": keyboard,
+        })
+        data = resp.json()
+        if not data.get("ok"):
+            logger.warning(f"sendMessage+keyboard failed: {resp.text}")
+            return None
+        return data.get("result", {}).get("message_id")
+
+
+async def edit_message_text(chat_id: str, message_id: int, text: str, token: str = "") -> bool:
+    """Edit an existing message (used to update confirmation buttons)."""
+    tok = token or _DEFAULT_TOKEN
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(f"{_api(tok)}/editMessageText", json={
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "Markdown",
+        })
+        return resp.json().get("ok", False)
+
+
 async def send_typing(chat_id: str, token: str = "") -> None:
     tok = token or _DEFAULT_TOKEN
     if not tok:

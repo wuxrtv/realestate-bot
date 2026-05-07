@@ -6,12 +6,14 @@ Per-agency admin panel at /admin/{slug}.
 Webhooks at /telegram/webhook/{slug}.
 """
 
+import asyncio
 import base64
 import json
 import logging
 import os
 import re
 import secrets
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 
@@ -39,8 +41,10 @@ import toni_bot
 import whatsapp_bot
 from telegram_bot import (
     answer_callback_query,
+    edit_message_text,
     get_file_bytes,
     send_message,
+    send_message_with_keyboard,
     send_typing,
     set_webhook,
 )
@@ -705,6 +709,149 @@ async def _process_excel_upload(
             await toni_bot._send(g.chat_id, announce, agency.bot_token)
 
 
+# ─── Pending broadcast state (in-memory, cleared on restart) ─────────────────
+
+_pending_broadcasts: dict[str, dict] = {}
+
+
+def _is_urgent(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in ("срочно", "urgent", "asap", "жон", "tez", "немедленно"))
+
+
+def _wants_broadcast(caption: str) -> bool:
+    c = (caption or "").lower()
+    return any(w in c for w in ("скинь всем", "отправь всем", "send all", "broadcast",
+                                 "разошли", "скинь", "отправь", "share"))
+
+
+def _is_inventory_file(fname: str, caption: str) -> bool:
+    """Excel/CSV without explicit brochure caption = inventory/project data."""
+    f, c = fname.lower(), (caption or "").lower()
+    if f.endswith((".xlsx", ".xls", ".csv")):
+        return True
+    inv_kw = ("инвентарь", "inventory", "прайс", "price list", "availability", "unit list")
+    return any(w in c or w in f for w in inv_kw)
+
+
+def _store_pending(agency_id: int, admin_id: str, message_id: int) -> str:
+    uid = uuid.uuid4().hex[:8]
+    _pending_broadcasts[uid] = {
+        "agency_id": agency_id,
+        "admin_id": admin_id,
+        "from_chat_id": admin_id,
+        "message_id": message_id,
+    }
+    return uid
+
+
+def _confirm_keyboard(uid: str) -> dict:
+    return {"inline_keyboard": [[
+        {"text": "✅ Отправить в группы", "callback_data": f"confirm:{uid}"},
+        {"text": "❌ Отмена", "callback_data": f"cancel:{uid}"},
+    ]]}
+
+
+def _save_brochure(db: Session, agency_id: int, file_id: str, fuid: str,
+                   fname: str, caption: str, file_type: str,
+                   message_id: int, from_chat_id: str):
+    key = fuid or f"admin_{from_chat_id}_{message_id}"
+    if db.query(ToniFile).filter(ToniFile.file_unique_id == key).first():
+        return
+    units = list(set(toni_bot._extract_units(fname) + toni_bot._extract_units(caption)))
+    db.add(ToniFile(
+        agency_id=agency_id, file_id=file_id, file_unique_id=key,
+        file_name=fname, caption=caption, file_type=file_type,
+        unit_numbers=units, message_id=message_id, channel_chat_id=from_chat_id,
+    ))
+    db.commit()
+
+
+async def _analyze_brochure(file_bytes: bytes | None, fname: str, caption: str, file_type: str) -> str:
+    """Analyze brochure content with Claude. Returns formatted description."""
+    fname_lower = fname.lower()
+    try:
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+
+        if file_bytes and fname_lower.endswith(".pdf"):
+            import io as _io
+            import pdfplumber
+            text = ""
+            with pdfplumber.open(_io.BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages[:8]:
+                    text += (page.extract_text() or "") + "\n"
+            if text.strip():
+                resp = await ai.messages.create(
+                    model="claude-haiku-4-5-20251001", max_tokens=500,
+                    messages=[{"role": "user", "content": (
+                        f"Файл: {fname}\nПодпись: {caption or 'нет'}\n\n"
+                        f"Содержимое (первые страницы):\n{text[:3000]}\n\n"
+                        "Составь краткое описание (3-5 строк) для команды агентов. "
+                        "Выдели: проект, цены, типы юнитов, ключевые особенности. Ответь на русском."
+                    )}],
+                )
+                return resp.content[0].text.strip()
+
+        if file_bytes and file_type == "photo":
+            return await _analyze_image(file_bytes, caption or "")
+
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=200,
+            messages=[{"role": "user", "content": (
+                f"Файл: {fname}\nПодпись: {caption or 'нет'}\n"
+                "Составь 2 строки описания для отправки агентам. Ответ на русском."
+            )}],
+        )
+        return resp.content[0].text.strip()
+    except Exception as e:
+        logger.warning(f"Brochure analysis error: {e}")
+        return caption or fname
+
+
+async def _execute_broadcast(agency: Agency, from_chat_id: str, message_id: int,
+                              db: Session, tok: str) -> int:
+    """Forward a file to all active Telegram groups with 20-second intervals."""
+    groups = db.query(ToniGroup).filter(
+        ToniGroup.active == True, ToniGroup.agency_id == agency.id
+    ).all()
+    count = 0
+    for i, g in enumerate(groups):
+        if i > 0:
+            await asyncio.sleep(20)
+        ok = await toni_bot._copy(g.chat_id, from_chat_id, message_id, tok)
+        if ok:
+            count += 1
+    return count
+
+
+async def _handle_brochure_file(agency: Agency, user_id: str, file_id: str, fuid: str,
+                                 fname: str, caption: str, msg_id: int, file_type: str,
+                                 db: Session, tok: str):
+    """Save brochure and either broadcast or ask confirmation."""
+    _save_brochure(db, agency.id, file_id, fuid, fname, caption, file_type, msg_id, user_id)
+
+    if _is_urgent(caption):
+        count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
+        await send_message(user_id, f"⚡ Отправлено всем {count} группам!", token=tok)
+        return
+
+    fname_lower = fname.lower()
+    skip_download = fname_lower.endswith((".mp4", ".avi", ".mov", ".mkv"))
+    file_bytes = None if skip_download else await get_file_bytes(file_id, token=tok)
+    desc = await _analyze_brochure(file_bytes, fname, caption, file_type)
+
+    if _wants_broadcast(caption):
+        count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
+        await send_message(user_id, f"{desc}\n\n✅ Отправлено в {count} групп!", token=tok)
+        return
+
+    uid = _store_pending(agency.id, user_id, msg_id)
+    await send_message(user_id, desc, token=tok)
+    await send_message_with_keyboard(
+        user_id, "Готово. Отправляем? ✅ / ❌", _confirm_keyboard(uid), token=tok
+    )
+
+
 # ─── Telegram webhook (per-agency) ────────────────────────────────────────────
 
 async def _handle_webhook(data: dict, agency: Agency, db: Session):
@@ -716,7 +863,30 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         return
 
     if callback := data.get("callback_query"):
+        cb_data = callback.get("data", "")
+        cb_from_id = str(callback.get("from", {}).get("id", ""))
+        cb_msg_id = callback.get("message", {}).get("message_id")
         await answer_callback_query(callback["id"], token=tok)
+
+        if not is_admin(cb_from_id, agency):
+            return
+
+        if cb_data.startswith("confirm:"):
+            uid = cb_data[8:]
+            pending = _pending_broadcasts.pop(uid, None)
+            if pending and pending["agency_id"] == agency.id:
+                await edit_message_text(cb_from_id, cb_msg_id, "⏳ Рассылаю по группам...", token=tok)
+                count = await _execute_broadcast(
+                    agency, pending["from_chat_id"], pending["message_id"], db, tok
+                )
+                await edit_message_text(cb_from_id, cb_msg_id, f"✅ Отправлено в {count} групп!", token=tok)
+            else:
+                await edit_message_text(cb_from_id, cb_msg_id, "❌ Запрос устарел.", token=tok)
+
+        elif cb_data.startswith("cancel:"):
+            uid = cb_data[7:]
+            _pending_broadcasts.pop(uid, None)
+            await edit_message_text(cb_from_id, cb_msg_id, "❌ Отменено.", token=tok)
         return
 
     if data.get("edited_message"):
@@ -765,13 +935,19 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
     # ── 2. Photo ──────────────────────────────────────────────────────────────
     photos = message.get("photo")
     if photos:
-        await send_typing(user_id, token=tok)
         photo = photos[-1]
-        file_bytes = await get_file_bytes(photo["file_id"], token=tok)
-        if file_bytes:
-            caption = (message.get("caption") or "").strip()
-            result = await _analyze_image(file_bytes, caption, "image/jpeg")
-            await send_message(user_id, result, token=tok)
+        caption = (message.get("caption") or "").strip()
+        msg_id = message.get("message_id")
+        await send_typing(user_id, token=tok)
+
+        if _is_urgent(caption):
+            count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
+            await send_message(user_id, f"⚡ Отправлено всем {count} группам!", token=tok)
+        else:
+            await _handle_brochure_file(
+                agency, user_id, photo["file_id"], photo.get("file_unique_id", ""),
+                caption or "Фото", caption, msg_id, "photo", db, tok
+            )
         return
 
     # ── 3. Document ───────────────────────────────────────────────────────────
@@ -780,33 +956,66 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
         fname = doc.get("file_name", "")
         caption = (message.get("caption") or "").strip()
         fname_lower = fname.lower()
-
-        if fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
-            await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
-            return
-
-        if fname_lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
-            await send_typing(user_id, token=tok)
-            file_bytes = await get_file_bytes(doc["file_id"], token=tok)
-            if file_bytes:
-                media_type = "image/png" if fname_lower.endswith(".png") else "image/jpeg"
-                result = await _analyze_image(file_bytes, caption, media_type)
-                await send_message(user_id, result, token=tok)
-            return
-
+        msg_id = message.get("message_id")
+        fuid = doc.get("file_unique_id", "")
         await send_typing(user_id, token=tok)
-        file_desc = f"[Получил файл: {fname}. Подпись: {caption or 'нет'}]"
-        try:
-            reply = await admin_agent.process(agency=agency, user_id=user_id, message=file_desc, db=db)
-            await send_message(user_id, reply, token=tok)
-        except Exception as e:
-            logger.exception(f"Admin agent error on file: {e}")
+
+        # Excel / CSV → inventory/project data
+        if fname_lower.endswith((".xlsx", ".xls", ".csv")):
+            await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
+            if _is_urgent(caption) or _wants_broadcast(caption):
+                count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
+                await send_message(user_id, f"📤 Инвентарь отправлен в {count} групп!", token=tok)
+            return
+
+        # PDF → if explicit inventory keyword: project data. Otherwise: brochure
+        if fname_lower.endswith(".pdf"):
+            if _is_inventory_file(fname, caption) and any(
+                kw in (caption or "").lower()
+                for kw in ("инвентарь", "inventory", "прайс", "price list", "availability")
+            ):
+                await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
+                if _is_urgent(caption) or _wants_broadcast(caption):
+                    count = await _execute_broadcast(agency, user_id, msg_id, db, tok)
+                    await send_message(user_id, f"📤 Отправлено в {count} групп!", token=tok)
+            else:
+                await _handle_brochure_file(
+                    agency, user_id, doc["file_id"], fuid, fname, caption, msg_id, "document", db, tok
+                )
+            return
+
+        # Image documents → brochure
+        if fname_lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
+            await _handle_brochure_file(
+                agency, user_id, doc["file_id"], fuid, fname, caption, msg_id, "photo", db, tok
+            )
+            return
+
+        # Any other file (Word, video, etc.) → brochure
+        await _handle_brochure_file(
+            agency, user_id, doc["file_id"], fuid, fname, caption, msg_id, "document", db, tok
+        )
         return
 
     if not text:
         return
 
     await send_typing(user_id, token=tok)
+
+    # Urgent text → execute any pending broadcast for this admin
+    if _is_urgent(text):
+        uid_found = next(
+            (k for k, v in _pending_broadcasts.items()
+             if v["agency_id"] == agency.id and v["admin_id"] == user_id),
+            None,
+        )
+        if uid_found:
+            pending = _pending_broadcasts.pop(uid_found)
+            count = await _execute_broadcast(
+                agency, pending["from_chat_id"], pending["message_id"], db, tok
+            )
+            await send_message(user_id, f"⚡ Отправлено всем {count} группам!", token=tok)
+            return
 
     if text == "/tonigroups":
         groups = db.query(ToniGroup).filter(
