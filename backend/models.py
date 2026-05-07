@@ -1,52 +1,72 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy import JSON
 from sqlalchemy.sql import func
 from database import Base
 import os
 
-# Use JSONB for Postgres, JSON for SQLite
 _json_type = JSONB if "postgresql" in os.getenv("DATABASE_URL", "") else JSON
 
 
+class Agency(Base):
+    """One record per client agency that buys the SaaS product."""
+    __tablename__ = "agencies"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, nullable=False)
+    slug = Column(String, unique=True, index=True)       # URL key: /telegram/webhook/{slug}
+    bot_token = Column(String, unique=True, nullable=False)
+    admin_ids = Column(_json_type, default=list)          # ["7567850330", ...]
+    admin_password = Column(String, default="toni2024")   # for /admin/{slug}
+    bot_username = Column(String, default="")             # for @mention detection in groups
+    umar_contact = Column(String, default="@support")     # shown when unit not found
+    db_channel_id = Column(String, default="")            # private file/brochure channel
+    is_active = Column(Boolean, default=True)
+    created_at = Column(DateTime, default=func.now())
+
+
 class ToniFile(Base):
-    """File indexed from the private database channel for Toni bot."""
+    """File indexed from the private database channel."""
     __tablename__ = "toni_files"
 
     id = Column(Integer, primary_key=True, index=True)
+    agency_id = Column(Integer, nullable=True, index=True)
     file_id = Column(String)
     file_unique_id = Column(String, unique=True, index=True)
     file_name = Column(String)
     caption = Column(Text)
-    file_type = Column(String)            # document | photo | video
-    unit_numbers = Column(_json_type, default=list)   # extracted unit numbers
-    message_id = Column(Integer)          # original message_id in the channel
-    channel_chat_id = Column(String)      # channel chat ID for copyMessage
+    file_type = Column(String)
+    unit_numbers = Column(_json_type, default=list)
+    message_id = Column(Integer)
+    channel_chat_id = Column(String)
     created_at = Column(DateTime, default=func.now())
 
 
 class ToniGroup(Base):
-    """Agent group where Toni is present."""
+    """Agent group where the bot is present."""
     __tablename__ = "toni_groups"
+    __table_args__ = (UniqueConstraint("agency_id", "chat_id", name="uq_agency_group"),)
 
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(String, unique=True, index=True)
+    agency_id = Column(Integer, nullable=True, index=True)
+    chat_id = Column(String, index=True)
     title = Column(String)
     active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
 
 
 class ToniProject(Base):
-    """Excel project file uploaded via admin panel."""
+    """Excel project file uploaded via admin."""
     __tablename__ = "toni_projects"
 
     id = Column(Integer, primary_key=True, index=True)
-    project_name = Column(String, index=True)   # human-readable name (from filename or override)
+    agency_id = Column(Integer, nullable=True, index=True)
+    project_name = Column(String, index=True)
     version = Column(Integer, default=1)
     sheet_count = Column(Integer, default=0)
     unit_count = Column(Integer, default=0)
-    sheets_data = Column(_json_type)            # {sheet_name: [row_dicts]}
-    unit_index = Column(_json_type)             # {unit_num: {_sheet, col: val, ...}}
+    sheets_data = Column(_json_type)
+    unit_index = Column(_json_type)
     is_active = Column(Boolean, default=True)
     uploaded_at = Column(DateTime, default=func.now())
     uploaded_by = Column(String, default="web")

@@ -1,5 +1,6 @@
 """
 Telegram Bot API helpers: send messages, set webhook, download files.
+All functions accept an optional `token` parameter for multi-agency support.
 """
 
 import logging
@@ -9,16 +10,20 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-API = f"https://api.telegram.org/bot{TOKEN}"
+_DEFAULT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 
-async def send_message(chat_id: str, text: str) -> bool:
-    if not TOKEN:
-        logger.error("TELEGRAM_BOT_TOKEN not set")
+def _api(token: str) -> str:
+    return f"https://api.telegram.org/bot{token}"
+
+
+async def send_message(chat_id: str, text: str, token: str = "") -> bool:
+    tok = token or _DEFAULT_TOKEN
+    if not tok:
+        logger.error("No bot token for send_message")
         return False
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(f"{API}/sendMessage", json={
+        resp = await client.post(f"{_api(tok)}/sendMessage", json={
             "chat_id": chat_id,
             "text": text,
             "parse_mode": "Markdown",
@@ -28,25 +33,30 @@ async def send_message(chat_id: str, text: str) -> bool:
         return resp.json().get("ok", False)
 
 
-async def send_typing(chat_id: str):
+async def send_typing(chat_id: str, token: str = "") -> None:
+    tok = token or _DEFAULT_TOKEN
+    if not tok:
+        return
     async with httpx.AsyncClient(timeout=5) as client:
-        await client.post(f"{API}/sendChatAction", json={
+        await client.post(f"{_api(tok)}/sendChatAction", json={
             "chat_id": chat_id,
             "action": "typing",
         })
 
 
-async def answer_callback_query(callback_query_id: str) -> bool:
+async def answer_callback_query(callback_query_id: str, token: str = "") -> bool:
+    tok = token or _DEFAULT_TOKEN
     async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.post(f"{API}/answerCallbackQuery", json={
+        resp = await client.post(f"{_api(tok)}/answerCallbackQuery", json={
             "callback_query_id": callback_query_id,
         })
         return resp.json().get("ok", False)
 
 
-async def set_webhook(webhook_url: str) -> dict:
+async def set_webhook(webhook_url: str, token: str = "") -> dict:
+    tok = token or _DEFAULT_TOKEN
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(f"{API}/setWebhook", json={
+        resp = await client.post(f"{_api(tok)}/setWebhook", json={
             "url": webhook_url,
             "allowed_updates": ["message", "callback_query", "channel_post"],
             "drop_pending_updates": True,
@@ -56,16 +66,17 @@ async def set_webhook(webhook_url: str) -> dict:
         return result
 
 
-async def get_file_bytes(file_id: str) -> bytes | None:
+async def get_file_bytes(file_id: str, token: str = "") -> bytes | None:
     """Download a file from Telegram by file_id. Returns raw bytes or None on failure."""
+    tok = token or _DEFAULT_TOKEN
     async with httpx.AsyncClient(timeout=60) as client:
-        resp = await client.post(f"{API}/getFile", json={"file_id": file_id})
+        resp = await client.post(f"{_api(tok)}/getFile", json={"file_id": file_id})
         data = resp.json()
         if not data.get("ok"):
             logger.warning(f"getFile failed: {resp.text[:200]}")
             return None
         file_path = data["result"]["file_path"]
-        dl = await client.get(f"https://api.telegram.org/file/bot{TOKEN}/{file_path}")
+        dl = await client.get(f"https://api.telegram.org/file/bot{tok}/{file_path}")
         if dl.status_code != 200:
             logger.warning(f"File download failed: status {dl.status_code}")
             return None

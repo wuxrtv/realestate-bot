@@ -1,7 +1,9 @@
 """
-FastAPI application — Toni bot for real estate agent groups.
-Routes Telegram updates: groups/channel → Toni, private admin chat → AdminAgent.
-Admin panel at /admin for uploading Excel project files.
+FastAPI application — Toni SaaS for real estate agencies.
+Multi-tenant: each agency has its own bot token and isolated data.
+Super admin panel at /superadmin to manage agencies.
+Per-agency admin panel at /admin/{slug}.
+Webhooks at /telegram/webhook/{slug}.
 """
 
 import base64
@@ -15,14 +17,14 @@ from datetime import datetime
 
 import anthropic
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy.orm import Session
 
 from admin_agent import AdminAgent, is_admin
-from database import get_db, init_db
+from database import SessionLocal, get_db, init_db
 from excel_parser import (
     build_unit_index,
     diff_unit_indexes,
@@ -31,7 +33,7 @@ from excel_parser import (
     parse_csv,
     parse_excel,
 )
-from models import ToniFile, ToniGroup, ToniProject
+from models import Agency, ToniFile, ToniGroup, ToniProject
 import toni_bot
 from telegram_bot import (
     answer_callback_query,
@@ -48,6 +50,8 @@ admin_agent = AdminAgent()
 scheduler = AsyncIOScheduler(timezone="Asia/Tashkent")
 http_basic = HTTPBasic()
 
+_SUPER_PASSWORD = os.getenv("SUPER_ADMIN_PASSWORD", "superadmin2024")
+
 
 # ─── App lifespan ─────────────────────────────────────────────────────────────
 
@@ -55,11 +59,17 @@ http_basic = HTTPBasic()
 async def lifespan(app: FastAPI):
     init_db()
 
-    railway_url = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_URL")
-    if railway_url and os.getenv("TELEGRAM_BOT_TOKEN"):
-        webhook_url = f"https://{railway_url}/telegram/webhook"
-        await set_webhook(webhook_url)
-        logger.info(f"Webhook set: {webhook_url}")
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_URL")
+    if public_domain:
+        db = SessionLocal()
+        try:
+            agencies = db.query(Agency).filter(Agency.is_active == True).all()
+            for agency in agencies:
+                url = f"https://{public_domain}/telegram/webhook/{agency.slug}"
+                await set_webhook(url, token=agency.bot_token)
+                logger.info(f"Webhook set for agency '{agency.slug}': {url}")
+        finally:
+            db.close()
 
     scheduler.add_job(toni_bot.send_morning_report, "cron", hour=9, minute=0, id="toni_morning")
     scheduler.start()
@@ -69,7 +79,7 @@ async def lifespan(app: FastAPI):
     scheduler.shutdown()
 
 
-app = FastAPI(title="Toni Bot", version="3.0.0", lifespan=lifespan)
+app = FastAPI(title="Toni SaaS", version="4.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -79,25 +89,49 @@ app.add_middleware(
 )
 
 
-# ─── Admin auth ───────────────────────────────────────────────────────────────
+# ─── Auth helpers ─────────────────────────────────────────────────────────────
 
-def _verify_admin(credentials: HTTPBasicCredentials = Depends(http_basic)):
-    password = os.getenv("ADMIN_PASSWORD", "toni2024")
+def _verify_super_admin(credentials: HTTPBasicCredentials = Depends(http_basic)):
     ok = (
         secrets.compare_digest(credentials.username.encode(), b"admin")
-        and secrets.compare_digest(credentials.password.encode(), password.encode())
+        and secrets.compare_digest(credentials.password.encode(), _SUPER_PASSWORD.encode())
     )
     if not ok:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
+        raise HTTPException(status_code=401, detail="Unauthorized",
+                            headers={"WWW-Authenticate": "Basic"})
+
+
+def _check_agency_auth(request: Request, agency: Agency) -> bool:
+    import base64 as _b64
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Basic "):
+        return False
+    try:
+        decoded = _b64.b64decode(auth_header[6:]).decode()
+        username, password = decoded.split(":", 1)
+        return (
+            secrets.compare_digest(username.encode(), b"admin")
+            and secrets.compare_digest(password.encode(), (agency.admin_password or "toni2024").encode())
         )
+    except Exception:
+        return False
 
 
-# ─── Admin panel HTML ─────────────────────────────────────────────────────────
+# ─── Slug helper ──────────────────────────────────────────────────────────────
 
-_ADMIN_CSS = """
+def _make_slug(name: str, db: Session) -> str:
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "agency"
+    slug = base
+    i = 2
+    while db.query(Agency).filter(Agency.slug == slug).first():
+        slug = f"{base}-{i}"
+        i += 1
+    return slug
+
+
+# ─── Shared CSS ───────────────────────────────────────────────────────────────
+
+_CSS = """
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
        background: #f0f2f5; color: #1a1a2e; }
@@ -121,10 +155,156 @@ tr:last-child td { border-bottom: none; }
          font-size: .75rem; font-weight: 500; }
 .badge-blue { background: #ebf4ff; color: #2b6cb0; }
 .badge-green { background: #f0fff4; color: #276749; }
+.badge-red { background: #fff5f5; color: #c53030; }
 .sheet-list { font-size: .8rem; color: #718096; }
 .empty { text-align: center; padding: 28px; color: #a0aec0; font-size: .9rem; }
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label { font-size: .82rem; font-weight: 600; color: #4a5568; }
+.field input { padding: 9px 12px; border: 1px solid #d1d5db; border-radius: 8px;
+               font-size: .9rem; outline: none; }
+.field input:focus { border-color: #667eea; box-shadow: 0 0 0 3px rgba(102,126,234,.15); }
+.field-full { grid-column: 1 / -1; }
+.btn { padding: 10px 22px; border: none; border-radius: 8px; font-size: .9rem;
+       font-weight: 600; cursor: pointer; }
+.btn-primary { background: #1a1a2e; color: #fff; }
+.btn-primary:hover { background: #2d2d4e; }
+a { color: #2b6cb0; text-decoration: none; }
+a:hover { text-decoration: underline; }
 """
 
+
+# ─── Super admin panel ────────────────────────────────────────────────────────
+
+def _super_html(agencies: list, message: str = "") -> str:
+    rows = ""
+    for a in agencies:
+        dt = a.created_at.strftime("%d.%m.%Y") if a.created_at else "—"
+        status = '<span class="badge badge-green">active</span>' if a.is_active else '<span class="badge badge-red">off</span>'
+        rows += f"""
+        <tr>
+          <td><strong>{a.name}</strong></td>
+          <td><code>{a.slug}</code></td>
+          <td>{status}</td>
+          <td><a href="/admin/{a.slug}" target="_blank">/admin/{a.slug}</a></td>
+          <td>{dt}</td>
+        </tr>"""
+
+    msg_html = f'<div class="hint" style="margin-bottom:16px;background:#f0fff4;border-color:#9ae6b4;color:#276749">{message}</div>' if message else ""
+
+    return f"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Toni SaaS — Агентства</title>
+  <style>{_CSS}</style>
+</head>
+<body>
+  <div class="header">
+    <div>🤖</div>
+    <div>
+      <h1>Toni SaaS — Управление агентствами</h1>
+      <span>Супер-администратор</span>
+    </div>
+  </div>
+  <div class="container">
+    {msg_html}
+    <div class="card">
+      <h2>➕ Добавить агентство</h2>
+      <form method="post" action="/superadmin/agency">
+        <div class="form-grid">
+          <div class="field field-full">
+            <label>Название агентства *</label>
+            <input name="name" required placeholder="Alpha Real Estate">
+          </div>
+          <div class="field field-full">
+            <label>Telegram Bot Token * (от @BotFather)</label>
+            <input name="bot_token" required placeholder="1234567890:AAFxxxx...">
+          </div>
+          <div class="field">
+            <label>Telegram ID администратора * (через запятую)</label>
+            <input name="admin_ids" required placeholder="7567850330">
+          </div>
+          <div class="field">
+            <label>Пароль для панели /admin</label>
+            <input name="admin_password" placeholder="toni2024">
+          </div>
+          <div class="field">
+            <label>Username бота (без @, для @упоминаний)</label>
+            <input name="bot_username" placeholder="ToniRealtyBot">
+          </div>
+          <div class="field">
+            <label>Контакт поддержки (когда юнит не найден)</label>
+            <input name="umar_contact" placeholder="@manager">
+          </div>
+          <div class="field field-full">
+            <label>ID канала-базы файлов (необязательно)</label>
+            <input name="db_channel_id" placeholder="-1001234567890">
+          </div>
+          <div class="field field-full">
+            <button class="btn btn-primary" type="submit">Создать агентство</button>
+          </div>
+        </div>
+      </form>
+    </div>
+    <div class="card">
+      <h2>📋 Агентства ({len(agencies)})</h2>
+      {'<div class="empty">Пока нет ни одного агентства.</div>' if not agencies else f'<table><thead><tr><th>Название</th><th>Slug</th><th>Статус</th><th>Панель</th><th>Создано</th></tr></thead><tbody>{rows}</tbody></table>'}
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+@app.get("/superadmin", response_class=HTMLResponse)
+async def super_admin_page(
+    _: None = Depends(_verify_super_admin),
+    db: Session = Depends(get_db),
+):
+    agencies = db.query(Agency).order_by(Agency.created_at.desc()).all()
+    return _super_html(agencies)
+
+
+@app.post("/superadmin/agency")
+async def super_admin_create_agency(
+    _: None = Depends(_verify_super_admin),
+    db: Session = Depends(get_db),
+    name: str = Form(...),
+    bot_token: str = Form(...),
+    admin_ids: str = Form(...),
+    admin_password: str = Form("toni2024"),
+    bot_username: str = Form(""),
+    umar_contact: str = Form("@support"),
+    db_channel_id: str = Form(""),
+):
+    slug = _make_slug(name, db)
+    parsed_ids = [i.strip() for i in admin_ids.split(",") if i.strip()]
+    agency = Agency(
+        name=name.strip(),
+        slug=slug,
+        bot_token=bot_token.strip(),
+        admin_ids=parsed_ids,
+        admin_password=admin_password.strip() or "toni2024",
+        bot_username=bot_username.strip().lstrip("@"),
+        umar_contact=umar_contact.strip() or "@support",
+        db_channel_id=db_channel_id.strip(),
+    )
+    db.add(agency)
+    db.commit()
+    db.refresh(agency)
+
+    # Register webhook for this agency's bot
+    public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_URL")
+    if public_domain:
+        webhook_url = f"https://{public_domain}/telegram/webhook/{slug}"
+        await set_webhook(webhook_url, token=bot_token.strip())
+        logger.info(f"Webhook registered for new agency '{slug}': {webhook_url}")
+
+    return RedirectResponse(url=f"/superadmin?created={slug}", status_code=303)
+
+
+# ─── Per-agency admin panel ───────────────────────────────────────────────────
 
 def _projects_table(projects: list) -> str:
     if not projects:
@@ -157,20 +337,20 @@ def _projects_table(projects: list) -> str:
     </table>"""
 
 
-def _admin_html(projects: list) -> str:
+def _agency_admin_html(agency: Agency, projects: list) -> str:
     return f"""<!DOCTYPE html>
 <html lang="ru">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Тони — Projects</title>
-  <style>{_ADMIN_CSS}</style>
+  <title>Тони — {agency.name}</title>
+  <style>{_CSS}</style>
 </head>
 <body>
   <div class="header">
     <div>🤖</div>
     <div>
-      <h1>Тони — База проектов</h1>
+      <h1>Тони — {agency.name}</h1>
       <span>Только просмотр • загрузка через Telegram</span>
     </div>
   </div>
@@ -181,7 +361,7 @@ def _admin_html(projects: list) -> str:
         Отправьте Excel-файл (<strong>.xlsx</strong> или <strong>.xls</strong>) боту в личный чат в Telegram.<br>
         • Бот прочитает все листы и запомнит данные.<br>
         • Если проект уже был загружен — бот покажет что изменилось.<br>
-        • Подпись к файлу станет названием проекта (необязательно).
+        • Если файл с несколькими листами — каждый лист сохраняется как отдельный проект.
       </div>
     </div>
     <div class="card">
@@ -193,26 +373,39 @@ def _admin_html(projects: list) -> str:
 </html>"""
 
 
-# ─── Admin panel route (read-only view) ──────────────────────────────────────
+@app.get("/admin/{slug}", response_class=HTMLResponse)
+async def agency_admin_page(slug: str, request: Request, db: Session = Depends(get_db)):
+    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+    if not agency:
+        raise HTTPException(status_code=404, detail="Agency not found")
 
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_page(
-    _: None = Depends(_verify_admin),
-    db: Session = Depends(get_db),
-):
+    if not _check_agency_auth(request, agency):
+        return HTMLResponse(
+            content="Unauthorized",
+            status_code=401,
+            headers={"WWW-Authenticate": 'Basic realm="Toni Admin"'},
+        )
+
     projects = (
         db.query(ToniProject)
-        .filter(ToniProject.is_active == True)
+        .filter(ToniProject.is_active == True, ToniProject.agency_id == agency.id)
         .order_by(ToniProject.uploaded_at.desc())
         .all()
     )
-    return _admin_html(projects)
+    return _agency_admin_html(agency, projects)
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_redirect(db: Session = Depends(get_db)):
+    agency = db.query(Agency).filter(Agency.slug == "default").first()
+    if agency:
+        return RedirectResponse(url=f"/admin/{agency.slug}", status_code=302)
+    raise HTTPException(status_code=404, detail="No default agency configured")
 
 
 # ─── Admin helper utilities ──────────────────────────────────────────────────
 
 async def _transcribe_voice(audio_bytes: bytes) -> str | None:
-    """Transcribe a voice OGG file via Groq Whisper."""
     key = os.getenv("GROQ_API_KEY")
     if not key:
         return None
@@ -230,7 +423,6 @@ async def _transcribe_voice(audio_bytes: bytes) -> str | None:
 
 
 async def _analyze_image(image_bytes: bytes, caption: str, media_type: str = "image/jpeg") -> str:
-    """Analyze an image with Claude vision and return a text description."""
     try:
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         img_b64 = base64.standard_b64encode(image_bytes).decode()
@@ -257,7 +449,6 @@ async def _analyze_image(image_bytes: bytes, caption: str, media_type: str = "im
 
 
 async def _detect_project_name_ai(sheets_data: dict, filename: str) -> str:
-    """Ask Claude to identify the project name from spreadsheet content."""
     try:
         first_sheet = next(iter(sheets_data.values()), [])
         headers = list(first_sheet[0].keys()) if first_sheet else []
@@ -283,15 +474,19 @@ async def _detect_project_name_ai(sheets_data: dict, filename: str) -> str:
 _GENERIC_SHEET = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
 
 
-async def _save_project(name: str, sheets: dict, user_id: str, db: Session) -> dict:
-    """Save or update one ToniProject. Returns {status, name, units, version, diff_report}."""
+async def _save_project(name: str, sheets: dict, user_id: str,
+                        db: Session, agency_id: int) -> dict:
     unit_index = build_unit_index(sheets)
     if not unit_index:
         return {"status": "skipped", "name": name, "reason": "no units found"}
 
     existing = (
         db.query(ToniProject)
-        .filter(ToniProject.project_name == name, ToniProject.is_active == True)
+        .filter(
+            ToniProject.project_name == name,
+            ToniProject.is_active == True,
+            ToniProject.agency_id == agency_id,
+        )
         .first()
     )
     if existing:
@@ -304,7 +499,8 @@ async def _save_project(name: str, sheets: dict, user_id: str, db: Session) -> d
             project_name=name, version=new_version,
             sheet_count=len(sheets), unit_count=len(unit_index),
             sheets_data=sheets, unit_index=unit_index,
-            is_active=True, uploaded_at=datetime.now(), uploaded_by=user_id,
+            is_active=True, uploaded_at=datetime.now(),
+            uploaded_by=user_id, agency_id=agency_id,
         ))
         db.commit()
         return {"status": "updated", "name": name, "units": len(unit_index),
@@ -314,26 +510,28 @@ async def _save_project(name: str, sheets: dict, user_id: str, db: Session) -> d
             project_name=name, version=1,
             sheet_count=len(sheets), unit_count=len(unit_index),
             sheets_data=sheets, unit_index=unit_index,
-            is_active=True, uploaded_at=datetime.now(), uploaded_by=user_id,
+            is_active=True, uploaded_at=datetime.now(),
+            uploaded_by=user_id, agency_id=agency_id,
         ))
         db.commit()
         return {"status": "created", "name": name, "units": len(unit_index), "version": 1}
 
 
 async def _process_excel_upload(
+    agency: Agency,
     user_id: str,
     file_id: str,
     file_name: str,
     project_name_override: str,
     db: Session,
 ):
-    """Download file, split sheets into separate projects, save each."""
-    await send_typing(user_id)
-    await send_message(user_id, f"📊 Читаю файл *{file_name}*...")
+    tok = agency.bot_token
+    await send_typing(user_id, token=tok)
+    await send_message(user_id, f"📊 Читаю файл *{file_name}*...", token=tok)
 
-    file_bytes = await get_file_bytes(file_id)
+    file_bytes = await get_file_bytes(file_id, token=tok)
     if not file_bytes:
-        await send_message(user_id, "❌ Не удалось скачать файл. Попробуй ещё раз.")
+        await send_message(user_id, "❌ Не удалось скачать файл. Попробуй ещё раз.", token=tok)
         return
 
     try:
@@ -343,17 +541,15 @@ async def _process_excel_upload(
             sheets_data = parse_excel(file_bytes)
     except Exception as e:
         logger.exception("Spreadsheet parse error")
-        await send_message(user_id, f"❌ Ошибка чтения файла: {e}")
+        await send_message(user_id, f"❌ Ошибка чтения файла: {e}", token=tok)
         return
 
     if not sheets_data:
-        await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.")
+        await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.", token=tok)
         return
 
-    # ── Determine how to split into projects ─────────────────────────────────
-    # Single sheet  → caption (if any) is the project name, else detect from content
-    # Multiple sheets → always split one project per sheet; caption is ignored
-
+    # Single sheet: respect caption override or detect name
+    # Multiple sheets: always split one project per sheet; caption is ignored
     if len(sheets_data) == 1:
         sheet_name, _ = next(iter(sheets_data.items()))
         if project_name_override.strip():
@@ -364,8 +560,6 @@ async def _process_excel_upload(
             name = sheet_name.strip()
         tasks = [(name, sheets_data)]
     else:
-        # Multiple sheets → each sheet becomes its own project
-        # Caption is ignored; generic sheet names get "filename — SheetN" style
         file_stem = os.path.splitext(file_name)[0]
         tasks = []
         for sheet_name, rows in sheets_data.items():
@@ -376,32 +570,32 @@ async def _process_excel_upload(
                 name = sheet_name.strip()
             tasks.append((name, single))
 
-    # ── Save each project ─────────────────────────────────────────────────────
     results = []
     for name, sheets in tasks:
-        r = await _save_project(name, sheets, user_id, db)
+        r = await _save_project(name, sheets, user_id, db, agency_id=agency.id)
         results.append(r)
 
     saved = [r for r in results if r["status"] != "skipped"]
     skipped = [r for r in results if r["status"] == "skipped"]
 
     if not saved:
-        await send_message(user_id, "❌ Ни в одном листе не найдены юниты.")
+        await send_message(user_id, "❌ Ни в одном листе не найдены юниты.", token=tok)
         return
 
-    # ── Reply to admin ────────────────────────────────────────────────────────
     if len(saved) == 1:
         r = saved[0]
         if r["status"] == "updated":
             await send_message(
                 user_id,
                 f"✅ Проект *{r['name']}* обновлён → v{r['version']}\n"
-                f"Юнитов: {r['units']}\n\n{r['diff_report']}"
+                f"Юнитов: {r['units']}\n\n{r['diff_report']}",
+                token=tok,
             )
         else:
             await send_message(
                 user_id,
-                f"✅ Проект *{r['name']}* сохранён!\nЮнитов: {r['units']}"
+                f"✅ Проект *{r['name']}* сохранён!\nЮнитов: {r['units']}",
+                token=tok,
             )
     else:
         lines = [f"✅ Из файла *{file_name}* сохранено *{len(saved)}* проектов:\n"]
@@ -411,86 +605,85 @@ async def _process_excel_upload(
             lines.append(f"{icon} *{r['name']}* — {r['units']} юн. {ver}")
         if skipped:
             lines.append(f"\n⚠️ Пропущено (нет юнитов): {', '.join(r['name'] for r in skipped)}")
-        await send_message(user_id, "\n".join(lines))
+        await send_message(user_id, "\n".join(lines), token=tok)
 
-    # ── Announce new projects to groups ───────────────────────────────────────
     new_names = [r["name"] for r in saved if r["status"] == "created"]
     if new_names:
-        groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
+        groups = db.query(ToniGroup).filter(
+            ToniGroup.active == True, ToniGroup.agency_id == agency.id
+        ).all()
         names_str = ", ".join(f"*{n}*" for n in new_names)
         announce = f"📁 Новые проекты добавлены: {names_str}\nСпрашивайте по номеру юнита!"
         for g in groups:
-            await toni_bot._send(g.chat_id, announce)
+            await toni_bot._send(g.chat_id, announce, agency.bot_token)
 
 
-# ─── Telegram webhook ─────────────────────────────────────────────────────────
+# ─── Telegram webhook (per-agency) ────────────────────────────────────────────
 
-@app.post("/telegram/webhook")
-async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
-    data = await request.json()
+async def _handle_webhook(data: dict, agency: Agency, db: Session):
+    """Core webhook logic shared between /telegram/webhook/{slug} and legacy route."""
+    tok = agency.bot_token
 
     if data.get("channel_post"):
-        await toni_bot.handle_update(data)
-        return {"ok": True}
+        await toni_bot.handle_update(data, agency)
+        return
 
     if callback := data.get("callback_query"):
-        await answer_callback_query(callback["id"])
-        return {"ok": True}
+        await answer_callback_query(callback["id"], token=tok)
+        return
 
-    # Ignore edited messages — they re-trigger Claude unnecessarily
     if data.get("edited_message"):
-        return {"ok": True}
+        return
 
     message = data.get("message")
     if not message:
-        return {"ok": True}
+        return
 
-    # Ignore messages from bots (including the bot itself)
     if message.get("from", {}).get("is_bot"):
-        return {"ok": True}
+        return
 
     chat_type = message.get("chat", {}).get("type", "")
-    chat_id = str(message.get("chat", {}).get("id", ""))
     user_id = str(message.get("from", {}).get("id", ""))
     text = (message.get("text") or "").strip()
 
     if chat_type in ("group", "supergroup"):
-        await toni_bot.handle_update(data)
-        return {"ok": True}
+        await toni_bot.handle_update(data, agency)
+        return
 
-    if not is_admin(user_id):
-        return {"ok": True}
+    if not is_admin(user_id, agency):
+        return
 
-    # ── 1. Voice / audio message → transcribe → treat as text ────────────────
+    # ── 1. Voice ──────────────────────────────────────────────────────────────
     voice = message.get("voice") or message.get("audio")
     if voice and not text:
-        await send_typing(user_id)
-        file_bytes = await get_file_bytes(voice["file_id"])
+        await send_typing(user_id, token=tok)
+        file_bytes = await get_file_bytes(voice["file_id"], token=tok)
         if file_bytes:
             transcript = await _transcribe_voice(file_bytes)
             if transcript:
-                await send_message(user_id, f"🎤 _{transcript}_")
-                text = transcript  # fall through to admin_agent below
+                await send_message(user_id, f"🎤 _{transcript}_", token=tok)
+                text = transcript
             else:
                 await send_message(
                     user_id,
-                    "❌ Не могу распознать голосовое — добавь GROQ\\_API\\_KEY в переменные окружения."
+                    "❌ Не могу распознать голосовое — добавь GROQ\\_API\\_KEY в переменные окружения.",
+                    token=tok,
                 )
-                return {"ok": True}
+                return
         else:
-            return {"ok": True}
+            return
 
-    # ── 2. Photo → Claude vision analysis ────────────────────────────────────
+    # ── 2. Photo ──────────────────────────────────────────────────────────────
     photos = message.get("photo")
     if photos:
-        await send_typing(user_id)
+        await send_typing(user_id, token=tok)
         photo = photos[-1]
-        file_bytes = await get_file_bytes(photo["file_id"])
+        file_bytes = await get_file_bytes(photo["file_id"], token=tok)
         if file_bytes:
             caption = (message.get("caption") or "").strip()
             result = await _analyze_image(file_bytes, caption, "image/jpeg")
-            await send_message(user_id, result)
-        return {"ok": True}
+            await send_message(user_id, result, token=tok)
+        return
 
     # ── 3. Document ───────────────────────────────────────────────────────────
     doc = message.get("document")
@@ -499,85 +692,109 @@ async def telegram_webhook(request: Request, db: Session = Depends(get_db)):
         caption = (message.get("caption") or "").strip()
         fname_lower = fname.lower()
 
-        # Spreadsheet → project memory
         if fname_lower.endswith((".xlsx", ".xls", ".csv")):
-            await _process_excel_upload(user_id, doc["file_id"], fname, caption, db)
-            return {"ok": True}
+            await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
+            return
 
-        # Image document → Claude vision
         if fname_lower.endswith((".png", ".jpg", ".jpeg", ".webp")):
-            await send_typing(user_id)
-            file_bytes = await get_file_bytes(doc["file_id"])
+            await send_typing(user_id, token=tok)
+            file_bytes = await get_file_bytes(doc["file_id"], token=tok)
             if file_bytes:
                 media_type = "image/png" if fname_lower.endswith(".png") else "image/jpeg"
                 result = await _analyze_image(file_bytes, caption, media_type)
-                await send_message(user_id, result)
-            return {"ok": True}
+                await send_message(user_id, result, token=tok)
+            return
 
-        # Any other file → pass description to admin_agent
-        await send_typing(user_id)
+        await send_typing(user_id, token=tok)
         file_desc = f"[Получил файл: {fname}. Подпись: {caption or 'нет'}]"
         try:
-            reply = await admin_agent.process(user_id=user_id, message=file_desc, db=db)
-            await send_message(user_id, reply)
+            reply = await admin_agent.process(agency=agency, user_id=user_id, message=file_desc, db=db)
+            await send_message(user_id, reply, token=tok)
         except Exception as e:
             logger.exception(f"Admin agent error on file: {e}")
-        return {"ok": True}
+        return
 
     if not text:
-        return {"ok": True}
+        return
 
-    await send_typing(user_id)
+    await send_typing(user_id, token=tok)
 
     if text == "/tonigroups":
-        groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
+        groups = db.query(ToniGroup).filter(
+            ToniGroup.active == True, ToniGroup.agency_id == agency.id
+        ).all()
         if not groups:
-            await send_message(user_id, "Бот ещё не добавлен ни в одну группу.")
+            await send_message(user_id, "Бот ещё не добавлен ни в одну группу.", token=tok)
         else:
             lines = [f"📋 Групп зарегистрировано: {len(groups)}\n"]
             for g in groups:
                 lines.append(f"• {g.title or '—'} (`{g.chat_id}`)")
-            await send_message(user_id, "\n".join(lines))
-        return {"ok": True}
+            await send_message(user_id, "\n".join(lines), token=tok)
+        return
 
     if text == "/toniprojects":
-        projs = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+        projs = db.query(ToniProject).filter(
+            ToniProject.is_active == True, ToniProject.agency_id == agency.id
+        ).all()
         if not projs:
-            await send_message(user_id, "Проекты не загружены. Откройте /admin панель.")
+            await send_message(user_id, f"Проекты не загружены. Откройте /admin/{agency.slug}", token=tok)
         else:
             lines = [f"📁 Проектов в базе: {len(projs)}\n"]
             for p in projs:
                 lines.append(f"• {p.project_name} — {p.unit_count} юн., v{p.version}")
-            await send_message(user_id, "\n".join(lines))
-        return {"ok": True}
+            await send_message(user_id, "\n".join(lines), token=tok)
+        return
 
     if text == "/tonifiles":
-        files = db.query(ToniFile).order_by(ToniFile.id.desc()).limit(10).all()
+        files = db.query(ToniFile).filter(
+            ToniFile.agency_id == agency.id
+        ).order_by(ToniFile.id.desc()).limit(10).all()
         if not files:
-            await send_message(user_id, "База файлов пуста.")
+            await send_message(user_id, "База файлов пуста.", token=tok)
         else:
             lines = [f"📁 Последние {len(files)} файлов:\n"]
             for f in files:
                 units = ", ".join(f.unit_numbers) if f.unit_numbers else "—"
                 lines.append(f"• {f.file_name} | юниты: {units}")
-            await send_message(user_id, "\n".join(lines))
-        return {"ok": True}
+            await send_message(user_id, "\n".join(lines), token=tok)
+        return
 
     if text.startswith("/toniannounce "):
         msg_text = text[len("/toniannounce "):].strip()
-        groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
+        groups = db.query(ToniGroup).filter(
+            ToniGroup.active == True, ToniGroup.agency_id == agency.id
+        ).all()
         for g in groups:
-            await toni_bot._send(g.chat_id, msg_text)
-        await send_message(user_id, f"✅ Отправлено в {len(groups)} групп(ы).")
-        return {"ok": True}
+            await toni_bot._send(g.chat_id, msg_text, agency.bot_token)
+        await send_message(user_id, f"✅ Отправлено в {len(groups)} групп(ы).", token=tok)
+        return
 
     try:
-        reply = await admin_agent.process(user_id=user_id, message=text, db=db)
-        await send_message(user_id, reply)
+        reply = await admin_agent.process(agency=agency, user_id=user_id, message=text, db=db)
+        await send_message(user_id, reply, token=tok)
     except Exception as e:
         logger.exception(f"Admin agent error: {e}")
-        await send_message(user_id, f"Ошибка: {e}")
+        await send_message(user_id, f"Ошибка: {e}", token=tok)
 
+
+@app.post("/telegram/webhook/{slug}")
+async def telegram_webhook_agency(slug: str, request: Request, db: Session = Depends(get_db)):
+    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+    if not agency:
+        return {"ok": True}
+    data = await request.json()
+    await _handle_webhook(data, agency, db)
+    return {"ok": True}
+
+
+@app.post("/telegram/webhook")
+async def telegram_webhook_default(request: Request, db: Session = Depends(get_db)):
+    """Backward-compat route — uses the 'default' agency slug."""
+    agency = db.query(Agency).filter(Agency.slug == "default", Agency.is_active == True).first()
+    if not agency:
+        return {"ok": True}
+    data = await request.json()
+    await _handle_webhook(data, agency, db)
     return {"ok": True}
 
 

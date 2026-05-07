@@ -1,6 +1,6 @@
 """
 Toni — AI assistant for real estate sales agents.
-Monitors a private Telegram channel as file database and serves multiple agent groups.
+All public functions accept an `agency` model instance for multi-agency support.
 """
 
 import json
@@ -15,16 +15,9 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal
 from excel_parser import format_unit_card
-from models import ToniFile, ToniGroup, ToniProject
+from models import Agency, ToniFile, ToniGroup, ToniProject
 
 logger = logging.getLogger(__name__)
-
-TONI_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-_TONI_API = f"https://api.telegram.org/bot{TONI_TOKEN}"
-DB_CHANNEL_ID = os.getenv("TONI_DB_CHANNEL", "")
-UMAR_CONTACT = os.getenv("TONI_UMAR_CONTACT", "@Umar")
-# Bot username without @, e.g. "ToniRealtyBot" — used to detect @mentions in groups
-_BOT_USERNAME = os.getenv("TONI_BOT_USERNAME", "").lower().lstrip("@")
 
 GREETING = (
     "Привет! Я Тони AI-помощник. "
@@ -57,23 +50,20 @@ _SYSTEM_BASE = """Ты — Тони, AI-помощник агентов по н�
 
 # ─── Bot mention detection ───────────────────────────────────────────────────
 
-def _is_bot_mentioned(message: dict) -> bool:
-    """Return True if the message is directed at the bot."""
+def _is_bot_mentioned(message: dict, bot_username: str) -> bool:
     text = (message.get("text") or "").lower()
 
-    # Name mention: "тони", "toni", "tony"
     if _BOT_NAMES.search(text):
         return True
 
-    # @username mention via Telegram entities
-    if _BOT_USERNAME:
+    if bot_username:
+        uname = bot_username.lower().lstrip("@")
         for ent in message.get("entities") or []:
             if ent.get("type") == "mention":
                 mention = text[ent["offset"]: ent["offset"] + ent["length"]].lstrip("@")
-                if mention == _BOT_USERNAME:
+                if mention == uname:
                     return True
 
-    # Reply to the bot's own message
     if message.get("reply_to_message", {}).get("from", {}).get("is_bot"):
         return True
 
@@ -82,31 +72,31 @@ def _is_bot_mentioned(message: dict) -> bool:
 
 # ─── Low-level Telegram API ───────────────────────────────────────────────────
 
-async def _tg(method: str, **kwargs) -> dict:
-    if not TONI_TOKEN:
-        logger.warning("TELEGRAM_BOT_TOKEN not set")
+async def _tg(method: str, token: str, **kwargs) -> dict:
+    if not token:
+        logger.warning("No bot token for _tg call")
         return {}
     async with httpx.AsyncClient(timeout=15) as client:
-        resp = await client.post(f"{_TONI_API}/{method}", json=kwargs)
+        resp = await client.post(f"https://api.telegram.org/bot{token}/{method}", json=kwargs)
         data = resp.json()
         if not data.get("ok"):
             logger.warning(f"Toni {method} failed: {resp.text[:200]}")
         return data
 
 
-async def _send(chat_id: str, text: str) -> bool:
-    data = await _tg("sendMessage", chat_id=chat_id, text=text, parse_mode="Markdown")
+async def _send(chat_id: str, text: str, token: str) -> bool:
+    data = await _tg("sendMessage", token, chat_id=chat_id, text=text, parse_mode="Markdown")
     return data.get("ok", False)
 
 
-async def _copy(chat_id: str, from_chat_id: str, message_id: int) -> bool:
-    """Copy a file from the database channel to an agent group (no 'Forwarded from' label)."""
-    data = await _tg("copyMessage", chat_id=chat_id, from_chat_id=from_chat_id, message_id=message_id)
+async def _copy(chat_id: str, from_chat_id: str, message_id: int, token: str) -> bool:
+    data = await _tg("copyMessage", token, chat_id=chat_id,
+                     from_chat_id=from_chat_id, message_id=message_id)
     return bool(data.get("result"))
 
 
-async def _get_bot_id() -> int:
-    data = await _tg("getMe")
+async def _get_bot_id(token: str) -> int:
+    data = await _tg("getMe", token)
     return data.get("result", {}).get("id", 0)
 
 
@@ -116,20 +106,22 @@ def _extract_units(text: str) -> list[str]:
     return list(set(_UNIT_RE.findall(text or "")))
 
 
-def _all_group_ids(db: Session) -> list[str]:
-    return [g.chat_id for g in db.query(ToniGroup).filter(ToniGroup.active == True).all()]
+def _all_group_ids(db: Session, agency_id: int) -> list[str]:
+    return [
+        g.chat_id for g in
+        db.query(ToniGroup).filter(ToniGroup.active == True, ToniGroup.agency_id == agency_id).all()
+    ]
 
 
 # ─── Main update handler ──────────────────────────────────────────────────────
 
-async def handle_update(update: dict):
+async def handle_update(update: dict, agency: Agency):
     db = SessionLocal()
     try:
-        # New post in the private database channel
         if channel_post := update.get("channel_post"):
             cid = str(channel_post.get("chat", {}).get("id", ""))
-            if DB_CHANNEL_ID and cid == DB_CHANNEL_ID:
-                await _handle_channel_post(channel_post, db)
+            if agency.db_channel_id and cid == agency.db_channel_id:
+                await _handle_channel_post(channel_post, db, agency)
             return
 
         message = update.get("message")
@@ -140,18 +132,16 @@ async def handle_update(update: dict):
         chat_id = str(chat.get("id", ""))
         chat_type = chat.get("type", "")
 
-        # Bot was added to a group
         for m in message.get("new_chat_members", []):
-            if m.get("id") == await _get_bot_id():
-                await _on_added_to_group(chat_id, chat.get("title", ""), db)
+            if m.get("id") == await _get_bot_id(agency.bot_token):
+                await _on_added_to_group(chat_id, chat.get("title", ""), db, agency)
                 return
 
         if chat_type in ("group", "supergroup"):
-            # Messages from the database group → index files, not treat as agent query
-            if DB_CHANNEL_ID and chat_id == DB_CHANNEL_ID:
-                await _handle_channel_post(message, db)
+            if agency.db_channel_id and chat_id == agency.db_channel_id:
+                await _handle_channel_post(message, db, agency)
             else:
-                await _handle_group_message(message, chat_id, chat.get("title", ""), db)
+                await _handle_group_message(message, chat_id, chat.get("title", ""), db, agency)
     except Exception:
         logger.exception("Toni handle_update error")
     finally:
@@ -160,20 +150,22 @@ async def handle_update(update: dict):
 
 # ─── Bot added to a group ─────────────────────────────────────────────────────
 
-async def _on_added_to_group(chat_id: str, title: str, db: Session):
-    existing = db.query(ToniGroup).filter(ToniGroup.chat_id == chat_id).first()
+async def _on_added_to_group(chat_id: str, title: str, db: Session, agency: Agency):
+    existing = db.query(ToniGroup).filter(
+        ToniGroup.chat_id == chat_id, ToniGroup.agency_id == agency.id
+    ).first()
     if existing:
         existing.active = True
     else:
-        db.add(ToniGroup(chat_id=chat_id, title=title, active=True))
+        db.add(ToniGroup(chat_id=chat_id, title=title, active=True, agency_id=agency.id))
     db.commit()
-    await _send(chat_id, GREETING)
-    logger.info(f"Toni added to group {chat_id} ({title})")
+    await _send(chat_id, GREETING, agency.bot_token)
+    logger.info(f"Toni added to group {chat_id} ({title}) for agency {agency.id}")
 
 
 # ─── New file in database channel ─────────────────────────────────────────────
 
-async def _handle_channel_post(message: dict, db: Session):
+async def _handle_channel_post(message: dict, db: Session, agency: Agency):
     chat_id = str(message.get("chat", {}).get("id", ""))
     message_id = message.get("message_id")
     caption = (message.get("caption") or "").strip()
@@ -191,16 +183,17 @@ async def _handle_channel_post(message: dict, db: Session):
         file_id, file_unique_id = video.get("file_id"), video.get("file_unique_id")
         file_name, file_type = video.get("file_name", "Видео"), "video"
     else:
-        return  # text-only posts are not indexed
+        return
 
     if not file_unique_id:
         return
 
     if db.query(ToniFile).filter(ToniFile.file_unique_id == file_unique_id).first():
-        return  # already indexed
+        return
 
     units = list(set(_extract_units(file_name) + _extract_units(caption)))
     db.add(ToniFile(
+        agency_id=agency.id,
         file_id=file_id,
         file_unique_id=file_unique_id,
         file_name=file_name,
@@ -217,15 +210,15 @@ async def _handle_channel_post(message: dict, db: Session):
     label = caption if caption else file_name
     announcement = f"🆕 Новое обновление {date_str}: {label}. Доступно уже сейчас!"
 
-    for gid in _all_group_ids(db):
-        await _send(gid, announcement)
-        await _copy(gid, chat_id, message_id)
+    for gid in _all_group_ids(db, agency.id):
+        await _send(gid, announcement, agency.bot_token)
+        await _copy(gid, chat_id, message_id, agency.bot_token)
 
 
 # ─── Group message handler ────────────────────────────────────────────────────
 
-async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db: Session):
-    # Ignore bot messages (including our own replies)
+async def _handle_group_message(message: dict, chat_id: str, chat_title: str,
+                                db: Session, agency: Agency):
     if message.get("from", {}).get("is_bot"):
         return
 
@@ -233,17 +226,19 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
     if not text:
         return
 
-    # Only respond when explicitly addressed
-    if not _is_bot_mentioned(message):
+    if not _is_bot_mentioned(message, agency.bot_username or ""):
         return
 
-    # Register group if first encounter
-    if not db.query(ToniGroup).filter(ToniGroup.chat_id == chat_id).first():
-        db.add(ToniGroup(chat_id=chat_id, title=chat_title, active=True))
+    existing_group = db.query(ToniGroup).filter(
+        ToniGroup.chat_id == chat_id, ToniGroup.agency_id == agency.id
+    ).first()
+    if not existing_group:
+        db.add(ToniGroup(chat_id=chat_id, title=chat_title, active=True, agency_id=agency.id))
         db.commit()
 
-    # Build dynamic system prompt — inject available project names so Claude can answer
-    projects_snapshot = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+    projects_snapshot = db.query(ToniProject).filter(
+        ToniProject.is_active == True, ToniProject.agency_id == agency.id
+    ).all()
     if projects_snapshot:
         proj_lines = "\n".join(f"  • {p.project_name} — {p.unit_count} юн." for p in projects_snapshot)
         system = _SYSTEM_BASE + f"\n\nДоступные проекты в базе:\n{proj_lines}"
@@ -273,49 +268,47 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str, db
     project_name: str = parsed.get("project_name") or ""
 
     if intent == "unit_query" and unit_numbers:
-        await _respond_unit(chat_id, unit_numbers, db)
+        await _respond_unit(chat_id, unit_numbers, db, agency)
     elif intent == "brochure_request":
-        await _respond_brochure(chat_id, project_name, db)
+        await _respond_brochure(chat_id, project_name, db, agency)
     elif intent == "property_search":
         keywords: list[str] = parsed.get("keywords") or []
-        # Prepend project_name so the search matches it against project names
         if project_name and project_name not in keywords:
             keywords = [project_name] + keywords
-        await _respond_property_search(chat_id, keywords, db)
+        await _respond_property_search(chat_id, keywords, db, agency)
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
-            await _send(chat_id, reply)
-    # silent → stay out of the conversation
+            await _send(chat_id, reply, agency.bot_token)
 
 
 # ─── Unit query response ──────────────────────────────────────────────────────
 
-async def _respond_unit(chat_id: str, unit_numbers: list[str], db: Session):
-    projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+async def _respond_unit(chat_id: str, unit_numbers: list[str], db: Session, agency: Agency):
+    projects = db.query(ToniProject).filter(
+        ToniProject.is_active == True, ToniProject.agency_id == agency.id
+    ).all()
     not_found: list[str] = []
     sent = 0
 
     for unit in unit_numbers:
         found = False
 
-        # Search in Excel projects first
         for proj in projects:
             idx: dict = proj.unit_index or {}
             if unit in idx:
                 card = format_unit_card(unit, idx[unit], proj.project_name)
-                await _send(chat_id, card)
+                await _send(chat_id, card, agency.bot_token)
                 sent += 1
                 found = True
                 break
 
-        # Fallback: search in ToniFile (legacy channel files)
         if not found:
-            all_files = db.query(ToniFile).all()
+            all_files = db.query(ToniFile).filter(ToniFile.agency_id == agency.id).all()
             matches = [f for f in all_files if unit in (f.unit_numbers or [])]
             if matches:
                 for f in matches[:1]:
-                    await _copy(chat_id, f.channel_chat_id, f.message_id)
+                    await _copy(chat_id, f.channel_chat_id, f.message_id, agency.bot_token)
                     sent += 1
                 found = True
 
@@ -330,14 +323,15 @@ async def _respond_unit(chat_id: str, unit_numbers: list[str], db: Session):
         await _send(
             chat_id,
             f"К сожалению, юнит {units_str} недоступен. "
-            f"Напишите напрямую {UMAR_CONTACT} для уточнения."
+            f"Напишите напрямую {agency.umar_contact} для уточнения.",
+            agency.bot_token,
         )
 
 
 # ─── Brochure request response ────────────────────────────────────────────────
 
-async def _respond_brochure(chat_id: str, project_name: str, db: Session):
-    all_files = db.query(ToniFile).all()
+async def _respond_brochure(chat_id: str, project_name: str, db: Session, agency: Agency):
+    all_files = db.query(ToniFile).filter(ToniFile.agency_id == agency.id).all()
 
     if project_name:
         pn = project_name.lower()
@@ -350,32 +344,32 @@ async def _respond_brochure(chat_id: str, project_name: str, db: Session):
 
     if matched:
         for f in matched[:3]:
-            await _copy(chat_id, f.channel_chat_id, f.message_id)
+            await _copy(chat_id, f.channel_chat_id, f.message_id, agency.bot_token)
     else:
         await _send(
             chat_id,
-            f"Брошюра не найдена в базе. Обратитесь напрямую к {UMAR_CONTACT}."
+            f"Брошюра не найдена в базе. Обратитесь напрямую к {agency.umar_contact}.",
+            agency.bot_token,
         )
 
 
-# ─── Property search response ────────────────────────────────────────────────
+# ─── Property search response ─────────────────────────────────────────────────
 
-async def _respond_property_search(chat_id: str, keywords: list[str], db: Session):
-    """Search Excel projects and legacy files by keywords, send top matches."""
+async def _respond_property_search(chat_id: str, keywords: list[str],
+                                   db: Session, agency: Agency):
     matched_units: list[tuple[str, dict, str]] = []
-    projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
+    projects = db.query(ToniProject).filter(
+        ToniProject.is_active == True, ToniProject.agency_id == agency.id
+    ).all()
 
     if keywords:
         for proj in projects:
             idx: dict = proj.unit_index or {}
-
-            # If a keyword matches the project name → prioritize units from this project
             proj_hit = any(kw.lower() in proj.project_name.lower() for kw in keywords)
             other_kws = [kw for kw in keywords if kw.lower() not in proj.project_name.lower()]
 
             for unit_num, data in idx.items():
                 if proj_hit:
-                    # Only apply remaining keywords (floor, budget, rooms…) if any
                     if other_kws:
                         searchable = " ".join(str(v) for v in data.values()).lower()
                         if not any(kw.lower() in searchable for kw in other_kws):
@@ -393,37 +387,35 @@ async def _respond_property_search(chat_id: str, keywords: list[str], db: Sessio
 
     if matched_units:
         for unit_num, data, proj_name in matched_units[:3]:
-            card = format_unit_card(unit_num, data, proj_name)
-            await _send(chat_id, card)
+            await _send(chat_id, format_unit_card(unit_num, data, proj_name), agency.bot_token)
         return
 
-    # Fallback: search legacy ToniFile records
     if keywords:
-        all_files = db.query(ToniFile).all()
+        all_files = db.query(ToniFile).filter(ToniFile.agency_id == agency.id).all()
         matched_files = [
             f for f in all_files
             if any(kw.lower() in f"{f.file_name or ''} {f.caption or ''}".lower() for kw in keywords)
         ]
         if matched_files:
             for f in matched_files[:3]:
-                await _copy(chat_id, f.channel_chat_id, f.message_id)
+                await _copy(chat_id, f.channel_chat_id, f.message_id, agency.bot_token)
             return
 
-    # Last resort: show sample units from any available project
     if projects:
         proj = projects[0]
         idx = proj.unit_index or {}
         sample = list(idx.items())[:3]
         if sample:
-            await _send(chat_id, f"Точного совпадения не нашёл, вот доступные варианты из *{proj.project_name}*:")
+            await _send(chat_id, f"Точного совпадения не нашёл, вот доступные варианты из *{proj.project_name}*:", agency.bot_token)
             for unit_num, data in sample:
-                await _send(chat_id, format_unit_card(unit_num, data, proj.project_name))
+                await _send(chat_id, format_unit_card(unit_num, data, proj.project_name), agency.bot_token)
             return
 
     await _send(
         chat_id,
         f"Вариантов по запросу не нашёл. Уточните название проекта, этаж или количество комнат — помогу точнее. "
-        f"Или напишите {UMAR_CONTACT}."
+        f"Или напишите {agency.umar_contact}.",
+        agency.bot_token,
     )
 
 
@@ -432,19 +424,24 @@ async def _respond_property_search(chat_id: str, keywords: list[str], db: Sessio
 async def send_morning_report():
     db = SessionLocal()
     try:
-        projects = db.query(ToniProject).filter(ToniProject.is_active == True).all()
-        if not projects:
-            text = "📊 Доброе утро! Проекты в базе пока не загружены."
-        else:
-            total_units = sum(p.unit_count for p in projects)
-            lines = [f"📊 Доброе утро! В базе {len(projects)} проект(а), {total_units} юнитов:\n"]
-            for p in projects:
-                lines.append(f"• *{p.project_name}* — {p.unit_count} юн.")
-            lines.append("\nЗадайте номер юнита или параметры поиска!")
-            text = "\n".join(lines)
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            projects = db.query(ToniProject).filter(
+                ToniProject.is_active == True,
+                ToniProject.agency_id == agency.id,
+            ).all()
 
-        for gid in _all_group_ids(db):
-            await _send(gid, text)
+            if not projects:
+                text = "📊 Доброе утро! Проекты в базе пока не загружены."
+            else:
+                total_units = sum(p.unit_count for p in projects)
+                lines = [f"📊 Доброе утро! В базе {len(projects)} проект(а), {total_units} юнитов:\n"]
+                for p in projects:
+                    lines.append(f"• *{p.project_name}* — {p.unit_count} юн.")
+                lines.append("\nЗадайте номер юнита или параметры поиска!")
+                text = "\n".join(lines)
+
+            for gid in _all_group_ids(db, agency.id):
+                await _send(gid, text, agency.bot_token)
     finally:
         db.close()
-
