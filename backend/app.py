@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -279,6 +280,46 @@ async def _detect_project_name_ai(sheets_data: dict, filename: str) -> str:
 
 # ─── Telegram spreadsheet upload handler ─────────────────────────────────────
 
+_GENERIC_SHEET = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
+
+
+async def _save_project(name: str, sheets: dict, user_id: str, db: Session) -> dict:
+    """Save or update one ToniProject. Returns {status, name, units, version, diff_report}."""
+    unit_index = build_unit_index(sheets)
+    if not unit_index:
+        return {"status": "skipped", "name": name, "reason": "no units found"}
+
+    existing = (
+        db.query(ToniProject)
+        .filter(ToniProject.project_name == name, ToniProject.is_active == True)
+        .first()
+    )
+    if existing:
+        diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
+        report = format_diff_report(diff, name)
+        new_version = existing.version + 1
+        existing.is_active = False
+        db.flush()
+        db.add(ToniProject(
+            project_name=name, version=new_version,
+            sheet_count=len(sheets), unit_count=len(unit_index),
+            sheets_data=sheets, unit_index=unit_index,
+            is_active=True, uploaded_at=datetime.now(), uploaded_by=user_id,
+        ))
+        db.commit()
+        return {"status": "updated", "name": name, "units": len(unit_index),
+                "version": new_version, "diff_report": report}
+    else:
+        db.add(ToniProject(
+            project_name=name, version=1,
+            sheet_count=len(sheets), unit_count=len(unit_index),
+            sheets_data=sheets, unit_index=unit_index,
+            is_active=True, uploaded_at=datetime.now(), uploaded_by=user_id,
+        ))
+        db.commit()
+        return {"status": "created", "name": name, "units": len(unit_index), "version": 1}
+
+
 async def _process_excel_upload(
     user_id: str,
     file_id: str,
@@ -286,7 +327,7 @@ async def _process_excel_upload(
     project_name_override: str,
     db: Session,
 ):
-    """Download Excel from Telegram, parse, save/update ToniProject, reply to admin."""
+    """Download file, split sheets into separate projects, save each."""
     await send_typing(user_id)
     await send_message(user_id, f"📊 Читаю файл *{file_name}*...")
 
@@ -309,80 +350,78 @@ async def _process_excel_upload(
         await send_message(user_id, "❌ Файл пустой или не содержит данных с заголовками.")
         return
 
+    # ── Determine how to split into projects ─────────────────────────────────
+    # If caption provided → treat entire file as one project with that name
+    # If multiple sheets  → each sheet is its own project
+    # If single sheet     → ask Claude for the project name
+
     if project_name_override.strip():
-        name = project_name_override.strip()
-    else:
-        name = await _detect_project_name_ai(sheets_data, file_name)
-    unit_index = build_unit_index(sheets_data)
-    sheet_names = list(sheets_data.keys())
-
-    existing = (
-        db.query(ToniProject)
-        .filter(ToniProject.project_name == name, ToniProject.is_active == True)
-        .first()
-    )
-
-    if existing:
-        # Update existing project: diff + replace
-        diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
-        report = format_diff_report(diff, name)
-        new_version = existing.version + 1
-
-        existing.is_active = False
-        db.flush()
-
-        db.add(ToniProject(
-            project_name=name,
-            version=new_version,
-            sheet_count=len(sheets_data),
-            unit_count=len(unit_index),
-            sheets_data=sheets_data,
-            unit_index=unit_index,
-            is_active=True,
-            uploaded_at=datetime.now(),
-            uploaded_by=user_id,
-        ))
-        db.commit()
-
-        await send_message(
-            user_id,
-            f"✅ Проект *{name}* обновлён → v{new_version}\n"
-            f"Листов: {len(sheet_names)} ({', '.join(sheet_names[:3])}{'...' if len(sheet_names) > 3 else ''})\n"
-            f"Юнитов в памяти: {len(unit_index)}\n\n"
-            f"{report}"
+        # Admin gave an explicit name — one project, all sheets together
+        tasks = [(project_name_override.strip(), sheets_data)]
+    elif len(sheets_data) == 1:
+        sheet_name, rows = next(iter(sheets_data.items()))
+        name = (
+            await _detect_project_name_ai(sheets_data, file_name)
+            if _GENERIC_SHEET.match(sheet_name.strip())
+            else sheet_name.strip()
         )
+        tasks = [(name, sheets_data)]
     else:
-        # New project
-        db.add(ToniProject(
-            project_name=name,
-            version=1,
-            sheet_count=len(sheets_data),
-            unit_count=len(unit_index),
-            sheets_data=sheets_data,
-            unit_index=unit_index,
-            is_active=True,
-            uploaded_at=datetime.now(),
-            uploaded_by=user_id,
-        ))
-        db.commit()
+        # Multiple sheets → determine a name for each sheet separately
+        tasks = []
+        for sheet_name, rows in sheets_data.items():
+            single = {sheet_name: rows}
+            if _GENERIC_SHEET.match(sheet_name.strip()):
+                name = await _detect_project_name_ai(single, sheet_name)
+            else:
+                name = sheet_name.strip()
+            tasks.append((name, single))
 
-        # Announce to all agent groups
+    # ── Save each project ─────────────────────────────────────────────────────
+    results = []
+    for name, sheets in tasks:
+        r = await _save_project(name, sheets, user_id, db)
+        results.append(r)
+
+    saved = [r for r in results if r["status"] != "skipped"]
+    skipped = [r for r in results if r["status"] == "skipped"]
+
+    if not saved:
+        await send_message(user_id, "❌ Ни в одном листе не найдены юниты.")
+        return
+
+    # ── Reply to admin ────────────────────────────────────────────────────────
+    if len(saved) == 1:
+        r = saved[0]
+        if r["status"] == "updated":
+            await send_message(
+                user_id,
+                f"✅ Проект *{r['name']}* обновлён → v{r['version']}\n"
+                f"Юнитов: {r['units']}\n\n{r['diff_report']}"
+            )
+        else:
+            await send_message(
+                user_id,
+                f"✅ Проект *{r['name']}* сохранён!\nЮнитов: {r['units']}"
+            )
+    else:
+        lines = [f"✅ Из файла *{file_name}* сохранено *{len(saved)}* проектов:\n"]
+        for r in saved:
+            icon = "🔄" if r["status"] == "updated" else "📁"
+            ver = f"→ v{r['version']}" if r["status"] == "updated" else "(новый)"
+            lines.append(f"{icon} *{r['name']}* — {r['units']} юн. {ver}")
+        if skipped:
+            lines.append(f"\n⚠️ Пропущено (нет юнитов): {', '.join(r['name'] for r in skipped)}")
+        await send_message(user_id, "\n".join(lines))
+
+    # ── Announce new projects to groups ───────────────────────────────────────
+    new_names = [r["name"] for r in saved if r["status"] == "created"]
+    if new_names:
         groups = db.query(ToniGroup).filter(ToniGroup.active == True).all()
-        announce = (
-            f"📁 Новый проект добавлен: *{name}*\n"
-            f"Юнитов: {len(unit_index)}, листов: {len(sheet_names)}\n"
-            f"Спрашивайте по номеру юнита!"
-        )
+        names_str = ", ".join(f"*{n}*" for n in new_names)
+        announce = f"📁 Новые проекты добавлены: {names_str}\nСпрашивайте по номеру юнита!"
         for g in groups:
             await toni_bot._send(g.chat_id, announce)
-
-        await send_message(
-            user_id,
-            f"✅ Проект *{name}* сохранён в память бота!\n"
-            f"Листов: {len(sheet_names)} ({', '.join(sheet_names[:3])}{'...' if len(sheet_names) > 3 else ''})\n"
-            f"Юнитов: {len(unit_index)}\n"
-            f"Объявление разослано в {len(groups)} групп(ы)."
-        )
 
 
 # ─── Telegram webhook ─────────────────────────────────────────────────────────
