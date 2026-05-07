@@ -869,8 +869,9 @@ async def _handle_brochure_file(agency: Agency, user_id: str, file_id: str, fuid
         fname_lower = fname.lower()
         is_video = fname_lower.endswith((".mp4", ".avi", ".mov", ".mkv"))
         file_bytes = None if is_video else await get_file_bytes(file_id, token=tok)
-        await send_message(user_id, "📖 Читаю файл через Claude...", token=tok)
+        await send_message(user_id, f"📖 Читаю *{fname}* через Claude и сохраняю в базу данных...", token=tok)
         description = await _analyze_brochure(file_bytes, fname, caption, file_type)
+        await send_message(user_id, f"✅ Файл *{fname}* сохранён в базу данных.", token=tok)
 
     # ── "Скинь всем" in caption: auto-broadcast without confirmation ──────────
     if _wants_broadcast(caption):
