@@ -68,6 +68,7 @@ def _find_project_folder(svc, project_name: str) -> Optional[str]:
     """
     root_items = _list_folder(svc, _root_id())
     folders = [i for i in root_items if i["mimeType"] == "application/vnd.google-apps.folder"]
+    logger.info(f"Drive ROOT folders: {[f['name'] for f in folders]}")
 
     # Try direct match in root
     best, best_score = None, 0
@@ -77,18 +78,23 @@ def _find_project_folder(svc, project_name: str) -> Optional[str]:
             best, best_score = item["id"], score
 
     if best_score >= 1:
+        logger.info(f"Drive: found '{project_name}' directly in root → score={best_score}")
         return best
 
     # Try one level deeper: inside each subfolder (client folders)
     for client_folder in folders:
         sub_items = _list_folder(svc, client_folder["id"])
-        for item in sub_items:
-            if item["mimeType"] != "application/vnd.google-apps.folder":
-                continue
+        sub_folders = [i for i in sub_items if i["mimeType"] == "application/vnd.google-apps.folder"]
+        logger.info(f"Drive: inside '{client_folder['name']}': {[f['name'] for f in sub_folders]}")
+        for item in sub_folders:
             score = _name_score(item["name"], project_name)
             if score > best_score:
                 best, best_score = item["id"], score
 
+    if best_score >= 1:
+        logger.info(f"Drive: found '{project_name}' in subfolder → score={best_score}")
+    else:
+        logger.warning(f"Drive: project '{project_name}' NOT FOUND anywhere")
     return best if best_score >= 1 else None
 
 
