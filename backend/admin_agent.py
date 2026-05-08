@@ -95,8 +95,11 @@ NEVER say "I can only check what's in my memory" when asked for files — this i
 
 When Admin asks for brochure / photo / video:
 → ALWAYS call send_drive_file tool immediately — no questions, no explanations
-→ After tool runs: confirm briefly "Khalas habibi — sent the SAAS Hills brochure! 📄🔥"
-→ If tool returns error: tell Admin what went wrong, suggest checking the file name in Drive
+→ After tool runs successfully: confirm briefly "Khalas habibi — sent! 📄🔥"
+→ If tool returns error with "available_projects_in_drive": tell Admin EXACTLY which projects are in Drive
+  Example: "Habibi, couldn't find 'SAAS Hills' — Drive has these projects: [list them]. Is the name different?"
+→ If tool returns "Drive is NOT configured": tell Admin to check Railway environment variables
+→ If available_projects_in_drive is empty list []: tell Admin the Drive folder is not shared with the service account email
 
 list_projects = Excel inventory database (units, prices)
 send_drive_file = brochures, photos, videos from Google Drive
@@ -290,19 +293,31 @@ class AdminAgent:
             import whatsapp_bot
             svc = _drive.get_service()
             if not svc:
-                return {"error": "Google Drive not configured"}
+                return {
+                    "error": "Google Drive is NOT configured. Missing env vars: "
+                             "GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_DRIVE_ROOT_ID. "
+                             "Tell admin: Drive is not set up in Railway environment variables."
+                }
             chat_id = getattr(self, "_chat_id", "")
             if not chat_id:
-                return {"error": "No chat_id"}
+                return {"error": "No chat_id — cannot send file"}
+
+            # List available projects for diagnostic info
+            all_projects = _drive.list_project_names(svc)
+            logger.info(f"Drive: searching for '{project_name}' in projects: {all_projects}")
 
             if file_type == "brochure":
                 result = _drive.find_brochure(svc, project_name)
                 if not result:
-                    return {"error": f"Brochure not found for '{project_name}'"}
+                    return {
+                        "error": f"Brochure not found for '{project_name}'.",
+                        "available_projects_in_drive": all_projects,
+                        "hint": "Check if folder name in Drive matches the project name exactly.",
+                    }
                 file_id, file_name = result
                 file_bytes = _drive.download_file(svc, file_id)
                 if not file_bytes:
-                    return {"error": "Download failed"}
+                    return {"error": f"Failed to download '{file_name}' from Drive"}
                 ok = await whatsapp_bot._send_wa_file(
                     agency.wa_instance_id, agency.wa_token,
                     chat_id, file_bytes, file_name, f"{project_name} — Brochure 📄",
@@ -312,7 +327,10 @@ class AdminAgent:
             elif file_type == "photo":
                 photos = _drive.find_photos(svc, project_name, limit=5)
                 if not photos:
-                    return {"error": f"No photos found for '{project_name}'"}
+                    return {
+                        "error": f"No photos found for '{project_name}'.",
+                        "available_projects_in_drive": all_projects,
+                    }
                 sent_count = 0
                 for file_id, file_name in photos:
                     file_bytes = _drive.download_file(svc, file_id)
@@ -327,11 +345,14 @@ class AdminAgent:
             elif file_type == "video":
                 result = _drive.find_video(svc, project_name)
                 if not result:
-                    return {"error": f"No video found for '{project_name}'"}
+                    return {
+                        "error": f"No video found for '{project_name}'.",
+                        "available_projects_in_drive": all_projects,
+                    }
                 file_id, file_name = result
                 file_bytes = _drive.download_file(svc, file_id)
                 if not file_bytes:
-                    return {"error": "Download failed"}
+                    return {"error": f"Failed to download video '{file_name}' from Drive"}
                 ok = await whatsapp_bot._send_wa_file(
                     agency.wa_instance_id, agency.wa_token,
                     chat_id, file_bytes, file_name, f"{project_name} 🎬",

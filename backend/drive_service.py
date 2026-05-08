@@ -20,18 +20,20 @@ def get_service():
     creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     root_id = os.getenv("GOOGLE_DRIVE_ROOT_ID", "")
     if not creds_json:
-        logger.error("Drive: GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+        logger.error("Drive: GOOGLE_SERVICE_ACCOUNT_JSON env var is NOT SET — Drive disabled")
         return None
     if not root_id:
-        logger.error("Drive: GOOGLE_DRIVE_ROOT_ID is not set")
+        logger.error("Drive: GOOGLE_DRIVE_ROOT_ID env var is NOT SET — Drive disabled")
         return None
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
         info = json.loads(creds_json)
+        sa_email = info.get("client_email", "unknown")
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
         _svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-        logger.info("Google Drive service initialized OK")
+        logger.info(f"Drive: service initialized OK | sa={sa_email} | root={root_id}")
+        logger.info(f"Drive: IMPORTANT — share root folder with: {sa_email}")
         return _svc
     except json.JSONDecodeError as e:
         logger.error(f"Drive: GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {e}")
@@ -75,7 +77,14 @@ def _find_project_folder(svc, project_name: str) -> Optional[str]:
     """
     root_items = _list_folder(svc, _root_id())
     folders = [i for i in root_items if i["mimeType"] == "application/vnd.google-apps.folder"]
-    logger.info(f"Drive ROOT folders: {[f['name'] for f in folders]}")
+    if not folders:
+        logger.error(
+            f"Drive: ROOT folder ({_root_id()}) returned 0 folders! "
+            "Most likely the folder is NOT shared with the service account. "
+            "Share the root Drive folder with the service account email."
+        )
+    else:
+        logger.info(f"Drive ROOT folders ({len(folders)}): {[f['name'] for f in folders]}")
 
     # Try direct match in root
     best, best_score = None, 0
