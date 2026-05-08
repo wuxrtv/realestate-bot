@@ -570,8 +570,26 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
             keywords = [project_name] + keywords
         await _respond_search(chat_id, keywords, projects, agency)
     elif intent == "brochure_request":
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
-                       f"Please contact {agency.umar_contact} for brochures and presentations.")
+        import drive_service as _drive
+        svc = _drive.get_service()
+        sent = False
+        search_name = project_name or (keywords[0] if keywords else "")
+        if svc and search_name:
+            drive_result = _drive.find_brochure(svc, search_name)
+            if drive_result:
+                file_id, file_name = drive_result
+                file_bytes = _drive.download_file(svc, file_id)
+                if file_bytes:
+                    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                                   f"Wallah great project habibi! 🏙️\nHere's the full story 👇")
+                    await _send_wa_file(agency.wa_instance_id, agency.wa_token,
+                                        chat_id, file_bytes, file_name,
+                                        f"{search_name} — Full Brochure 📄")
+                    sent = True
+        if not sent:
+            contact = agency.umar_contact or "@support"
+            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                           f"Ya habibi, let me get that for you 🙏\nContact {contact} for brochures!")
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
@@ -581,33 +599,97 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     _save_group_history(db, conv, history)
 
 
+# ─── Send file via WhatsApp ───────────────────────────────────────────────────
+
+async def _send_wa_file(instance_id: str, token: str, chat_id: str,
+                        file_bytes: bytes, file_name: str, caption: str = "") -> bool:
+    """Send file to WhatsApp via Green API sendFileByUpload."""
+    if not instance_id or not token:
+        return False
+    url = _wa_url(instance_id, token, "sendFileByUpload")
+    ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
+    mime_map = {
+        "pdf": "application/pdf",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls": "application/vnd.ms-excel",
+        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+        "png": "image/png", "webp": "image/webp",
+        "mp4": "video/mp4", "mov": "video/quicktime",
+    }
+    mime = mime_map.get(ext, "application/octet-stream")
+    async with httpx.AsyncClient(timeout=60) as client:
+        try:
+            resp = await client.post(
+                url,
+                data={"chatId": chat_id, "fileName": file_name, "caption": caption},
+                files={"file": (file_name, file_bytes, mime)},
+            )
+            ok = resp.status_code == 200
+            if not ok:
+                logger.warning(f"WA sendFileByUpload failed: {resp.text[:200]}")
+            return ok
+        except Exception:
+            logger.exception("WA send file error")
+            return False
+
+
 # ─── Unit lookup ──────────────────────────────────────────────────────────────
 
 async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency: Agency):
-    not_found = []
-    sent = 0
-    for unit in unit_numbers:
+    import drive_service as _drive
+    svc = _drive.get_service()
+    contact = agency.umar_contact or "@support"
+
+    for unit in unit_numbers[:3]:
         found = False
         for proj in projects:
             idx: dict = proj.unit_index or {}
             if unit in idx:
-                card = format_unit_card(unit, idx[unit], proj.project_name)
-                await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, card)
-                sent += 1
                 found = True
+                card = format_unit_card(unit, idx[unit], proj.project_name)
+
+                # Try Drive first — send PDF/file if available
+                if svc:
+                    drive_result = _drive.find_unit_file(svc, proj.project_name, unit)
+                    if drive_result:
+                        file_id, file_name = drive_result
+                        file_bytes = _drive.download_file(svc, file_id)
+                        if file_bytes:
+                            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                                           f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
+                            await _send_wa_file(agency.wa_instance_id, agency.wa_token,
+                                                chat_id, file_bytes, file_name, card)
+                            break
+
+                # No Drive file — send text card
+                await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                               f"Wallah good choice habibi! 👀\n{card}")
                 break
+
         if not found:
-            not_found.append(unit)
-        if sent >= 3:
-            break
-    if not_found:
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
-                       f"Unit {', '.join(not_found)} not found. Contact {agency.umar_contact}.")
+            # Unit not in inventory — show alternatives
+            alts = []
+            for proj in projects:
+                idx = proj.unit_index or {}
+                for u_num, u_data in list(idx.items())[:3]:
+                    if u_num != unit:
+                        alts.append((u_num, u_data, proj.project_name))
+                if alts:
+                    break
+
+            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                           f"Ya habibi — Unit {unit} not available right now 😔\n"
+                           f"Sold or reserved wallah\n\nBut check these 👇" if alts else
+                           f"Ya habibi — Unit {unit} not found 😔 Contact {contact} 🙏")
+            for u_num, u_data, p_name in alts[:2]:
+                await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                               format_unit_card(u_num, u_data, p_name))
 
 
 # ─── Property search ──────────────────────────────────────────────────────────
 
 async def _respond_search(chat_id: str, keywords: list, projects: list, agency: Agency):
+    contact = agency.umar_contact or "@support"
     matched = []
     for proj in projects:
         idx: dict = proj.unit_index or {}
@@ -635,7 +717,7 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
                            format_unit_card(unit_num, data, proj_name))
     else:
         await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
-                       f"No matches found. Specify project, floor or room count — or contact {agency.umar_contact}.")
+                       f"No matches found habibi 😅 Specify project, floor or room count — or contact {contact} 🙏")
 
 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
