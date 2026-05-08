@@ -15,7 +15,7 @@ class Agency(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, nullable=False)
     slug = Column(String, unique=True, index=True)       # URL key: /telegram/webhook/{slug}
-    bot_token = Column(String, unique=True, nullable=False)
+    bot_token = Column(String, unique=True, nullable=True, default="")
     admin_ids = Column(_json_type, default=list)          # ["7567850330", ...]
     admin_password = Column(String, default="toni2024")   # for /admin/{slug}
     bot_username = Column(String, default="")             # for @mention detection in groups

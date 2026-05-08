@@ -41,8 +41,9 @@ def _migrate():
 
 def _seed_default_agency():
     """Create a default agency from env vars if no agencies exist yet."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
-    if not token:
+    wa_instance = os.getenv("WA_INSTANCE_ID", "")
+    wa_token_env = os.getenv("WA_TOKEN", "")
+    if not wa_instance or not wa_token_env:
         return
 
     db = SessionLocal()
@@ -51,15 +52,19 @@ def _seed_default_agency():
         if db.query(Agency).count() > 0:
             return
         raw_ids = [i.strip() for i in os.getenv("ADMIN_IDS", "").split(",") if i.strip()]
+        wa_nums = [n.strip().lstrip("+") for n in os.getenv("WA_ADMIN_NUMBERS", "").split(",") if n.strip()]
         db.add(Agency(
             name="Default Agency",
             slug="default",
-            bot_token=token,
+            bot_token="",
             admin_ids=raw_ids,
             admin_password=os.getenv("ADMIN_PASSWORD", "toni2024"),
-            bot_username=os.getenv("TONI_BOT_USERNAME", ""),
+            bot_username="",
             umar_contact=os.getenv("TONI_UMAR_CONTACT", "@support"),
-            db_channel_id=os.getenv("TONI_DB_CHANNEL", ""),
+            db_channel_id="",
+            wa_instance_id=wa_instance,
+            wa_token=wa_token_env,
+            wa_admin_numbers=wa_nums,
         ))
         db.commit()
     finally:
