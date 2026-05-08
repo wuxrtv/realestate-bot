@@ -19,7 +19,11 @@ def get_service():
         return _svc
     creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
     root_id = os.getenv("GOOGLE_DRIVE_ROOT_ID", "")
-    if not creds_json or not root_id:
+    if not creds_json:
+        logger.error("Drive: GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+        return None
+    if not root_id:
+        logger.error("Drive: GOOGLE_DRIVE_ROOT_ID is not set")
         return None
     try:
         from google.oauth2 import service_account
@@ -27,10 +31,13 @@ def get_service():
         info = json.loads(creds_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
         _svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-        logger.info("Google Drive service initialized")
+        logger.info("Google Drive service initialized OK")
         return _svc
-    except Exception:
-        logger.exception("Drive: failed to init")
+    except json.JSONDecodeError as e:
+        logger.error(f"Drive: GOOGLE_SERVICE_ACCOUNT_JSON is invalid JSON: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Drive: failed to init — {e}")
         return None
 
 
