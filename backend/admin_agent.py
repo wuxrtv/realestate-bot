@@ -83,11 +83,13 @@ FRIDAY NIGHT: "Bro it's Friday night wallah 😄 Go enjoy habibi — I'll hold i
 • "what projects", "show database", "is there Breez" → list_projects
 • "unit 1507", "show 2301", "any 3-bedrooms" → search_units
 • "broadcast", "send to groups", "announce" → find info first, then announce_to_groups
-• "brochure", "presentation", "брошюра", "PDF", "materials" + project name → send_brochure
+• "brochure", "presentation", "брошюра", "PDF", "materials" → send_drive_file (file_type="brochure")
+• "photo", "фото", "pictures", "renders" → send_drive_file (file_type="photo")
+• "video", "видео", "tour" → send_drive_file (file_type="video")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
 
-IMPORTANT: Brochures live in Google Drive — NOT in the Excel database.
-When Admin asks for a brochure → always use send_brochure tool (file will be sent automatically).
+IMPORTANT: Brochures, photos and videos live in Google Drive — NOT in the Excel database.
+When Admin asks for any media file → always use send_drive_file tool (file will be sent automatically).
 After sending: confirm briefly, e.g. "Khalas habibi — sent the SAAS Hills brochure! 📄🔥"
 
 ━━━ ADMIN PERSONALITY ADAPTATION ━━━
@@ -144,19 +146,24 @@ ADMIN_TOOLS = [
         },
     },
     {
-        "name": "send_brochure",
-        "description": "Find a project brochure in Google Drive and send it to admin. Use when admin asks for a brochure or presentation of a project.",
+        "name": "send_drive_file",
+        "description": "Find and send a file from Google Drive to admin. Use when admin asks for brochure, photos, or video of a project.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "project_name": {"type": "string", "description": "Project name to search brochure for"},
+                "project_name": {"type": "string", "description": "Project name"},
+                "file_type": {
+                    "type": "string",
+                    "enum": ["brochure", "photo", "video"],
+                    "description": "Type of file to find: brochure (PDF), photo (images), video (mp4)",
+                },
             },
-            "required": ["project_name"],
+            "required": ["project_name", "file_type"],
         },
     },
     {
         "name": "list_drive_projects",
-        "description": "List all project folders available in Google Drive (for brochures and unit files).",
+        "description": "List all project folders available in Google Drive.",
         "input_schema": {"type": "object", "properties": {}},
     },
 ]
@@ -243,8 +250,8 @@ class AdminAgent:
             return self._list_projects(db, agency)
         if name == "search_units":
             return self._search_units(db, inp["query"], inp.get("limit", 5), agency)
-        if name == "send_brochure":
-            return await self._send_brochure(inp["project_name"], agency)
+        if name == "send_drive_file":
+            return await self._send_drive_file(inp["project_name"], inp.get("file_type", "brochure"), agency)
         if name == "list_drive_projects":
             return self._list_drive_projects()
         return {"error": f"Unknown tool: {name}"}
@@ -267,31 +274,63 @@ class AdminAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _send_brochure(self, project_name: str, agency) -> dict:
+    async def _send_drive_file(self, project_name: str, file_type: str, agency) -> dict:
         try:
             import drive_service as _drive
             import whatsapp_bot
             svc = _drive.get_service()
             if not svc:
                 return {"error": "Google Drive not configured"}
-            result = _drive.find_brochure(svc, project_name)
-            if not result:
-                return {"error": f"Brochure not found for '{project_name}' in Drive"}
-            file_id, file_name = result
-            file_bytes = _drive.download_file(svc, file_id)
-            if not file_bytes:
-                return {"error": "Failed to download brochure"}
             chat_id = getattr(self, "_chat_id", "")
-            if chat_id and agency.wa_instance_id and agency.wa_token:
+            if not chat_id:
+                return {"error": "No chat_id"}
+
+            if file_type == "brochure":
+                result = _drive.find_brochure(svc, project_name)
+                if not result:
+                    return {"error": f"Brochure not found for '{project_name}'"}
+                file_id, file_name = result
+                file_bytes = _drive.download_file(svc, file_id)
+                if not file_bytes:
+                    return {"error": "Download failed"}
                 ok = await whatsapp_bot._send_wa_file(
                     agency.wa_instance_id, agency.wa_token,
-                    chat_id, file_bytes, file_name,
-                    f"{project_name} — Brochure 📄",
+                    chat_id, file_bytes, file_name, f"{project_name} — Brochure 📄",
                 )
                 return {"sent": ok, "file_name": file_name}
-            return {"error": "No chat_id to send file"}
+
+            elif file_type == "photo":
+                photos = _drive.find_photos(svc, project_name, limit=5)
+                if not photos:
+                    return {"error": f"No photos found for '{project_name}'"}
+                sent_count = 0
+                for file_id, file_name in photos:
+                    file_bytes = _drive.download_file(svc, file_id)
+                    if file_bytes:
+                        await whatsapp_bot._send_wa_file(
+                            agency.wa_instance_id, agency.wa_token,
+                            chat_id, file_bytes, file_name,
+                        )
+                        sent_count += 1
+                return {"sent": sent_count, "total": len(photos)}
+
+            elif file_type == "video":
+                result = _drive.find_video(svc, project_name)
+                if not result:
+                    return {"error": f"No video found for '{project_name}'"}
+                file_id, file_name = result
+                file_bytes = _drive.download_file(svc, file_id)
+                if not file_bytes:
+                    return {"error": "Download failed"}
+                ok = await whatsapp_bot._send_wa_file(
+                    agency.wa_instance_id, agency.wa_token,
+                    chat_id, file_bytes, file_name, f"{project_name} 🎬",
+                )
+                return {"sent": ok, "file_name": file_name}
+
+            return {"error": f"Unknown file_type: {file_type}"}
         except Exception as e:
-            logger.exception("send_brochure tool error")
+            logger.exception("send_drive_file tool error")
             return {"error": str(e)}
 
     def _list_projects(self, db: Session, agency) -> dict:

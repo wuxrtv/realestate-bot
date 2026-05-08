@@ -48,26 +48,147 @@ def _list_folder(svc, folder_id: str) -> list:
         return []
 
 
-def _find_subfolder(svc, parent_id: str, name: str) -> Optional[str]:
-    items = _list_folder(svc, parent_id)
-    name_lower = name.lower()
-    for item in items:
-        if (item["mimeType"] == "application/vnd.google-apps.folder"
-                and item["name"].lower() == name_lower):
-            return item["id"]
-    return None
+def _name_score(folder_name: str, query: str) -> int:
+    """Return match score between folder name and query (higher = better)."""
+    fn = folder_name.lower().replace(" ", "").replace("_", "").replace("-", "")
+    q = query.lower().replace(" ", "").replace("_", "").replace("-", "")
+    if fn == q:
+        return 3
+    if fn.startswith(q) or q.startswith(fn):
+        return 2
+    if q in fn or fn in q:
+        return 1
+    return 0
 
 
 def _find_project_folder(svc, project_name: str) -> Optional[str]:
-    """Fuzzy-match project folder name in root."""
-    items = _list_folder(svc, _root_id())
-    proj_clean = project_name.lower().replace(" ", "").replace("_", "").replace("-", "")
+    """
+    Search for a project folder by name.
+    Looks in ROOT directly, then one level deeper (client folders inside ROOT).
+    """
+    root_items = _list_folder(svc, _root_id())
+    folders = [i for i in root_items if i["mimeType"] == "application/vnd.google-apps.folder"]
+
+    # Try direct match in root
+    best, best_score = None, 0
+    for item in folders:
+        score = _name_score(item["name"], project_name)
+        if score > best_score:
+            best, best_score = item["id"], score
+
+    if best_score >= 1:
+        return best
+
+    # Try one level deeper: inside each subfolder (client folders)
+    for client_folder in folders:
+        sub_items = _list_folder(svc, client_folder["id"])
+        for item in sub_items:
+            if item["mimeType"] != "application/vnd.google-apps.folder":
+                continue
+            score = _name_score(item["name"], project_name)
+            if score > best_score:
+                best, best_score = item["id"], score
+
+    return best if best_score >= 1 else None
+
+
+# File type categories
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
+_VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+_PDF_EXT = ".pdf"
+_BROCHURE_KEYWORDS = {"brochure", "брошюр", "presentation", "презентац", "catalog", "каталог", "флайер", "flyer"}
+
+
+def _ext(name: str) -> str:
+    return ("." + name.rsplit(".", 1)[-1]).lower() if "." in name else ""
+
+
+def _is_brochure(name: str) -> bool:
+    name_l = name.lower()
+    return _ext(name) == _PDF_EXT or any(kw in name_l for kw in _BROCHURE_KEYWORDS)
+
+
+def _is_photo(name: str) -> bool:
+    return _ext(name) in _IMAGE_EXTS
+
+
+def _is_video(name: str) -> bool:
+    return _ext(name) in _VIDEO_EXTS
+
+
+def _collect_files(svc, folder_id: str) -> list:
+    """Recursively list all non-folder files in a folder."""
+    items = _list_folder(svc, folder_id)
+    files = []
     for item in items:
-        if item["mimeType"] != "application/vnd.google-apps.folder":
-            continue
-        item_clean = item["name"].lower().replace(" ", "").replace("_", "").replace("-", "")
-        if proj_clean in item_clean or item_clean in proj_clean:
-            return item["id"]
+        if item["mimeType"] == "application/vnd.google-apps.folder":
+            files.extend(_collect_files(svc, item["id"]))
+        elif not item["mimeType"].startswith("application/vnd.google-apps"):
+            files.append(item)
+    return files
+
+
+def find_brochure(svc, project_name: str) -> Optional[tuple]:
+    """Find a brochure (PDF) for a project. Returns (file_id, name) or None."""
+    try:
+        proj_id = _find_project_folder(svc, project_name)
+        if not proj_id:
+            return None
+        files = _collect_files(svc, proj_id)
+        # Prefer files explicitly named as brochures, then any PDF
+        for f in files:
+            if _is_brochure(f["name"]) and any(kw in f["name"].lower() for kw in _BROCHURE_KEYWORDS):
+                return f["id"], f["name"]
+        for f in files:
+            if _ext(f["name"]) == _PDF_EXT:
+                return f["id"], f["name"]
+    except Exception:
+        logger.exception(f"Drive: find_brochure failed {project_name}")
+    return None
+
+
+def find_photos(svc, project_name: str, limit: int = 5) -> list:
+    """Find photo files for a project. Returns list of (file_id, name)."""
+    try:
+        proj_id = _find_project_folder(svc, project_name)
+        if not proj_id:
+            return []
+        files = _collect_files(svc, proj_id)
+        photos = [(f["id"], f["name"]) for f in files if _is_photo(f["name"])]
+        return photos[:limit]
+    except Exception:
+        logger.exception(f"Drive: find_photos failed {project_name}")
+    return []
+
+
+def find_video(svc, project_name: str) -> Optional[tuple]:
+    """Find first video file for a project. Returns (file_id, name) or None."""
+    try:
+        proj_id = _find_project_folder(svc, project_name)
+        if not proj_id:
+            return None
+        files = _collect_files(svc, proj_id)
+        for f in files:
+            if _is_video(f["name"]):
+                return f["id"], f["name"]
+    except Exception:
+        logger.exception(f"Drive: find_video failed {project_name}")
+    return None
+
+
+def find_unit_file(svc, project_name: str, unit_number: str) -> Optional[tuple]:
+    """Find any file for a unit (e.g. '1507.pdf'). Returns (file_id, name) or None."""
+    try:
+        proj_id = _find_project_folder(svc, project_name)
+        if not proj_id:
+            return None
+        files = _collect_files(svc, proj_id)
+        unit_lower = unit_number.lower()
+        for f in files:
+            if unit_lower in f["name"].lower():
+                return f["id"], f["name"]
+    except Exception:
+        logger.exception(f"Drive: find_unit_file failed {unit_number}")
     return None
 
 
@@ -86,47 +207,20 @@ def download_file(svc, file_id: str) -> Optional[bytes]:
         return None
 
 
-def find_unit_file(svc, project_name: str, unit_number: str) -> Optional[tuple]:
-    """Find any file for a unit in sales_offers/. Returns (file_id, name) or None."""
-    try:
-        proj_id = _find_project_folder(svc, project_name)
-        if not proj_id:
-            return None
-        offers_id = _find_subfolder(svc, proj_id, "sales_offers")
-        if not offers_id:
-            return None
-        unit_lower = unit_number.lower()
-        for f in _list_folder(svc, offers_id):
-            if unit_lower in f["name"].lower():
-                return f["id"], f["name"]
-    except Exception:
-        logger.exception(f"Drive: find_unit_file failed {unit_number}")
-    return None
-
-
-def find_brochure(svc, project_name: str) -> Optional[tuple]:
-    """Find a brochure file for a project. Returns (file_id, name) or None."""
-    try:
-        proj_id = _find_project_folder(svc, project_name)
-        if not proj_id:
-            return None
-        brochures_id = _find_subfolder(svc, proj_id, "brochures")
-        if not brochures_id:
-            return None
-        files = [
-            f for f in _list_folder(svc, brochures_id)
-            if not f["mimeType"].startswith("application/vnd.google-apps")
-        ]
-        return (files[0]["id"], files[0]["name"]) if files else None
-    except Exception:
-        logger.exception(f"Drive: find_brochure failed {project_name}")
-    return None
-
-
 def list_project_names(svc) -> list:
-    """List all project folder names in root."""
+    """List all project folder names (searches root and one level deep)."""
     try:
-        items = _list_folder(svc, _root_id())
-        return [i["name"] for i in items if i["mimeType"] == "application/vnd.google-apps.folder"]
+        root_items = _list_folder(svc, _root_id())
+        names = []
+        for item in root_items:
+            if item["mimeType"] == "application/vnd.google-apps.folder":
+                # Could be a client folder — list its subfolders too
+                sub = _list_folder(svc, item["id"])
+                sub_folders = [s["name"] for s in sub if s["mimeType"] == "application/vnd.google-apps.folder"]
+                if sub_folders:
+                    names.extend(sub_folders)  # project folders inside client folder
+                else:
+                    names.append(item["name"])  # treat as project folder itself
+        return names
     except Exception:
         return []
