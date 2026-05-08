@@ -524,13 +524,13 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     projects = db.query(ToniProject).filter(
         ToniProject.is_active == True, ToniProject.agency_id == agency.id
     ).all()
+    contact = agency.umar_contact or "@support"
     if projects:
         proj_lines = "\n".join(f"  • {p.project_name} — {p.unit_count} units" for p in projects)
-        system = _SYSTEM_BASE + f"\n\nAvailable projects:\n{proj_lines}"
+        system = _SYSTEM_BASE + f"\n\nAdmin contact: {contact}\nAvailable projects:\n{proj_lines}"
     else:
-        system = _SYSTEM_BASE
+        system = _SYSTEM_BASE + f"\n\nAdmin contact: {contact}\nNo projects loaded yet."
 
-    # WA groups use "wa_" prefix to separate from Telegram history
     conv, history = _load_group_history(db, agency.id, f"wa_{chat_id}")
     history.append({"role": "user", "content": f"[{sender_name}]: {text}"})
 
@@ -538,7 +538,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = await ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=400,
+            max_tokens=800,
             system=system,
             messages=history,
         )
@@ -550,6 +550,8 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         parsed = json.loads(match.group())
     except Exception:
         logger.exception(f"WA Claude error for: {text[:80]}")
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                       f"Ya habibi, something went wrong 😅 Contact {contact} 🙏")
         return
 
     intent = parsed.get("intent", "off_topic")
@@ -557,8 +559,12 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     project_name: str = parsed.get("project_name") or ""
     keywords: list = parsed.get("keywords") or []
 
-    if intent == "unit_query" and unit_numbers:
-        await _respond_unit(chat_id, unit_numbers, projects, agency)
+    if intent == "unit_query":
+        if unit_numbers:
+            await _respond_unit(chat_id, unit_numbers, projects, agency)
+        else:
+            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                           f"Ya habibi, which unit number? 😅 Contact {contact} 🙏")
     elif intent == "property_search":
         if project_name and project_name not in keywords:
             keywords = [project_name] + keywords
