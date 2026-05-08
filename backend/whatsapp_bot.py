@@ -594,8 +594,8 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         if svc and search_name:
             drive_result = _drive.find_brochure(svc, search_name)
             if drive_result:
-                file_id, file_name = drive_result
-                file_bytes = _drive.download_file(svc, file_id)
+                file_id, file_name, export_mime = drive_result
+                file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if file_bytes:
                     await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
                                    f"Wallah great project habibi! 🏙️\nHere's the brochure 👇")
@@ -635,8 +635,8 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         if svc and search_name:
             drive_result = _drive.find_video(svc, search_name)
             if drive_result:
-                file_id, file_name = drive_result
-                file_bytes = _drive.download_file(svc, file_id)
+                file_id, file_name, export_mime = drive_result
+                file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if file_bytes:
                     await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
                                    f"Yalla habibi — {search_name} video 🎬👇")

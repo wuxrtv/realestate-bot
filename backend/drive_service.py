@@ -138,13 +138,27 @@ def _is_video(name: str) -> bool:
     return _ext(name) in _VIDEO_EXTS
 
 
+_EXPORTABLE = {
+    "application/vnd.google-apps.presentation": ("application/pdf", ".pdf"),
+    "application/vnd.google-apps.document": ("application/pdf", ".pdf"),
+}
+
+
 def _collect_files(svc, folder_id: str) -> list:
-    """Recursively list all non-folder files in a folder."""
+    """Recursively list all non-folder files in a folder. Google Slides/Docs marked as exportable."""
     items = _list_folder(svc, folder_id)
     files = []
     for item in items:
         if item["mimeType"] == "application/vnd.google-apps.folder":
             files.extend(_collect_files(svc, item["id"]))
+        elif item["mimeType"] in _EXPORTABLE:
+            # Google Slides / Docs — exportable as PDF
+            _, ext = _EXPORTABLE[item["mimeType"]]
+            item = dict(item)
+            item["_export_mime"] = _EXPORTABLE[item["mimeType"]][0]
+            if not item["name"].endswith(ext):
+                item["name"] = item["name"] + ext
+            files.append(item)
         elif not item["mimeType"].startswith("application/vnd.google-apps"):
             files.append(item)
     return files
@@ -157,13 +171,23 @@ def find_brochure(svc, project_name: str) -> Optional[tuple]:
         if not proj_id:
             return None
         files = _collect_files(svc, proj_id)
-        # Prefer files explicitly named as brochures, then any PDF
+        all_names = [f["name"] for f in files]
+        logger.info(f"Drive: all files in '{project_name}': {all_names}")
+        # Prefer files explicitly named as brochures, then any PDF, then Google Slides
         for f in files:
             if _is_brochure(f["name"]) and any(kw in f["name"].lower() for kw in _BROCHURE_KEYWORDS):
-                return f["id"], f["name"]
+                logger.info(f"Drive: selected brochure '{f['name']}' (keyword match)")
+                return f["id"], f["name"], f.get("_export_mime", "")
         for f in files:
             if _ext(f["name"]) == _PDF_EXT:
-                return f["id"], f["name"]
+                logger.info(f"Drive: selected brochure '{f['name']}' (any PDF fallback)")
+                return f["id"], f["name"], f.get("_export_mime", "")
+        # Last resort: Google Slides presentation
+        for f in files:
+            if f.get("_export_mime"):
+                logger.info(f"Drive: selected brochure '{f['name']}' (Google Slides export)")
+                return f["id"], f["name"], f["_export_mime"]
+        logger.warning(f"Drive: no PDF/Slides found in '{project_name}', files: {all_names}")
     except Exception:
         logger.exception(f"Drive: find_brochure failed {project_name}")
     return None
@@ -184,7 +208,7 @@ def find_photos(svc, project_name: str, limit: int = 5) -> list:
 
 
 def find_video(svc, project_name: str) -> Optional[tuple]:
-    """Find first video file for a project. Returns (file_id, name) or None."""
+    """Find first video file for a project. Returns (file_id, name, export_mime) or None."""
     try:
         proj_id = _find_project_folder(svc, project_name)
         if not proj_id:
@@ -192,7 +216,7 @@ def find_video(svc, project_name: str) -> Optional[tuple]:
         files = _collect_files(svc, proj_id)
         for f in files:
             if _is_video(f["name"]):
-                return f["id"], f["name"]
+                return f["id"], f["name"], f.get("_export_mime", "")
     except Exception:
         logger.exception(f"Drive: find_video failed {project_name}")
     return None
@@ -214,16 +238,23 @@ def find_unit_file(svc, project_name: str, unit_number: str) -> Optional[tuple]:
     return None
 
 
-def download_file(svc, file_id: str) -> Optional[bytes]:
+def download_file(svc, file_id: str, export_mime: str = "") -> Optional[bytes]:
     try:
         from googleapiclient.http import MediaIoBaseDownload
         buf = io.BytesIO()
-        req = svc.files().get_media(fileId=file_id)
+        if export_mime:
+            # Google Slides/Docs — export as PDF
+            req = svc.files().export_media(fileId=file_id, mimeType=export_mime)
+            logger.info(f"Drive: exporting {file_id} as {export_mime}")
+        else:
+            req = svc.files().get_media(fileId=file_id)
         dl = MediaIoBaseDownload(buf, req)
         done = False
         while not done:
             _, done = dl.next_chunk()
-        return buf.getvalue()
+        data = buf.getvalue()
+        logger.info(f"Drive: downloaded {file_id} — {len(data)} bytes")
+        return data
     except Exception:
         logger.exception(f"Drive: download failed {file_id}")
         return None

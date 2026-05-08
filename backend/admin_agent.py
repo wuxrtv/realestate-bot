@@ -314,8 +314,8 @@ class AdminAgent:
                         "available_projects_in_drive": all_projects,
                         "hint": "Check if folder name in Drive matches the project name exactly.",
                     }
-                file_id, file_name = result
-                file_bytes = _drive.download_file(svc, file_id)
+                file_id, file_name, export_mime = result
+                file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if not file_bytes:
                     return {"error": f"Failed to download '{file_name}' from Drive"}
                 ok = await whatsapp_bot._send_wa_file(
@@ -349,8 +349,8 @@ class AdminAgent:
                         "error": f"No video found for '{project_name}'.",
                         "available_projects_in_drive": all_projects,
                     }
-                file_id, file_name = result
-                file_bytes = _drive.download_file(svc, file_id)
+                file_id, file_name, export_mime = result
+                file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if not file_bytes:
                     return {"error": f"Failed to download video '{file_name}' from Drive"}
                 ok = await whatsapp_bot._send_wa_file(
