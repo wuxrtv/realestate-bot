@@ -498,6 +498,20 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
                                 db: Session, agency: Agency):
     from admin_agent import AdminAgent
+    from models import AdminConversation
+
+    if text.strip().lower() in ("/reset", "reset", "/start"):
+        conv = db.query(AdminConversation).filter(
+            AdminConversation.agency_id == agency.id,
+            AdminConversation.user_id == f"wa_{sender_phone}",
+        ).first()
+        if conv:
+            conv.history = []
+            db.commit()
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                       "Khalas habibi — memory cleared! Fresh start 🔄🔥")
+        return
+
     agent = AdminAgent()
     try:
         reply = await agent.process(agency, f"wa_{sender_phone}", text, db, chat_id=chat_id)
