@@ -268,21 +268,18 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Файл пустой или без данных.")
         return
 
+    # All sheets → ONE project (same logic as Telegram bot)
     _GENERIC = _re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", _re.IGNORECASE)
-    if len(sheets_data) == 1:
-        sheet_name = next(iter(sheets_data))
-        name = caption.strip() or (normalize_project_name(file_name) if _GENERIC.match(sheet_name.strip()) else sheet_name.strip())
-        tasks = [(name, sheets_data)]
+    non_generic = [s for s in sheets_data.keys() if not _GENERIC.match(s.strip())]
+    if caption.strip():
+        name = caption.strip()
+    elif len(non_generic) == 1:
+        name = non_generic[0].strip()
     else:
-        file_stem = os.path.splitext(file_name)[0]
-        tasks = [
-            (sn.strip() if not _GENERIC.match(sn.strip()) else f"{normalize_project_name(file_stem)} — {sn.strip()}",
-             {sn: rows})
-            for sn, rows in sheets_data.items()
-        ]
+        name = normalize_project_name(file_name)
 
     results = []
-    for name, sheets in tasks:
+    for name, sheets in [(name, sheets_data)]:
         unit_index = build_unit_index(sheets)
         if not unit_index:
             results.append({"status": "skipped", "name": name})

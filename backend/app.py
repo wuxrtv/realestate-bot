@@ -674,7 +674,7 @@ async def _process_excel_upload(
         name = project_name_override.strip()
     else:
         non_generic = [s for s in sheets_data.keys() if not _GENERIC_SHEET.match(s.strip())]
-        if len(non_generic) == 1 and len(sheets_data) == 1:
+        if len(non_generic) == 1:
             name = non_generic[0].strip()
         else:
             name = await _detect_project_name_or_none(sheets_data, file_name)
@@ -1111,7 +1111,8 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
 
         # Excel / CSV → inventory/project data
         if fname_lower.endswith((".xlsx", ".xls", ".csv")):
-            await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
+            proj_name_hint = caption if not _wants_broadcast(caption) else ""
+            await _process_excel_upload(agency, user_id, doc["file_id"], fname, proj_name_hint, db)
             return
 
         # PDF → if explicit inventory keyword: project data. Otherwise: brochure

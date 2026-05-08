@@ -29,6 +29,7 @@ GREETING = (
 )
 
 _UNIT_RE = re.compile(r"\b(\d{3,5})\b")
+_YEAR_RE = re.compile(r"\b(19[0-9]{2}|20[0-3][0-9])\b")
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
 
 # Daily state — tracks whether admin responded/was active today (resets on restart)
@@ -141,7 +142,9 @@ async def _get_bot_id(token: str) -> int:
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _extract_units(text: str) -> list[str]:
-    return list(set(_UNIT_RE.findall(text or "")))
+    candidates = set(_UNIT_RE.findall(text or ""))
+    years = set(_YEAR_RE.findall(text or ""))
+    return list(candidates - years)
 
 
 def _all_group_ids(db: Session, agency_id: int) -> list[str]:
@@ -284,7 +287,7 @@ async def _handle_group_message(message: dict, chat_id: str, chat_title: str,
     if message.get("from", {}).get("is_bot"):
         return
 
-    text = (message.get("text") or "").strip()
+    text = (message.get("text") or message.get("caption") or "").strip()
     if not text:
         return
 
