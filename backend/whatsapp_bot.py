@@ -14,9 +14,120 @@ import anthropic
 import httpx
 from sqlalchemy.orm import Session
 
+from sqlalchemy.orm.attributes import flag_modified
+
 from database import SessionLocal
 from excel_parser import format_unit_card
-from models import Agency, ToniProject, WhatsAppGroup
+from models import Agency, GroupConversation, ToniProject, WhatsAppGroup
+
+# ─── Daily admin state ────────────────────────────────────────────────────────
+
+_daily: dict[str, dict] = {}
+
+
+def _day_state(agency_id: int) -> dict:
+    from datetime import datetime as _dt
+    key = f"{agency_id}_{_dt.now().strftime('%Y-%m-%d')}"
+    if key not in _daily:
+        _daily[key] = {"morning_replied": False, "follow_up_sent": False}
+    return _daily[key]
+
+
+def mark_admin_active(agency_id: int):
+    _day_state(agency_id)["morning_replied"] = True
+
+
+# ─── Group conversation history ───────────────────────────────────────────────
+
+def _load_group_history(db, agency_id: int, chat_id: str):
+    from datetime import datetime as _dt
+    conv = db.query(GroupConversation).filter(
+        GroupConversation.agency_id == agency_id,
+        GroupConversation.chat_id == chat_id,
+    ).first()
+    if not conv:
+        conv = GroupConversation(agency_id=agency_id, chat_id=chat_id, history=[])
+        db.add(conv)
+        db.flush()
+    return conv, list(conv.history or [])
+
+
+def _save_group_history(db, conv, history: list):
+    from datetime import datetime as _dt
+    conv.history = history[-20:]
+    conv.updated_at = _dt.now()
+    flag_modified(conv, "history")
+    db.commit()
+
+
+# ─── Scheduled message texts ──────────────────────────────────────────────────
+
+_MORNING_GREETINGS = [
+    "Morning! What are we pushing to the groups today? 💼",
+    "Good morning! Ready when you are — what's the plan for today?",
+    "Morning boss! What's on the agenda? Any new projects to broadcast?",
+    "Rise and shine! What files are we sending out today?",
+    "Good morning! Got everything ready — what are we working with today?",
+    "Hey, morning! What do you need from me today?",
+    "Morning! The groups are waiting — what do we broadcast today?",
+]
+
+_FOLLOWUP_MSGS = [
+    "Hey, just checking — did you see my morning message? What are we working with today?",
+    "Morning! Still here whenever you're ready — anything to push out?",
+    "Just a nudge — let me know what projects we're focusing on today!",
+    "Bro, you there? Ready when you are 🙌",
+    "Hey, no rush — just checking in. Anything for the groups today?",
+]
+
+_MIDDAY_MSGS = [
+    "Hey, any offers worth sharing this afternoon?",
+    "Есть что-нибудь для рассылки после обеда?",
+    "Bro, anything new to drop? Groups are active 👀",
+    "Afternoon check-in — anything worth broadcasting today?",
+    "Hey, groups are busy — got any content to share?",
+]
+
+# ─── Tony group AI system prompt ─────────────────────────────────────────────
+
+_SYSTEM_BASE = """You are TONY — an AI Sales Assistant for a real estate agency in Dubai.
+You are in a group chat with real estate agents. Your name is Tony.
+
+Respond ONLY with valid JSON (no markdown, no code blocks):
+{
+  "intent": "unit_query" | "brochure_request" | "property_search" | "direct_question" | "off_topic",
+  "unit_numbers": ["1507", "1435"],
+  "project_name": "project name or null",
+  "keywords": ["2 rooms", "villa", "floor 20"],
+  "reply": "your reply (only for direct_question, empty string otherwise)"
+}
+
+━━━ WHEN TO RESPOND ━━━
+✅ Respond when:
+• Someone mentions "Tony" or "Тони"
+• Someone asks about units, prices, availability, projects in the database
+• Question is clearly real-estate related
+
+❌ Do NOT respond (use "off_topic" intent) when:
+• People are having personal conversations
+• Topics unrelated to real estate
+• You don't have accurate data to answer
+• When in doubt — don't respond
+
+━━━ INTENT RULES ━━━
+• unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
+• brochure_request: asking for brochure, price list, or project presentation
+• property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
+• direct_question: any other work question — answer in "reply" using the project context below
+• off_topic: personal talk or unrelated topic — leave reply as empty string
+
+━━━ STYLE ━━━
+• Professional but friendly — like a reliable colleague
+• Never guess facts. Never improvise prices or availability.
+• Be accurate and concise. If unsure — say so.
+
+LANGUAGE: Detect the language of the message. Respond ONLY in that same language.
+Russian → Russian. English → English. Uzbek → Uzbek."""
 
 # Multilingual keywords that identify an inventory/price-list file
 _WA_INVENTORY_KEYWORDS = (
@@ -37,16 +148,7 @@ def _wa_is_inventory(fname: str, caption: str) -> bool:
     if fl.endswith((".xlsx", ".xls", ".csv")):
         return True
     return any(kw in cl or kw in fl for kw in _WA_INVENTORY_KEYWORDS)
-from toni_bot import (
-    _FOLLOWUP_MSGS,
-    _MIDDAY_MSGS,
-    _MORNING_GREETINGS,
-    _SYSTEM_BASE,
-    _day_state,
-    _load_group_history,
-    _save_group_history,
-    mark_admin_active,
-)
+
 
 logger = logging.getLogger(__name__)
 

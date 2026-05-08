@@ -184,26 +184,11 @@ class AdminAgent:
         return {"error": f"Unknown tool: {name}"}
 
     async def _announce_to_groups(self, db: Session, message: str, agency) -> dict:
-        import asyncio
-        import toni_bot
         import whatsapp_bot
-        from models import ToniGroup
-
-        # Telegram groups
-        tg_groups = db.query(ToniGroup).filter(
-            ToniGroup.active == True, ToniGroup.agency_id == agency.id
-        ).all()
-        for i, g in enumerate(tg_groups):
-            if i > 0:
-                await asyncio.sleep(30)
-            await toni_bot._send(g.chat_id, message, agency.bot_token)
-
-        # WhatsApp groups
         wa_sent = 0
         if agency.wa_instance_id and agency.wa_token:
             wa_sent = await whatsapp_bot.announce_to_wa_groups(db, message, agency)
-
-        return {"sent_to_telegram": len(tg_groups), "sent_to_whatsapp": wa_sent}
+        return {"sent_to_whatsapp": wa_sent}
 
     def _list_projects(self, db: Session, agency) -> dict:
         projects = (

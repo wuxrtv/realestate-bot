@@ -28,37 +28,6 @@ class Agency(Base):
     created_at = Column(DateTime, default=func.now())
 
 
-class ToniFile(Base):
-    """File indexed from the private database channel or sent directly by admin."""
-    __tablename__ = "toni_files"
-
-    id = Column(Integer, primary_key=True, index=True)
-    agency_id = Column(Integer, nullable=True, index=True)
-    file_id = Column(String)
-    file_unique_id = Column(String, unique=True, index=True)
-    file_name = Column(String)
-    caption = Column(Text)
-    file_type = Column(String)
-    unit_numbers = Column(_json_type, default=list)
-    project_name = Column(String, default="", nullable=True)   # linked project
-    message_id = Column(Integer)
-    channel_chat_id = Column(String)
-    created_at = Column(DateTime, default=func.now())
-
-
-class ToniGroup(Base):
-    """Agent group where the bot is present."""
-    __tablename__ = "toni_groups"
-    __table_args__ = (UniqueConstraint("agency_id", "chat_id", name="uq_agency_group"),)
-
-    id = Column(Integer, primary_key=True, index=True)
-    agency_id = Column(Integer, nullable=True, index=True)
-    chat_id = Column(String, index=True)
-    title = Column(String)
-    active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=func.now())
-
-
 class AdminConversation(Base):
     """Persistent conversation history for admin ↔ AdminAgent chat."""
     __tablename__ = "admin_conversations"
