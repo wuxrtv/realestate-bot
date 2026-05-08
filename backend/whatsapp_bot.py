@@ -17,6 +17,26 @@ from sqlalchemy.orm import Session
 from database import SessionLocal
 from excel_parser import format_unit_card
 from models import Agency, ToniProject, WhatsAppGroup
+
+# Multilingual keywords that identify an inventory/price-list file
+_WA_INVENTORY_KEYWORDS = (
+    "инвентарий", "инвентарь", "инвентаризация",
+    "прайс-лист", "прайслист", "прайс", "база данных", "база юнитов", "список юнитов",
+    "inventory", "price list", "pricelist", "availability", "unit list", "stock list",
+    "مخزون", "قائمة الوحدات", "قائمة",
+    "inventaire", "liste des unités",
+    "inventario", "lista de unidades",
+    "inventar", "bestand", "einheitenliste",
+    "envanter", "birim listesi",
+    "库存", "单元列表",
+)
+
+
+def _wa_is_inventory(fname: str, caption: str) -> bool:
+    fl, cl = fname.lower(), (caption or "").lower()
+    if fl.endswith((".xlsx", ".xls", ".csv")):
+        return True
+    return any(kw in cl or kw in fl for kw in _WA_INVENTORY_KEYWORDS)
 from toni_bot import (
     _FOLLOWUP_MSGS,
     _MIDDAY_MSGS,
@@ -109,7 +129,7 @@ async def handle_update(data: dict, agency: Agency):
     msg_type = message_data.get("typeMessage")
     logger.info(f"WA message type: {msg_type}")
 
-    if msg_type not in ("textMessage", "documentMessage"):
+    if msg_type not in ("textMessage", "documentMessage", "imageMessage", "videoMessage"):
         return
 
     sender_data = data.get("senderData", {})
@@ -130,10 +150,10 @@ async def handle_update(data: dict, agency: Agency):
 
     db = SessionLocal()
     try:
-        if msg_type == "documentMessage" and not is_group and admin_check:
+        if msg_type in ("documentMessage", "imageMessage", "videoMessage") and not is_group and admin_check:
             file_data = message_data.get("fileMessageData", {})
             download_url = file_data.get("downloadUrl", "")
-            file_name = file_data.get("fileName", "file")
+            file_name = file_data.get("fileName", f"file.{'jpg' if msg_type == 'imageMessage' else 'mp4' if msg_type == 'videoMessage' else 'bin'}")
             caption = file_data.get("caption", "").strip()
             if download_url:
                 mark_admin_active(agency.id)
@@ -237,12 +257,28 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                               normalize_project_name, parse_csv, parse_excel, parse_pdf)
 
     fname_lower = file_name.lower()
-    if not fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
+
+    # Photos and videos are not inventory — inform admin
+    if fname_lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".avi")):
         await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
-                       "Поддерживаются файлы: .xlsx, .xls, .csv, .pdf")
+                       "📷 Фото/видео получено. Для добавления в базу брошюр используйте Telegram-канал агентства.")
         return
 
-    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"📊 Читаю файл {file_name}...")
+    # Non-data files
+    if not fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                       "❓ Файл не распознан как база данных. Для инвентаря отправьте .xlsx, .xls, .csv "
+                       "или PDF с названием «Инвентарий».")
+        return
+
+    # PDF without inventory keyword → brochure, not inventory
+    if not _wa_is_inventory(file_name, caption):
+        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                       f"📄 PDF «{file_name}» сохранён как брошюра.\n"
+                       "Чтобы загрузить как инвентарий, напишите «Инвентарий» в названии файла или подписи.")
+        return
+
+    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"📊 Читаю инвентарий *{file_name}*...")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:

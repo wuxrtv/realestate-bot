@@ -744,12 +744,36 @@ def _wants_broadcast(caption: str) -> bool:
                                  "разошли", "скинь", "отправь", "share"))
 
 
+_INVENTORY_KEYWORDS = (
+    # Russian
+    "инвентарий", "инвентарь", "инвентаризация",
+    "прайс-лист", "прайслист", "прайс",
+    "база данных", "база юнитов", "список юнитов",
+    # English
+    "inventory", "price list", "pricelist", "availability",
+    "unit list", "stock list", "availability list",
+    # Arabic
+    "مخزون", "قائمة الوحدات", "قائمة",
+    # French
+    "inventaire", "liste des unités",
+    # Spanish
+    "inventario", "lista de unidades",
+    # German
+    "inventar", "bestand", "einheitenliste",
+    # Turkish
+    "envanter", "birim listesi",
+    # Chinese (simplified)
+    "库存", "单元列表",
+)
+
+
 def _is_inventory_file(fname: str, caption: str) -> bool:
     f, c = fname.lower(), (caption or "").lower()
+    # Excel / CSV — always inventory regardless of name
     if f.endswith((".xlsx", ".xls", ".csv")):
         return True
-    inv_kw = ("инвентарь", "inventory", "прайс", "price list", "availability", "unit list")
-    return any(w in c or w in f for w in inv_kw)
+    # PDF or other — inventory only if filename or caption contains a keyword
+    return any(kw in c or kw in f for kw in _INVENTORY_KEYWORDS)
 
 
 def _store_pending(agency_id: int, admin_id: str, message_id: int, description: str = "") -> str:
@@ -1115,13 +1139,11 @@ async def _handle_webhook(data: dict, agency: Agency, db: Session):
             await _process_excel_upload(agency, user_id, doc["file_id"], fname, proj_name_hint, db)
             return
 
-        # PDF → if explicit inventory keyword: project data. Otherwise: brochure
+        # PDF → inventory if keyword in name/caption, otherwise brochure
         if fname_lower.endswith(".pdf"):
-            if _is_inventory_file(fname, caption) and any(
-                kw in (caption or "").lower()
-                for kw in ("инвентарь", "inventory", "прайс", "price list", "availability")
-            ):
-                await _process_excel_upload(agency, user_id, doc["file_id"], fname, caption, db)
+            if _is_inventory_file(fname, caption):
+                proj_name_hint = caption if not _wants_broadcast(caption) else ""
+                await _process_excel_upload(agency, user_id, doc["file_id"], fname, proj_name_hint, db)
             else:
                 await _handle_brochure_file(
                     agency, user_id, doc["file_id"], fuid, fname, caption, msg_id, "document", db, tok
