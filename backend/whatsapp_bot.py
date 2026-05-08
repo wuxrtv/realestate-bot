@@ -498,8 +498,9 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
     from admin_agent import AdminAgent
     agent = AdminAgent()
     try:
-        reply = await agent.process(agency, f"wa_{sender_phone}", text, db)
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, reply)
+        reply = await agent.process(agency, f"wa_{sender_phone}", text, db, chat_id=chat_id)
+        if reply and reply.strip():
+            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, reply)
     except Exception:
         logger.exception("WA admin agent error")
         await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,

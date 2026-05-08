@@ -83,6 +83,12 @@ FRIDAY NIGHT: "Bro it's Friday night wallah 😄 Go enjoy habibi — I'll hold i
 • "what projects", "show database", "is there Breez" → list_projects
 • "unit 1507", "show 2301", "any 3-bedrooms" → search_units
 • "broadcast", "send to groups", "announce" → find info first, then announce_to_groups
+• "brochure", "presentation", "брошюра", "PDF", "materials" + project name → send_brochure
+• "what's in Drive", "Drive projects", "what files" → list_drive_projects
+
+IMPORTANT: Brochures live in Google Drive — NOT in the Excel database.
+When Admin asks for a brochure → always use send_brochure tool (file will be sent automatically).
+After sending: confirm briefly, e.g. "Khalas habibi — sent the SAAS Hills brochure! 📄🔥"
 
 ━━━ ADMIN PERSONALITY ADAPTATION ━━━
 Tony learns Admin through daily conversation — silently:
@@ -137,6 +143,22 @@ ADMIN_TOOLS = [
             "required": ["query"],
         },
     },
+    {
+        "name": "send_brochure",
+        "description": "Find a project brochure in Google Drive and send it to admin. Use when admin asks for a brochure or presentation of a project.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_name": {"type": "string", "description": "Project name to search brochure for"},
+            },
+            "required": ["project_name"],
+        },
+    },
+    {
+        "name": "list_drive_projects",
+        "description": "List all project folders available in Google Drive (for brochures and unit files).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -165,7 +187,8 @@ class AdminAgent:
         flag_modified(conv, "history")
         db.commit()
 
-    async def process(self, agency, user_id: str, message: str, db: Session) -> str:
+    async def process(self, agency, user_id: str, message: str, db: Session, chat_id: str = "") -> str:
+        self._chat_id = chat_id
         conv, history = self._load_history(db, agency.id, user_id)
         history.append({"role": "user", "content": message})
 
@@ -220,6 +243,10 @@ class AdminAgent:
             return self._list_projects(db, agency)
         if name == "search_units":
             return self._search_units(db, inp["query"], inp.get("limit", 5), agency)
+        if name == "send_brochure":
+            return await self._send_brochure(inp["project_name"], agency)
+        if name == "list_drive_projects":
+            return self._list_drive_projects()
         return {"error": f"Unknown tool: {name}"}
 
     async def _announce_to_groups(self, db: Session, message: str, agency) -> dict:
@@ -228,6 +255,44 @@ class AdminAgent:
         if agency.wa_instance_id and agency.wa_token:
             wa_sent = await whatsapp_bot.announce_to_wa_groups(db, message, agency)
         return {"sent_to_whatsapp": wa_sent}
+
+    def _list_drive_projects(self) -> dict:
+        try:
+            import drive_service as _drive
+            svc = _drive.get_service()
+            if not svc:
+                return {"error": "Google Drive not configured"}
+            names = _drive.list_project_names(svc)
+            return {"count": len(names), "projects": names}
+        except Exception as e:
+            return {"error": str(e)}
+
+    async def _send_brochure(self, project_name: str, agency) -> dict:
+        try:
+            import drive_service as _drive
+            import whatsapp_bot
+            svc = _drive.get_service()
+            if not svc:
+                return {"error": "Google Drive not configured"}
+            result = _drive.find_brochure(svc, project_name)
+            if not result:
+                return {"error": f"Brochure not found for '{project_name}' in Drive"}
+            file_id, file_name = result
+            file_bytes = _drive.download_file(svc, file_id)
+            if not file_bytes:
+                return {"error": "Failed to download brochure"}
+            chat_id = getattr(self, "_chat_id", "")
+            if chat_id and agency.wa_instance_id and agency.wa_token:
+                ok = await whatsapp_bot._send_wa_file(
+                    agency.wa_instance_id, agency.wa_token,
+                    chat_id, file_bytes, file_name,
+                    f"{project_name} — Brochure 📄",
+                )
+                return {"sent": ok, "file_name": file_name}
+            return {"error": "No chat_id to send file"}
+        except Exception as e:
+            logger.exception("send_brochure tool error")
+            return {"error": str(e)}
 
     def _list_projects(self, db: Session, agency) -> dict:
         projects = (
