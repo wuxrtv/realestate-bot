@@ -63,29 +63,35 @@ def _save_group_history(db, conv, history: list):
 # ─── Scheduled message texts ──────────────────────────────────────────────────
 
 _MORNING_GREETINGS = [
-    "Morning! What are we pushing to the groups today? 💼",
-    "Good morning! Ready when you are — what's the plan for today?",
-    "Morning boss! What's on the agenda? Any new projects to broadcast?",
-    "Rise and shine! What files are we sending out today?",
-    "Good morning! Got everything ready — what are we working with today?",
-    "Hey, morning! What do you need from me today?",
-    "Morning! The groups are waiting — what do we broadcast today?",
+    "Morning habibi! Yalla what are we dropping today? 🔥",
+    "Morning boss! Wallah ready when you are — what's the plan? 💼",
+    "Rise and shine habibi! What files are we sending out today? ☀️",
+    "Good morning! Yalla yalla — what are we working with today? 🔥",
+    "Morning habibi! The groups are waiting — what do we broadcast? 💪",
+    "Hey, morning! Wallah got everything ready — what do we do today? 🤲",
+    "Morning! Yalla habibi — what are we dropping today? 💼🔥",
+]
+
+_MORNING_GREETINGS_FRIDAY = [
+    "Habibi it's FRIDAY wallah 🕌\nYalla what are we dropping before Jumaa? 🔥",
+    "Friday vibes habibi ☀️\nQuick blast before people disappear to brunch? 😂",
+    "Bro it's Friday wallah 🕌\nGroups go quiet after 12 you know the drill 😄\nYalla let's move fast! 💪",
 ]
 
 _FOLLOWUP_MSGS = [
-    "Hey, just checking — did you see my morning message? What are we working with today?",
-    "Morning! Still here whenever you're ready — anything to push out?",
-    "Just a nudge — let me know what projects we're focusing on today!",
-    "Bro, you there? Ready when you are 🙌",
-    "Hey, no rush — just checking in. Anything for the groups today?",
+    "Habibi you awake? ☕ Yalla let's go 💪",
+    "Hey habibi — still here whenever you're ready! Anything to push out? 🔥",
+    "Just a nudge habibi — let me know what projects we're focusing on today! 💼",
+    "Bro, you there? Wallah ready when you are 🙌",
+    "Hey habibi, no rush — just checking in. Anything for the groups today? 🤲",
 ]
 
 _MIDDAY_MSGS = [
-    "Hey, any offers worth sharing this afternoon?",
-    "Есть что-нибудь для рассылки после обеда?",
-    "Bro, anything new to drop? Groups are active 👀",
-    "Afternoon check-in — anything worth broadcasting today?",
-    "Hey, groups are busy — got any content to share?",
+    "Hey habibi, any offers worth sharing this afternoon? 👀",
+    "Wallah groups are active bro — got any content to share? 🔥",
+    "Afternoon habibi — anything new to drop? Yalla let's go! 💪",
+    "Hey habibi — groups are busy wallah. Got something for them? 🔥",
+    "Bro, anything new? Yalla send it — groups are waiting! 💼",
 ]
 
 # ─── Tony group AI system prompt ─────────────────────────────────────────────
@@ -121,13 +127,27 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
 • direct_question: any other work question — answer in "reply" using the project context below
 • off_topic: personal talk or unrelated topic — leave reply as empty string
 
+━━━ TONY'S CHARACTER (use in "reply" field only) ━━━
+Tony is a Dubai local — smart, warm, fast, reliable. Dubai energy.
+Arabic flavor: Habibi / Wallah / Yalla / Khalas — max 1-2 per message.
+NEVER say: "Certainly!" "Of course!" "Absolutely!" "I'd be happy to!"
+Good answer example:
+  "Wallah good choice habibi 👀
+   Unit B-2701 — Floor 27, Burj Khalifa view 🏙️
+   Price: AED 1,869,432
+   Inshallah yours soon 🤲"
+Not found example:
+  "Ya habibi this one I need to check 😅
+   @admin can you jump in? 🙏"
+
 ━━━ STYLE ━━━
-• Professional but friendly — like a reliable colleague
+• Numbers and data always accurate — humor is just the wrapper
 • Never guess facts. Never improvise prices or availability.
-• Be accurate and concise. If unsure — say so.
+• Be accurate and concise. If unsure — say so honestly.
 
 LANGUAGE: Detect the language of the message. Respond ONLY in that same language.
-Russian → Russian. English → English. Uzbek → Uzbek."""
+Russian → Russian. English → English. Uzbek → Uzbek.
+Arabic flavor words (habibi, wallah, yalla, khalas) work in ANY language."""
 
 # Multilingual keywords that identify an inventory/price-list file
 _WA_INVENTORY_KEYWORDS = (
@@ -300,13 +320,16 @@ async def _handle_stranger_message(chat_id: str, agency: Agency):
 
 async def send_wa_morning_greeting():
     """08:00 — morning greeting to WA admins."""
+    from datetime import datetime as _dt
+    is_friday = _dt.now().weekday() == 4  # 4 = Friday
     db = SessionLocal()
     try:
         agencies = db.query(Agency).filter(Agency.is_active == True).all()
         for agency in agencies:
             if not agency.wa_instance_id or not agency.wa_token:
                 continue
-            greeting = random.choice(_MORNING_GREETINGS)
+            pool = _MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS
+            greeting = random.choice(pool)
             for phone in (agency.wa_admin_numbers or []):
                 await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", greeting)
     finally:
