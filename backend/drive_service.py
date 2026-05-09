@@ -228,8 +228,30 @@ def _find_named_subfolder(svc, proj_id: str, name_hints: frozenset) -> Optional[
     return None
 
 
+_BROCHURE_SORT_KW = frozenset({"brochure", "брошюр", "presentation", "презентац", "catalog", "каталог"})
+_PAYMENT_SORT_KW  = frozenset({"payment", "plan", "план", "оплат", "рассрочк", "installment"})
+
+
+def _media_sort_key(file_name: str) -> int:
+    """Send order: brochure PDF=0, payment plan PDF=1, other PDF=2, photo=3, video=4, other=5."""
+    name_l = file_name.lower()
+    ext = _ext(file_name)
+    if ext == _PDF_EXT:
+        if any(kw in name_l for kw in _BROCHURE_SORT_KW):
+            return 0
+        if any(kw in name_l for kw in _PAYMENT_SORT_KW):
+            return 1
+        return 2
+    if ext in _IMAGE_EXTS:
+        return 3
+    if ext in _VIDEO_EXTS:
+        return 4
+    return 5
+
+
 def find_all_media(svc, project_name: str, limit: int = 15, agency_root_id: str = "") -> list:
-    """Return ALL media files from the project's 'media' subfolder (photos, videos, PDFs).
+    """Return ALL media files from the project's 'media' subfolder, sorted by send order.
+    Order: brochure PDF → payment plan PDF → other PDFs → photos → videos.
     Falls back to the whole project folder if no 'media' subfolder is found.
     Returns list of (file_id, name, export_mime).
     """
@@ -245,6 +267,7 @@ def find_all_media(svc, project_name: str, limit: int = 15, agency_root_id: str 
             for f in files
             if _is_photo(f["name"]) or _is_video(f["name"]) or _is_brochure(f["name"])
         ]
+        result.sort(key=lambda f: _media_sort_key(f[1]))
         logger.info(
             f"Drive: find_all_media '{project_name}' → {len(result)} files "
             f"({'media subfolder' if media_id else 'project root fallback'})"

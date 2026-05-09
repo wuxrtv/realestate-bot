@@ -141,6 +141,8 @@ Examples:
 ━━━ INTENT RULES ━━━
 • unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
 • media_request: asking for ANY media — brochure, PDF, photos, renders, video, tour, presentation ("фото", "photo", "brochure", "видео", "video", "renders", "tour", "ролик", "брошюра")
+  → Tony sends ALL files from project's media folder in order: Brochure → Payment Plan → Photos → Video
+  → NEVER send video before brochure — order is fixed
 • property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
 • direct_question: any other work question — answer in "reply" using the project context below
 • off_topic: personal talk or unrelated topic — leave reply as empty string
@@ -408,6 +410,20 @@ async def send_wa_midday_checkin():
 
 # ─── Admin document upload ───────────────────────────────────────────────────
 
+_WA_SAVE_RE = re.compile(
+    r"\b(save|сохрани|брошюра|brochure|inventory|инвентарь|прайс|price.?list|"
+    r"payment.?plan|добавь|добавить|база|database|это.?файл|загрузи)\b",
+    re.IGNORECASE,
+)
+
+_FORWARDABLE_EXTS = (
+    ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif",
+    ".mp4", ".mov", ".avi", ".mkv", ".webm",
+    ".doc", ".docx", ".ppt", ".pptx",
+)
+_INVENTORY_EXTS = (".xlsx", ".xls", ".csv")
+
+
 async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: str,
                                  file_name: str, caption: str, db: Session, agency: Agency):
     import re as _re
@@ -416,24 +432,38 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                               normalize_project_name, parse_csv, parse_excel, parse_pdf)
 
     fname_lower = file_name.lower()
+    has_save_intent = bool(_WA_SAVE_RE.search(caption))
 
-    # Photos and videos are not inventory — inform admin
-    if fname_lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".avi")):
-        await _send_wa(chat_id,
-                       "📷 Фото/видео получено. Чтобы добавить в базу — загрузи файл в Google Drive в папку проекта.")
+    # ── INSTANT FORWARD: any file without explicit save instruction ──────────
+    # Excel/CSV always go to inventory. Everything else (photo, video, PDF, doc)
+    # is forwarded to all groups unless admin says "save" / "brochure" etc.
+    is_inventory_ext = fname_lower.endswith(_INVENTORY_EXTS)
+    is_forwardable   = fname_lower.endswith(_FORWARDABLE_EXTS)
+
+    if not is_inventory_ext and not is_forwardable:
+        await _send_wa(chat_id, "❓ Файл не распознан.")
         return
 
-    # Non-data files
-    if not fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
-        await _send_wa(chat_id,
-                       "❓ Файл не распознан. Для инвентаря отправьте .xlsx, .xls, .csv или .pdf.")
+    if not is_inventory_ext and not has_save_intent:
+        # Download and instantly forward to all groups
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.get(download_url)
+                file_bytes = resp.content
+        except Exception:
+            logger.exception("WA instant forward download error")
+            await _send_wa(chat_id, "❌ Не удалось скачать файл.")
+            return
+        n = await announce_file_to_wa_groups(db, file_bytes, file_name, caption, agency)
+        await _send_wa(chat_id, f"Khalas habibi! ✅\nForwarded to {n} groups 💪")
         return
 
-    # PDFs classified by filename: no inventory keywords → brochure, upload to Drive
-    if fname_lower.endswith(".pdf") and not _wa_is_inventory(file_name, caption):
+    # ── SAVE PATH: Excel/CSV, or forwardable file with explicit save intent ──
+    # PDFs with save intent but no unit data → brochure, tell admin to put in Drive
+    if fname_lower.endswith(".pdf") and has_save_intent and not _wa_is_inventory(file_name, caption):
         await _send_wa(chat_id,
                        f"📄 PDF «{file_name}» — брошюра.\n"
-                       "Чтобы агенты могли получить её — загрузи файл в Google Drive в папку проекта.")
+                       "Загрузи файл в Google Drive в папку проекта, чтобы агенты могли его получить.")
         return
 
     await _send_wa(chat_id, f"📊 Читаю *{file_name}*...")
@@ -636,9 +666,16 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                         await _send_wa_file(chat_id, file_bytes, file_name)
                 sent = True
         if not sent:
-            contact = agency.umar_contact or "@support"
-            await _send_wa(chat_id,
-                           f"Ya habibi, no media found in Drive 😅 Contact {contact} 🙏")
+            # Tell group to wait, then notify admin privately
+            await _send_wa(chat_id, "Give me a sec habibi 🙏")
+            admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
+            if admin_numbers:
+                admin_chat_id = f"{admin_numbers[0]}@c.us"
+                await _send_wa(
+                    admin_chat_id,
+                    f"Habibi, media for *{search_name}* not found in Drive 🙏\n"
+                    f"Can you send it? I'll forward to the groups khalas 🔥"
+                )
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
