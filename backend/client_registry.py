@@ -64,25 +64,17 @@ def sync_to_db():
         for cfg in _by_slug.values():
             agency = db.query(Agency).filter(Agency.slug == cfg.slug).first()
             if agency:
-                # Update existing record
                 agency.name = cfg.name
                 agency.wa_admin_numbers = cfg.admin_phones
                 agency.drive_root_id = cfg.drive_root_id
                 agency.umar_contact = cfg.umar_contact
-                agency.admin_password = cfg.admin_password
                 agency.bot_character = cfg.bot_character
                 agency.is_active = True
             else:
-                # Create new record
                 db.add(Agency(
                     name=cfg.name,
                     slug=cfg.slug,
-                    bot_token="",
-                    admin_ids=[],
-                    admin_password=cfg.admin_password,
                     umar_contact=cfg.umar_contact,
-                    wa_instance_id="",
-                    wa_token="",
                     wa_admin_numbers=cfg.admin_phones,
                     drive_root_id=cfg.drive_root_id,
                     bot_character=cfg.bot_character,

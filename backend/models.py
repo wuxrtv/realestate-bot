@@ -9,46 +9,39 @@ _json_type = JSONB if "postgresql" in os.getenv("DATABASE_URL", "") else JSON
 
 
 class Agency(Base):
-    """One record per client agency that buys the SaaS product."""
+    """One record per client. Populated from clients/ config files at startup."""
     __tablename__ = "agencies"
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, nullable=False)
-    slug = Column(String, unique=True, index=True)       # URL key: /telegram/webhook/{slug}
-    bot_token = Column(String, unique=True, nullable=True, default="")
-    admin_ids = Column(_json_type, default=list)          # ["7567850330", ...]
-    admin_password = Column(String, default="toni2024")   # for /admin/{slug}
-    bot_username = Column(String, default="")             # for @mention detection in groups
-    umar_contact = Column(String, default="@support")     # shown when unit not found
-    db_channel_id = Column(String, default="")            # private file/brochure channel
-    wa_instance_id = Column(String, default="")    # Green API instance ID
-    wa_token = Column(String, default="")           # Green API token
-    wa_admin_numbers = Column(_json_type, default=list)  # ["79001234567", ...]
-    drive_root_id = Column(String, default="")      # Google Drive root folder ID for this agency
-    bot_character = Column(Text, default="")        # custom Tony personality for this agency
-    is_active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=func.now())
+    id           = Column(Integer, primary_key=True, index=True)
+    name         = Column(String, nullable=False)
+    slug         = Column(String, unique=True, index=True)
+    umar_contact = Column(String, default="@support")
+    wa_admin_numbers = Column(_json_type, default=list)  # admin phone numbers
+    drive_root_id    = Column(String, default="")        # Google Drive root folder ID
+    bot_character    = Column(Text, default="")          # custom Tony personality
+    is_active    = Column(Boolean, default=True)
+    created_at   = Column(DateTime, default=func.now())
 
 
 class AdminConversation(Base):
-    """Persistent conversation history for admin ↔ AdminAgent chat."""
+    """Conversation history for admin ↔ Tony private chat."""
     __tablename__ = "admin_conversations"
 
-    id = Column(Integer, primary_key=True, index=True)
-    agency_id = Column(Integer, index=True)
-    user_id = Column(String, index=True)
-    history = Column(_json_type, default=list)   # list of {role, content} dicts
+    id         = Column(Integer, primary_key=True, index=True)
+    agency_id  = Column(Integer, index=True)
+    user_id    = Column(String, index=True)
+    history    = Column(_json_type, default=list)
     updated_at = Column(DateTime, default=func.now())
 
 
 class GroupConversation(Base):
-    """Conversation history per group chat, shared across all agents in the group."""
+    """Conversation history per WhatsApp group."""
     __tablename__ = "group_conversations"
 
-    id = Column(Integer, primary_key=True, index=True)
-    agency_id = Column(Integer, index=True)
-    chat_id = Column(String, index=True)
-    history = Column(_json_type, default=list)   # [{role, content}] last N exchanges
+    id         = Column(Integer, primary_key=True, index=True)
+    agency_id  = Column(Integer, index=True)
+    chat_id    = Column(String, index=True)
+    history    = Column(_json_type, default=list)
     updated_at = Column(DateTime, default=func.now())
 
 
@@ -57,26 +50,26 @@ class WhatsAppGroup(Base):
     __tablename__ = "whatsapp_groups"
     __table_args__ = (UniqueConstraint("agency_id", "chat_id", name="uq_agency_wa_group"),)
 
-    id = Column(Integer, primary_key=True, index=True)
-    agency_id = Column(Integer, nullable=True, index=True)
-    chat_id = Column(String, index=True)   # e.g. "120363000000000000@g.us"
-    title = Column(String)
-    active = Column(Boolean, default=True)
+    id         = Column(Integer, primary_key=True, index=True)
+    agency_id  = Column(Integer, nullable=True, index=True)
+    chat_id    = Column(String, index=True)
+    title      = Column(String)
+    active     = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
 
 
 class ToniProject(Base):
-    """Excel project file uploaded via admin."""
+    """Excel inventory uploaded for a client."""
     __tablename__ = "toni_projects"
 
-    id = Column(Integer, primary_key=True, index=True)
-    agency_id = Column(Integer, nullable=True, index=True)
+    id           = Column(Integer, primary_key=True, index=True)
+    agency_id    = Column(Integer, nullable=True, index=True)
     project_name = Column(String, index=True)
-    version = Column(Integer, default=1)
-    sheet_count = Column(Integer, default=0)
-    unit_count = Column(Integer, default=0)
-    sheets_data = Column(_json_type)
-    unit_index = Column(_json_type)
-    is_active = Column(Boolean, default=True)
-    uploaded_at = Column(DateTime, default=func.now())
-    uploaded_by = Column(String, default="web")
+    version      = Column(Integer, default=1)
+    sheet_count  = Column(Integer, default=0)
+    unit_count   = Column(Integer, default=0)
+    sheets_data  = Column(_json_type)
+    unit_index   = Column(_json_type)
+    is_active    = Column(Boolean, default=True)
+    uploaded_at  = Column(DateTime, default=func.now())
+    uploaded_by  = Column(String, default="")
