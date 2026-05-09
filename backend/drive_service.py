@@ -4,6 +4,7 @@ import io
 import json
 import logging
 import os
+import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,19 @@ logger = logging.getLogger(__name__)
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 _svc = None
+
+# ─── Cache ────────────────────────────────────────────────────────────────────
+_CACHE_TTL = 1800  # 30 minutes
+
+_folder_cache: dict[str, tuple[list, float]] = {}         # folder_id → (items, ts)
+_project_cache: dict[str, tuple[Optional[str], float]] = {}  # "root|name" → (folder_id, ts)
+
+
+def clear_cache():
+    """Call after uploading new files to Drive so next search is fresh."""
+    _folder_cache.clear()
+    _project_cache.clear()
+    logger.info("Drive: cache cleared")
 
 
 def get_service():
@@ -45,10 +59,17 @@ def _root_id(agency_root_id: str = "") -> str:
 
 
 def _list_folder(svc, folder_id: str) -> list:
+    now = time.time()
+    if folder_id in _folder_cache:
+        items, ts = _folder_cache[folder_id]
+        if now - ts < _CACHE_TTL:
+            return items
     try:
         q = f"'{folder_id}' in parents and trashed=false"
         r = svc.files().list(q=q, fields="files(id,name,mimeType)", pageSize=200).execute()
-        return r.get("files", [])
+        items = r.get("files", [])
+        _folder_cache[folder_id] = (items, now)
+        return items
     except Exception:
         logger.exception("Drive: list_folder failed")
         return []
@@ -71,20 +92,27 @@ def _find_project_folder(svc, project_name: str, agency_root_id: str = "") -> Op
     """
     Search for a project folder by name.
     Looks in ROOT directly, then one level deeper (client folders inside ROOT).
+    Results cached for 30 minutes.
     """
+    cache_key = f"{agency_root_id}|{project_name.lower()}"
+    now = time.time()
+    if cache_key in _project_cache:
+        folder_id, ts = _project_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            logger.info(f"Drive: cache hit for '{project_name}'")
+            return folder_id
+
     effective_root = _root_id(agency_root_id)
     root_items = _list_folder(svc, effective_root)
     folders = [i for i in root_items if i["mimeType"] == "application/vnd.google-apps.folder"]
     if not folders:
         logger.error(
             f"Drive: ROOT folder ({effective_root}) returned 0 folders! "
-            "Most likely the folder is NOT shared with the service account. "
-            "Share the root Drive folder with the service account email."
+            "Most likely the folder is NOT shared with the service account."
         )
     else:
         logger.info(f"Drive ROOT folders ({len(folders)}): {[f['name'] for f in folders]}")
 
-    # Try direct match in root
     best, best_score = None, 0
     for item in folders:
         score = _name_score(item["name"], project_name)
@@ -93,23 +121,25 @@ def _find_project_folder(svc, project_name: str, agency_root_id: str = "") -> Op
 
     if best_score >= 1:
         logger.info(f"Drive: found '{project_name}' directly in root → score={best_score}")
+        _project_cache[cache_key] = (best, now)
         return best
 
-    # Try one level deeper: inside each subfolder (client folders)
     for client_folder in folders:
         sub_items = _list_folder(svc, client_folder["id"])
         sub_folders = [i for i in sub_items if i["mimeType"] == "application/vnd.google-apps.folder"]
-        logger.info(f"Drive: inside '{client_folder['name']}': {[f['name'] for f in sub_folders]}")
         for item in sub_folders:
             score = _name_score(item["name"], project_name)
             if score > best_score:
                 best, best_score = item["id"], score
 
-    if best_score >= 1:
+    result = best if best_score >= 1 else None
+    if result:
         logger.info(f"Drive: found '{project_name}' in subfolder → score={best_score}")
     else:
         logger.warning(f"Drive: '{project_name}' NOT FOUND. Available: {[f['name'] for f in folders]}")
-    return best if best_score >= 1 else None
+
+    _project_cache[cache_key] = (result, now)
+    return result
 
 
 # File type categories

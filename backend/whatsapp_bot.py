@@ -480,6 +480,9 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         await _send_wa(chat_id, "❌ Юниты не найдены.")
         return
 
+    import drive_service as _drive
+    _drive.clear_cache()
+
     if len(saved) == 1:
         r = saved[0]
         if r["status"] == "updated":
