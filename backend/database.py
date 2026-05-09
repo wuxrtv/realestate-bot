@@ -25,10 +25,11 @@ def init_db():
 def _migrate():
     """Add new columns to existing tables without dropping data."""
     additions = [
-        ("toni_projects", "agency_id", "INTEGER"),
-        ("agencies",      "wa_instance_id", "TEXT"),
-        ("agencies",      "wa_token",       "TEXT"),
+        ("toni_projects", "agency_id",        "INTEGER"),
+        ("agencies",      "wa_instance_id",   "TEXT"),
+        ("agencies",      "wa_token",         "TEXT"),
         ("agencies",      "wa_admin_numbers", "TEXT"),
+        ("agencies",      "drive_root_id",    "TEXT DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, col, typedef in additions:

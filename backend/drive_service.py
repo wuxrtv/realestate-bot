@@ -43,8 +43,9 @@ def get_service():
         return None
 
 
-def _root_id() -> str:
-    return os.getenv("GOOGLE_DRIVE_ROOT_ID", "")
+def _root_id(agency_root_id: str = "") -> str:
+    """Return the effective root folder ID: agency-specific or global env var."""
+    return agency_root_id or os.getenv("GOOGLE_DRIVE_ROOT_ID", "")
 
 
 def _list_folder(svc, folder_id: str) -> list:
@@ -70,16 +71,17 @@ def _name_score(folder_name: str, query: str) -> int:
     return 0
 
 
-def _find_project_folder(svc, project_name: str) -> Optional[str]:
+def _find_project_folder(svc, project_name: str, agency_root_id: str = "") -> Optional[str]:
     """
     Search for a project folder by name.
     Looks in ROOT directly, then one level deeper (client folders inside ROOT).
     """
-    root_items = _list_folder(svc, _root_id())
+    effective_root = _root_id(agency_root_id)
+    root_items = _list_folder(svc, effective_root)
     folders = [i for i in root_items if i["mimeType"] == "application/vnd.google-apps.folder"]
     if not folders:
         logger.error(
-            f"Drive: ROOT folder ({_root_id()}) returned 0 folders! "
+            f"Drive: ROOT folder ({effective_root}) returned 0 folders! "
             "Most likely the folder is NOT shared with the service account. "
             "Share the root Drive folder with the service account email."
         )
@@ -110,7 +112,7 @@ def _find_project_folder(svc, project_name: str) -> Optional[str]:
     if best_score >= 1:
         logger.info(f"Drive: found '{project_name}' in subfolder → score={best_score}")
     else:
-        logger.warning(f"Drive: project '{project_name}' NOT FOUND anywhere")
+        logger.warning(f"Drive: '{project_name}' NOT FOUND. Available: {[f['name'] for f in folders]}")
     return best if best_score >= 1 else None
 
 
@@ -164,10 +166,10 @@ def _collect_files(svc, folder_id: str) -> list:
     return files
 
 
-def find_brochure(svc, project_name: str) -> Optional[tuple]:
-    """Find a brochure (PDF) for a project. Returns (file_id, name) or None."""
+def find_brochure(svc, project_name: str, agency_root_id: str = "") -> Optional[tuple]:
+    """Find a brochure (PDF) for a project. Returns (file_id, name, export_mime) or None."""
     try:
-        proj_id = _find_project_folder(svc, project_name)
+        proj_id = _find_project_folder(svc, project_name, agency_root_id)
         if not proj_id:
             return None
         files = _collect_files(svc, proj_id)
@@ -193,10 +195,10 @@ def find_brochure(svc, project_name: str) -> Optional[tuple]:
     return None
 
 
-def find_photos(svc, project_name: str, limit: int = 5) -> list:
+def find_photos(svc, project_name: str, limit: int = 5, agency_root_id: str = "") -> list:
     """Find photo files for a project. Returns list of (file_id, name)."""
     try:
-        proj_id = _find_project_folder(svc, project_name)
+        proj_id = _find_project_folder(svc, project_name, agency_root_id)
         if not proj_id:
             return []
         files = _collect_files(svc, proj_id)
@@ -207,10 +209,10 @@ def find_photos(svc, project_name: str, limit: int = 5) -> list:
     return []
 
 
-def find_video(svc, project_name: str) -> Optional[tuple]:
+def find_video(svc, project_name: str, agency_root_id: str = "") -> Optional[tuple]:
     """Find first video file for a project. Returns (file_id, name, export_mime) or None."""
     try:
-        proj_id = _find_project_folder(svc, project_name)
+        proj_id = _find_project_folder(svc, project_name, agency_root_id)
         if not proj_id:
             return None
         files = _collect_files(svc, proj_id)
@@ -222,10 +224,10 @@ def find_video(svc, project_name: str) -> Optional[tuple]:
     return None
 
 
-def find_unit_file(svc, project_name: str, unit_number: str) -> Optional[tuple]:
+def find_unit_file(svc, project_name: str, unit_number: str, agency_root_id: str = "") -> Optional[tuple]:
     """Find any file for a unit (e.g. '1507.pdf'). Returns (file_id, name) or None."""
     try:
-        proj_id = _find_project_folder(svc, project_name)
+        proj_id = _find_project_folder(svc, project_name, agency_root_id)
         if not proj_id:
             return None
         files = _collect_files(svc, proj_id)
@@ -260,10 +262,10 @@ def download_file(svc, file_id: str, export_mime: str = "") -> Optional[bytes]:
         return None
 
 
-def list_project_names(svc) -> list:
+def list_project_names(svc, agency_root_id: str = "") -> list:
     """List all project folder names (searches root and one level deep)."""
     try:
-        root_items = _list_folder(svc, _root_id())
+        root_items = _list_folder(svc, _root_id(agency_root_id))
         names = []
         for item in root_items:
             if item["mimeType"] == "application/vnd.google-apps.folder":

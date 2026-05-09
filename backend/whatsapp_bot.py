@@ -590,9 +590,10 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         import drive_service as _drive
         svc = _drive.get_service()
         sent = False
+        root_id = getattr(agency, "drive_root_id", "") or ""
         search_name = project_name or (keywords[0] if keywords else "")
         if svc and search_name:
-            drive_result = _drive.find_brochure(svc, search_name)
+            drive_result = _drive.find_brochure(svc, search_name, root_id)
             if drive_result:
                 file_id, file_name, export_mime = drive_result
                 file_bytes = _drive.download_file(svc, file_id, export_mime)
@@ -611,9 +612,10 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         import drive_service as _drive
         svc = _drive.get_service()
         sent = False
+        root_id = getattr(agency, "drive_root_id", "") or ""
         search_name = project_name or (keywords[0] if keywords else "")
         if svc and search_name:
-            photos = _drive.find_photos(svc, search_name, limit=5)
+            photos = _drive.find_photos(svc, search_name, limit=5, agency_root_id=root_id)
             if photos:
                 await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
                                f"Wallah habibi — {search_name} photos incoming 📸👇")
@@ -631,9 +633,10 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         import drive_service as _drive
         svc = _drive.get_service()
         sent = False
+        root_id = getattr(agency, "drive_root_id", "") or ""
         search_name = project_name or (keywords[0] if keywords else "")
         if svc and search_name:
-            drive_result = _drive.find_video(svc, search_name)
+            drive_result = _drive.find_video(svc, search_name, root_id)
             if drive_result:
                 file_id, file_name, export_mime = drive_result
                 file_bytes = _drive.download_file(svc, file_id, export_mime)

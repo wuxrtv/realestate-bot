@@ -319,12 +319,13 @@ class AdminAgent:
             if not chat_id:
                 return {"error": "No chat_id — cannot send file"}
 
+            root_id = getattr(agency, "drive_root_id", "") or ""
             # List available projects for diagnostic info
-            all_projects = _drive.list_project_names(svc)
-            logger.info(f"Drive: searching for '{project_name}' in projects: {all_projects}")
+            all_projects = _drive.list_project_names(svc, root_id)
+            logger.info(f"Drive: searching for '{project_name}' (root={root_id or 'global'})")
 
             if file_type == "brochure":
-                result = _drive.find_brochure(svc, project_name)
+                result = _drive.find_brochure(svc, project_name, root_id)
                 if not result:
                     return {
                         "error": f"Brochure not found for '{project_name}'.",
@@ -345,7 +346,7 @@ class AdminAgent:
                 return {"sent_to_admin": ok, "file_name": file_name}
 
             elif file_type == "photo":
-                photos = _drive.find_photos(svc, project_name, limit=5)
+                photos = _drive.find_photos(svc, project_name, limit=5, agency_root_id=root_id)
                 if not photos:
                     return {
                         "error": f"No photos found for '{project_name}'.",
@@ -366,7 +367,7 @@ class AdminAgent:
                 return {"sent": sent_count, "total": len(photos), "destination": send_to}
 
             elif file_type == "video":
-                result = _drive.find_video(svc, project_name)
+                result = _drive.find_video(svc, project_name, root_id)
                 if not result:
                     return {
                         "error": f"No video found for '{project_name}'.",

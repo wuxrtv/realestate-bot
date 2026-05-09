@@ -167,13 +167,21 @@ def _super_html(agencies: list, message: str = "") -> str:
     for a in agencies:
         dt = a.created_at.strftime("%d.%m.%Y") if a.created_at else "—"
         status = '<span class="badge badge-green">active</span>' if a.is_active else '<span class="badge badge-red">off</span>'
+        drive = f'<span class="badge badge-blue">✓</span>' if getattr(a, "drive_root_id", "") else '<span class="badge badge-red">—</span>'
+        toggle_label = "Деактивировать" if a.is_active else "Активировать"
         rows += f"""
         <tr>
           <td><strong>{a.name}</strong></td>
           <td><code>{a.slug}</code></td>
           <td>{status}</td>
+          <td>{drive}</td>
           <td><a href="/admin/{a.slug}" target="_blank">/admin/{a.slug}</a></td>
           <td>{dt}</td>
+          <td>
+            <form method="post" action="/superadmin/agency/{a.id}/toggle" style="display:inline">
+              <button class="btn" style="padding:4px 10px;font-size:.75rem;background:#e2e8f0" type="submit">{toggle_label}</button>
+            </form>
+          </td>
         </tr>"""
 
     msg_html = f'<div class="hint" style="margin-bottom:16px;background:#f0fff4;border-color:#9ae6b4;color:#276749">{message}</div>' if message else ""
@@ -224,6 +232,10 @@ def _super_html(agencies: list, message: str = "") -> str:
             <label>WhatsApp номера админов * (через запятую, без +)</label>
             <input name="wa_admin_numbers" required placeholder="79001234567, 971501234567">
           </div>
+          <div class="field">
+            <label>Google Drive Root Folder ID (папка клиента)</label>
+            <input name="drive_root_id" placeholder="1IhO3Gq6e9mNs7xWVqdmwdx_YUr81hFws">
+          </div>
           <div class="field field-full">
             <button class="btn btn-primary" type="submit">Создать агентство</button>
           </div>
@@ -232,7 +244,7 @@ def _super_html(agencies: list, message: str = "") -> str:
     </div>
     <div class="card">
       <h2>📋 Агентства ({len(agencies)})</h2>
-      {'<div class="empty">Пока нет ни одного агентства.</div>' if not agencies else f'<table><thead><tr><th>Название</th><th>Slug</th><th>Статус</th><th>Панель</th><th>Создано</th></tr></thead><tbody>{rows}</tbody></table>'}
+      {'<div class="empty">Пока нет ни одного агентства.</div>' if not agencies else f'<table><thead><tr><th>Название</th><th>Slug</th><th>Статус</th><th>Drive</th><th>Панель</th><th>Создано</th><th></th></tr></thead><tbody>{rows}</tbody></table>'}
     </div>
   </div>
 </body>
@@ -258,6 +270,7 @@ async def super_admin_create_agency(
     wa_instance_id: str = Form(...),
     wa_token: str = Form(...),
     wa_admin_numbers: str = Form(...),
+    drive_root_id: str = Form(""),
 ):
     slug = _make_slug(name, db)
     parsed_wa_admins = [n.strip().lstrip("+") for n in wa_admin_numbers.split(",") if n.strip()]
@@ -271,6 +284,7 @@ async def super_admin_create_agency(
         wa_instance_id=wa_instance_id.strip(),
         wa_token=wa_token.strip(),
         wa_admin_numbers=parsed_wa_admins,
+        drive_root_id=drive_root_id.strip(),
     )
     db.add(agency)
     db.commit()
@@ -283,6 +297,20 @@ async def super_admin_create_agency(
         logger.info(f"WA webhook registered for '{slug}': {wa_url}")
 
     return RedirectResponse(url=f"/superadmin?created={slug}", status_code=303)
+
+
+@app.post("/superadmin/agency/{agency_id}/toggle")
+async def super_admin_toggle_agency(
+    agency_id: int,
+    _: None = Depends(_verify_super_admin),
+    db: Session = Depends(get_db),
+):
+    agency = db.query(Agency).filter(Agency.id == agency_id).first()
+    if not agency:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    agency.is_active = not agency.is_active
+    db.commit()
+    return RedirectResponse(url="/superadmin", status_code=303)
 
 
 # ─── Per-agency admin panel ───────────────────────────────────────────────────
@@ -370,6 +398,25 @@ def _agency_admin_html(agency: Agency, projects: list) -> str:
       </form>
     </div>
     <div class="card">
+      <h2>📁 Google Drive</h2>
+      {'<div class="hint" style="background:#f0fff4;border-color:#68d391">✅ Drive Root ID: <strong>' + (getattr(agency, "drive_root_id", "") or '') + '</strong></div>' if getattr(agency, "drive_root_id", "") else '<div class="hint" style="background:#fff5f5;border-color:#fc8181">⚠️ Google Drive не настроен — брошюры и фото недоступны</div>'}
+      <form method="post" action="/admin/{agency.slug}/drive" style="margin-top:16px">
+        <div class="form-grid">
+          <div class="field field-full">
+            <label>Google Drive Root Folder ID</label>
+            <input name="drive_root_id" value="{getattr(agency, 'drive_root_id', '') or ''}" placeholder="1IhO3Gq6e9mNs7xWVqdmwdx_YUr81hFws">
+          </div>
+          <div class="field field-full" style="font-size:.82rem;color:#718096;line-height:1.6">
+            Скопируйте ID из URL папки Google Drive: drive.google.com/drive/folders/<strong>ВОТ_ЭТО</strong><br>
+            Папка должна быть расшарена с email сервисного аккаунта Google.
+          </div>
+          <div class="field field-full">
+            <button class="btn btn-primary" type="submit">Сохранить Drive настройки</button>
+          </div>
+        </div>
+      </form>
+    </div>
+    <div class="card">
       <h2>📋 Активные проекты в памяти бота ({len(projects)})</h2>
       {_projects_table(projects)}
     </div>
@@ -426,6 +473,24 @@ async def agency_admin_save_whatsapp(
         wa_url = f"https://{public_domain}/whatsapp/webhook/{agency.slug}"
         await whatsapp_bot.set_wa_webhook(agency.wa_instance_id, agency.wa_token, wa_url)
 
+    return RedirectResponse(url=f"/admin/{slug}", status_code=303)
+
+
+@app.post("/admin/{slug}/drive")
+async def agency_admin_save_drive(
+    slug: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    drive_root_id: str = Form(""),
+):
+    agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+    if not agency:
+        raise HTTPException(status_code=404, detail="Agency not found")
+    if not _check_agency_auth(request, agency):
+        return HTMLResponse(content="Unauthorized", status_code=401,
+                            headers={"WWW-Authenticate": 'Basic realm="Toni Admin"'})
+    agency.drive_root_id = drive_root_id.strip()
+    db.commit()
     return RedirectResponse(url=f"/admin/{slug}", status_code=303)
 
 
