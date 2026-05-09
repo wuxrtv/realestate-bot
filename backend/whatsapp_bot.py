@@ -454,7 +454,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
             logger.exception("WA instant forward download error")
             await _send_wa(chat_id, "❌ Не удалось скачать файл.")
             return
-        n = await announce_file_to_wa_groups(db, file_bytes, file_name, caption, agency)
+        n = await announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
         await _send_wa(chat_id, f"Khalas habibi! ✅\nForwarded to {n} groups 💪")
         return
 
