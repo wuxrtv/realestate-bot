@@ -79,13 +79,19 @@ FRIDAY NIGHT: "Bro it's Friday night wallah 😄 Go enjoy habibi — I'll hold i
 → Sunday morning = back to full energy
 → Ramadan Fridays — extra respectful, no jokes
 
+━━━ PLATFORM ━━━
+This is WhatsApp ONLY. There is NO Telegram. NEVER mention Telegram, Telegram delay, or Telegram groups.
+Groups = WhatsApp groups. That's it.
+
 ━━━ TOOLS — use automatically, without being asked ━━━
 • "what projects", "show database", "is there Breez" → list_projects
 • "unit 1507", "show 2301", "any 3-bedrooms" → search_units
-• "broadcast", "send to groups", "announce" → find info first, then announce_to_groups
-• "brochure", "presentation", "брошюра", "PDF", "materials" → send_drive_file (file_type="brochure")
-• "photo", "фото", "pictures", "renders" → send_drive_file (file_type="photo")
-• "video", "видео", "tour" → send_drive_file (file_type="video")
+• "broadcast text to groups", "announce text" → announce_to_groups
+• "send brochure/video/photo TO GROUPS" → send_drive_file (send_to="groups")
+• "send me brochure/video/photo" (to admin only) → send_drive_file (send_to="admin")
+• "brochure", "брошюра", "PDF" without "to groups" → send_drive_file (send_to="admin")
+• "video", "видео", "tour" + "to groups" / "в группы" → send_drive_file (file_type="video", send_to="groups")
+• "photo", "фото", "renders" → send_drive_file (file_type="photo", send_to correct target)
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
 
 ━━━ GOOGLE DRIVE — CRITICAL RULES ━━━
@@ -95,11 +101,14 @@ NEVER say "I can only check what's in my memory" when asked for files — this i
 
 When Admin asks for brochure / photo / video:
 → ALWAYS call send_drive_file tool immediately — no questions, no explanations
-→ After tool runs successfully: confirm briefly "Khalas habibi — sent! 📄🔥"
+→ If Admin says "send to groups" / "в группы" / "blast to groups" → send_to="groups"
+→ If Admin says "send me" / "show me" / no destination mentioned → send_to="admin"
+→ After tool returns {"sent_to_groups": N}: say "Khalas! Blasted to N groups wallah 💥✅"
+→ After tool returns {"sent_to_admin": true}: say "Sent habibi! 📄🔥"
+→ NEVER say file was sent to groups unless tool returned sent_to_groups > 0
+→ NEVER mention Telegram — this is WhatsApp only
 → If tool returns error with "available_projects_in_drive": tell Admin EXACTLY which projects are in Drive
-  Example: "Habibi, couldn't find 'SAAS Hills' — Drive has these projects: [list them]. Is the name different?"
-→ If tool returns "Drive is NOT configured": tell Admin to check Railway environment variables
-→ If available_projects_in_drive is empty list []: tell Admin the Drive folder is not shared with the service account email
+→ If available_projects_in_drive is []: tell Admin Drive folder needs to be shared with service account
 
 list_projects = Excel inventory database (units, prices)
 send_drive_file = brochures, photos, videos from Google Drive
@@ -160,7 +169,7 @@ ADMIN_TOOLS = [
     },
     {
         "name": "send_drive_file",
-        "description": "Find and send a file from Google Drive to admin. Use when admin asks for brochure, photos, or video of a project.",
+        "description": "Find and send a file from Google Drive. Can send to admin only OR broadcast to all WhatsApp groups.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -168,10 +177,15 @@ ADMIN_TOOLS = [
                 "file_type": {
                     "type": "string",
                     "enum": ["brochure", "photo", "video"],
-                    "description": "Type of file to find: brochure (PDF), photo (images), video (mp4)",
+                    "description": "Type of file: brochure (PDF), photo (images), video (mp4)",
+                },
+                "send_to": {
+                    "type": "string",
+                    "enum": ["admin", "groups"],
+                    "description": "'admin' = send to this chat only. 'groups' = broadcast to ALL WhatsApp groups.",
                 },
             },
-            "required": ["project_name", "file_type"],
+            "required": ["project_name", "file_type", "send_to"],
         },
     },
     {
@@ -264,7 +278,10 @@ class AdminAgent:
         if name == "search_units":
             return self._search_units(db, inp["query"], inp.get("limit", 5), agency)
         if name == "send_drive_file":
-            return await self._send_drive_file(inp["project_name"], inp.get("file_type", "brochure"), agency)
+            return await self._send_drive_file(
+                inp["project_name"], inp.get("file_type", "brochure"),
+                inp.get("send_to", "admin"), agency,
+            )
         if name == "list_drive_projects":
             return self._list_drive_projects()
         return {"error": f"Unknown tool: {name}"}
@@ -287,7 +304,7 @@ class AdminAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _send_drive_file(self, project_name: str, file_type: str, agency) -> dict:
+    async def _send_drive_file(self, project_name: str, file_type: str, send_to: str, agency) -> dict:
         try:
             import drive_service as _drive
             import whatsapp_bot
@@ -318,11 +335,14 @@ class AdminAgent:
                 file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if not file_bytes:
                     return {"error": f"Failed to download '{file_name}' from Drive"}
+                caption = f"{project_name} — Brochure 📄"
+                if send_to == "groups":
+                    n = await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, caption, agency)
+                    return {"sent_to_groups": n, "file_name": file_name}
                 ok = await whatsapp_bot._send_wa_file(
-                    agency.wa_instance_id, agency.wa_token,
-                    chat_id, file_bytes, file_name, f"{project_name} — Brochure 📄",
+                    agency.wa_instance_id, agency.wa_token, chat_id, file_bytes, file_name, caption,
                 )
-                return {"sent": ok, "file_name": file_name}
+                return {"sent_to_admin": ok, "file_name": file_name}
 
             elif file_type == "photo":
                 photos = _drive.find_photos(svc, project_name, limit=5)
@@ -334,13 +354,16 @@ class AdminAgent:
                 sent_count = 0
                 for file_id, file_name in photos:
                     file_bytes = _drive.download_file(svc, file_id)
-                    if file_bytes:
+                    if not file_bytes:
+                        continue
+                    if send_to == "groups":
+                        await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
+                    else:
                         await whatsapp_bot._send_wa_file(
-                            agency.wa_instance_id, agency.wa_token,
-                            chat_id, file_bytes, file_name,
+                            agency.wa_instance_id, agency.wa_token, chat_id, file_bytes, file_name,
                         )
-                        sent_count += 1
-                return {"sent": sent_count, "total": len(photos)}
+                    sent_count += 1
+                return {"sent": sent_count, "total": len(photos), "destination": send_to}
 
             elif file_type == "video":
                 result = _drive.find_video(svc, project_name)
@@ -353,11 +376,14 @@ class AdminAgent:
                 file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if not file_bytes:
                     return {"error": f"Failed to download video '{file_name}' from Drive"}
+                caption = f"{project_name} 🎬"
+                if send_to == "groups":
+                    n = await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, caption, agency)
+                    return {"sent_to_groups": n, "file_name": file_name}
                 ok = await whatsapp_bot._send_wa_file(
-                    agency.wa_instance_id, agency.wa_token,
-                    chat_id, file_bytes, file_name, f"{project_name} 🎬",
+                    agency.wa_instance_id, agency.wa_token, chat_id, file_bytes, file_name, caption,
                 )
-                return {"sent": ok, "file_name": file_name}
+                return {"sent_to_admin": ok, "file_name": file_name}
 
             return {"error": f"Unknown file_type: {file_type}"}
         except Exception as e:

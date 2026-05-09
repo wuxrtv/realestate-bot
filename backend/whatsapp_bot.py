@@ -790,3 +790,22 @@ async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> in
             await asyncio.sleep(30)
         await _send_wa(agency.wa_instance_id, agency.wa_token, g.chat_id, message)
     return len(groups)
+
+
+async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: str,
+                                     caption: str, agency: Agency) -> int:
+    """Send a file to all active WhatsApp groups."""
+    groups = db.query(WhatsAppGroup).filter(
+        WhatsAppGroup.active == True,
+        WhatsAppGroup.agency_id == agency.id,
+    ).all()
+    sent = 0
+    for i, g in enumerate(groups):
+        if i > 0:
+            await asyncio.sleep(30)
+        ok = await _send_wa_file(agency.wa_instance_id, agency.wa_token,
+                                  g.chat_id, file_bytes, file_name, caption)
+        if ok:
+            sent += 1
+    logger.info(f"announce_file_to_wa_groups: sent to {sent}/{len(groups)} groups")
+    return sent
