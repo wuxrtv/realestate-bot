@@ -274,7 +274,7 @@ def _format_aed(v: str) -> str:
 
 
 def format_unit_card(unit_num: str, data: dict, project_name: str) -> str:
-    """Format unit data as a readable Telegram message."""
+    """Format unit data as a readable WhatsApp message."""
     sheet = data.get("_sheet", "")
     lines = [f"🏢 *Юнит {unit_num}* — {project_name}"]
     if sheet:

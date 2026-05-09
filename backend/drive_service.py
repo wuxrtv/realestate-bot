@@ -66,8 +66,17 @@ def _list_folder(svc, folder_id: str) -> list:
             return items
     try:
         q = f"'{folder_id}' in parents and trashed=false"
-        r = svc.files().list(q=q, fields="files(id,name,mimeType)", pageSize=200).execute()
-        items = r.get("files", [])
+        items = []
+        page_token = None
+        while True:
+            kwargs = {"q": q, "fields": "nextPageToken,files(id,name,mimeType)", "pageSize": 200}
+            if page_token:
+                kwargs["pageToken"] = page_token
+            r = svc.files().list(**kwargs).execute()
+            items.extend(r.get("files", []))
+            page_token = r.get("nextPageToken")
+            if not page_token:
+                break
         _folder_cache[folder_id] = (items, now)
         return items
     except Exception:

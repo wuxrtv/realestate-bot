@@ -109,16 +109,34 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
 }
 
 ━━━ WHEN TO RESPOND ━━━
-✅ Respond when:
-• Someone mentions "Tony" or "Тони"
-• Someone asks about units, prices, availability, projects in the database
+✅ Respond (use correct intent) when:
+• Someone mentions "Tony" or "Тони" — always respond
+• Someone asks about units, prices, availability — even WITHOUT mentioning Tony
+• Someone asks for brochure, video, photos — even WITHOUT mentioning Tony
 • Question is clearly real-estate related
 
-❌ Do NOT respond (use "off_topic" intent) when:
+❌ Use "off_topic" intent when:
 • People are having personal conversations
-• Topics unrelated to real estate
+• Topics completely unrelated to real estate
 • You don't have accurate data to answer
-• When in doubt — don't respond
+• When in doubt — use off_topic, do NOT respond
+
+━━━ CONTEXT INTELLIGENCE ━━━
+ALWAYS read the FULL conversation history before responding.
+
+→ If a specific project was discussed in the last 10-15 messages → use it as project_name automatically
+→ NEVER ask "which project?" if the project is already clear from context
+→ If project unclear AND not mentioned anywhere → use direct_question intent, ask once:
+   "Habibi which project? 😊\nWe have:\n• [list from available projects below]"
+→ Ask MAXIMUM ONCE — if you already asked above and got an answer, use that answer
+→ If you asked and got NO answer yet — still use off_topic, do not repeat the question
+
+Examples:
+• History shows "SAAS Hills" being discussed → someone says "send brochure"
+  → project_name = "SAAS Hills", intent = brochure_request ← NO questions asked
+• No project in history → "send brochure"
+  → intent = direct_question, reply lists available projects
+• "send me SAAS Hills brochure" → project_name = "SAAS Hills", intent = brochure_request ← immediate
 
 ━━━ INTENT RULES ━━━
 • unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
@@ -147,9 +165,10 @@ Not found example:
 • Never guess facts. Never improvise prices or availability.
 • Be accurate and concise. If unsure — say so honestly.
 
-LANGUAGE: Detect the language of the message. Respond ONLY in that same language.
-Russian → Russian. English → English. Uzbek → Uzbek.
-Arabic flavor words (habibi, wallah, yalla, khalas) work in ANY language."""
+LANGUAGE: Always reply in English only — no exceptions.
+You understand all languages (Russian, Uzbek, Arabic, any) but always respond in English.
+Arabic flavor words (habibi, wallah, yalla, khalas) are personality — not language switching.
+Never ask about language preference."""
 
 # Multilingual keywords that identify an inventory/price-list file
 _WA_INVENTORY_KEYWORDS = (
@@ -175,6 +194,15 @@ def _wa_is_inventory(fname: str, caption: str) -> bool:
 logger = logging.getLogger(__name__)
 
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
+_REALESTATE_TRIGGERS = re.compile(
+    r"\b(unit|юнит|brochure|брошюр|floor\s*plan|планировк|price\s*list|прайс|"
+    r"bedroom|спальн|villa|вилла|available|наличи|"
+    r"видео|video\s*tour|фото|render|renders|"
+    r"presentation|презентац|каталог|catalog|"
+    r"apartment|апартамент|availability|pdf)\b"
+    r"|\b\d{3,5}\b",
+    re.IGNORECASE,
+)
 _WA_BASE = "https://api.green-api.com"
 
 
@@ -232,6 +260,10 @@ def _normalize_phone(wa_id: str) -> str:
 
 def _is_tony_mentioned(text: str) -> bool:
     return bool(_BOT_NAMES.search(text))
+
+
+def _is_realestate_query(text: str) -> bool:
+    return bool(_REALESTATE_TRIGGERS.search(text))
 
 
 def _is_admin(sender_phone: str, agency: Agency) -> bool:
@@ -292,7 +324,7 @@ async def handle_update(data: dict, agency: Agency):
             if not is_group and admin_check:
                 mark_admin_active(agency.id)
                 await _handle_admin_message(chat_id, sender_phone, text, db, agency)
-            elif is_group and _is_tony_mentioned(text):
+            elif is_group and (_is_tony_mentioned(text) or _is_realestate_query(text)):
                 group_title = sender_data.get("chatName", chat_id)
                 await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
             elif not is_group and not admin_check:
@@ -396,18 +428,10 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
     # Non-data files
     if not fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
         await _send_wa(chat_id,
-                       "❓ Файл не распознан как база данных. Для инвентаря отправьте .xlsx, .xls, .csv "
-                       "или PDF с названием «Инвентарий».")
+                       "❓ Файл не распознан. Для инвентаря отправьте .xlsx, .xls, .csv или .pdf.")
         return
 
-    # PDF without inventory keyword → brochure, not inventory
-    if not _wa_is_inventory(file_name, caption):
-        await _send_wa(chat_id,
-                       f"📄 PDF «{file_name}» сохранён как брошюра.\n"
-                       "Чтобы загрузить как инвентарий, напишите «Инвентарий» в названии файла или подписи.")
-        return
-
-    await _send_wa(chat_id, f"📊 Читаю инвентарий *{file_name}*...")
+    await _send_wa(chat_id, f"📊 Читаю *{file_name}*...")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -477,7 +501,12 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 
     saved = [r for r in results if r["status"] != "skipped"]
     if not saved:
-        await _send_wa(chat_id, "❌ Юниты не найдены.")
+        if fname_lower.endswith(".pdf"):
+            await _send_wa(chat_id,
+                           f"📄 PDF «{file_name}» — брошюра (данных о юнитах не найдено).\n"
+                           "Чтобы агенты могли получить её — загрузи файл в Google Drive в папку проекта.")
+        else:
+            await _send_wa(chat_id, "❌ Юниты не найдены в файле. Проверь формат таблицы.")
         return
 
     import drive_service as _drive

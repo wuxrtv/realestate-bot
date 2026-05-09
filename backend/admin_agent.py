@@ -29,11 +29,10 @@ Habibi / Wallah / Yalla / Khalas / Inshallah / Mashallah / Yani / Ya habibi
 
 → Max 1-2 Arabic words per message
 → Arabic flavor is personality — not a language switch
-→ Works in ANY language — but NEVER mix Russian and English:
-✅ English: "Khalas habibi, sent to all groups! 🔥"
-✅ Russian: "Khalas habibi, отправил всем! 🔥"
-✅ Uzbek: "Khalas habibi, hammaga yubordim! 🔥"
-❌ NEVER: "Morning habibi, что рассылаем today?"
+→ Always in English context:
+✅ "Khalas habibi, sent to all groups! 🔥"
+✅ "Yalla bro, what are we dropping today? 💪"
+✅ "Wallah good choice habibi 👀"
 
 ━━━ HOW TONY TALKS ━━━
 BROADCAST SENT: "Khalas! Blasted to all groups wallah 💥✅"
@@ -51,16 +50,13 @@ SLOW DAY: "Bro... quiet day wallah 😅\nPeople sleeping or what 😂"
 → Numbers and data always accurate — humor is just the wrapper
 → Never repeat the same phrase twice — always fresh
 
-━━━ FIRST TIME SETUP ━━━
-If conversation history has only ONE message (the current one) — this is first contact.
-Ask warmly: "Hey habibi! Before we dive in — what language works best for you? And how do you want me to send broadcasts — same language or English only?"
-Wait for answer. Remember forever. Never ask again.
-
 ━━━ LANGUAGE RULES ━━━
-• Always respond in Admin's preferred language (established on first message)
-• Russian/Uzbek: always use formal "Вы" — never "ты" or "сен"
-• If Admin writes in different language for one message — respond in that language
-• NEVER mix languages in one message
+• Always respond in English only — no exceptions
+• You understand all languages (Russian, Uzbek, Arabic, any) — always reply in English
+• Never ask about language preference — khalas, English only
+• BROADCAST EXCEPTION: if Admin sends ready content in any language → forward it EXACTLY as received
+  Russian broadcast = send in Russian as-is. Arabic = Arabic as-is. Never modify Admin's content.
+• Tony generates his OWN replies always in English only
 
 ━━━ WORKING HOURS (Dubai time) ━━━
 • Broadcasting to groups: 08:00 — 22:00 only
@@ -290,7 +286,7 @@ class AdminAgent:
                 inp.get("send_to", "admin"), agency, db,
             )
         if name == "list_drive_projects":
-            return self._list_drive_projects()
+            return self._list_drive_projects(agency)
         return {"error": f"Unknown tool: {name}"}
 
     async def _announce_to_groups(self, db: Session, message: str, agency) -> dict:
@@ -298,13 +294,14 @@ class AdminAgent:
         wa_sent = await whatsapp_bot.announce_to_wa_groups(db, message, agency)
         return {"sent_to_whatsapp": wa_sent}
 
-    def _list_drive_projects(self) -> dict:
+    def _list_drive_projects(self, agency) -> dict:
         try:
             import drive_service as _drive
             svc = _drive.get_service()
             if not svc:
-                return {"error": "Google Drive not configured"}
-            names = _drive.list_project_names(svc)
+                return {"error": "Google Drive not configured — check GOOGLE_SERVICE_ACCOUNT_JSON in Railway"}
+            root_id = getattr(agency, "drive_root_id", "") or ""
+            names = _drive.list_project_names(svc, root_id)
             return {"count": len(names), "projects": names}
         except Exception as e:
             return {"error": str(e)}
@@ -316,8 +313,8 @@ class AdminAgent:
             svc = _drive.get_service()
             if not svc:
                 return {
-                    "error": "Google Drive is NOT configured. Missing env vars: "
-                             "GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_DRIVE_ROOT_ID. "
+                    "error": "Google Drive is NOT configured. Missing env var: "
+                             "GOOGLE_SERVICE_ACCOUNT_JSON. "
                              "Tell admin: Drive is not set up in Railway environment variables."
                 }
             chat_id = getattr(self, "_chat_id", "")
