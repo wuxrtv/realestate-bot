@@ -42,7 +42,7 @@ def get_service():
         sa_email = info.get("client_email", "unknown")
         creds = service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
         _svc = build("drive", "v3", credentials=creds, cache_discovery=False)
-        logger.info(f"Drive: service initialized OK | sa={sa_email} | root={root_id}")
+        logger.info(f"Drive: service initialized OK | sa={sa_email}")
         logger.info(f"Drive: IMPORTANT — share root folder with: {sa_email}")
         return _svc
     except json.JSONDecodeError as e:
