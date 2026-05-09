@@ -226,12 +226,19 @@ class AdminAgent:
         conv, history = self._load_history(db, agency.id, user_id)
         history.append({"role": "user", "content": message})
 
+        # Build system prompt: client-specific character + base rules
+        client_character = getattr(agency, "bot_character", "") or ""
+        if client_character.strip():
+            system = client_character.strip() + "\n\n" + ADMIN_SYSTEM_PROMPT
+        else:
+            system = ADMIN_SYSTEM_PROMPT
+
         try:
             for _ in range(5):
                 response = await self.client.messages.create(
                     model="claude-sonnet-4-6",
                     max_tokens=2000,
-                    system=ADMIN_SYSTEM_PROMPT,
+                    system=system,
                     tools=ADMIN_TOOLS,
                     messages=history,
                 )

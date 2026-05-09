@@ -20,6 +20,10 @@ def init_db():
     _migrate()
     _seed_default_agency()
     _sync_env_to_default_agency()
+    # Load client config files and sync to DB
+    import client_registry
+    client_registry.load_all()
+    client_registry.sync_to_db()
 
 
 def _migrate():
@@ -30,6 +34,7 @@ def _migrate():
         ("agencies",      "wa_token",         "TEXT"),
         ("agencies",      "wa_admin_numbers", "TEXT"),
         ("agencies",      "drive_root_id",    "TEXT DEFAULT ''"),
+        ("agencies",      "bot_character",    "TEXT DEFAULT ''"),
     ]
     with engine.connect() as conn:
         for table, col, typedef in additions:

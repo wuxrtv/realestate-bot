@@ -25,6 +25,7 @@ class Agency(Base):
     wa_token = Column(String, default="")           # Green API token
     wa_admin_numbers = Column(_json_type, default=list)  # ["79001234567", ...]
     drive_root_id = Column(String, default="")      # Google Drive root folder ID for this agency
+    bot_character = Column(Text, default="")        # custom Tony personality for this agency
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=func.now())
 

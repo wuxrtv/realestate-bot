@@ -550,6 +550,26 @@ async def _save_project(name: str, sheets: dict, user_id: str,
         return {"status": "created", "name": name, "units": len(unit_index), "version": 1}
 
 
+def _resolve_agency_from_message(data: dict, db) -> Agency | None:
+    """Find the correct agency for an incoming message by sender phone number."""
+    import client_registry
+    sender_data = data.get("senderData", {})
+    sender_wid = sender_data.get("sender", "")
+    sender_phone = sender_wid.split("@")[0]
+    if sender_phone:
+        cfg = client_registry.find_by_phone(sender_phone)
+        if cfg:
+            return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
+    # For group messages — look up group's agency
+    chat_id = sender_data.get("chatId", "")
+    if chat_id.endswith("@g.us"):
+        from models import WhatsAppGroup
+        group = db.query(WhatsAppGroup).filter(WhatsAppGroup.chat_id == chat_id).first()
+        if group and group.agency_id:
+            return db.query(Agency).filter(Agency.id == group.agency_id, Agency.is_active == True).first()
+    return None
+
+
 async def _bg_wa_webhook(data: dict, agency_id: int):
     """Background task — processes WhatsApp update with its own DB session."""
     db = SessionLocal()
@@ -570,7 +590,11 @@ async def whatsapp_webhook(slug: str, request: Request, background_tasks: Backgr
     data = await request.json()
     db = SessionLocal()
     try:
-        agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
+        # First: try to identify client by sender phone
+        agency = _resolve_agency_from_message(data, db)
+        # Fallback: use agency from URL slug
+        if not agency:
+            agency = db.query(Agency).filter(Agency.slug == slug, Agency.is_active == True).first()
         agency_id = agency.id if agency else None
     finally:
         db.close()
