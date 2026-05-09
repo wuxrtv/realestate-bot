@@ -390,7 +390,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
     # Photos and videos are not inventory — inform admin
     if fname_lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".avi")):
         await _send_wa(chat_id,
-                       "📷 Фото/видео получено. Для добавления в базу брошюр используйте Telegram-канал агентства.")
+                       "📷 Фото/видео получено. Чтобы добавить в базу — загрузи файл в Google Drive в папку проекта.")
         return
 
     # Non-data files
