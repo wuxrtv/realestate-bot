@@ -184,7 +184,9 @@ def _wa_url(instance_id: str, token: str, method: str) -> str:
     return f"{_WA_BASE}/waInstance{instance_id}/{method}/{token}"
 
 
-async def _send_wa(instance_id: str, token: str, chat_id: str, text: str) -> bool:
+async def _send_wa(chat_id: str, text: str) -> bool:
+    instance_id = os.getenv("WA_INSTANCE_ID", "")
+    token = os.getenv("WA_TOKEN", "")
     if not instance_id or not token:
         logger.warning("WhatsApp credentials not configured")
         return False
@@ -315,7 +317,7 @@ _STRANGER_MSGS = [
 
 async def _handle_stranger_message(chat_id: str, agency: Agency):
     msg = random.choice(_STRANGER_MSGS).format(contact=agency.umar_contact or "@support")
-    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, msg)
+    await _send_wa(chat_id, msg)
 
 
 # ─── WhatsApp scheduled jobs ──────────────────────────────────────────────────
@@ -328,12 +330,12 @@ async def send_wa_morning_greeting():
     try:
         agencies = db.query(Agency).filter(Agency.is_active == True).all()
         for agency in agencies:
-            if not agency.wa_instance_id or not agency.wa_token:
+            if not os.getenv("WA_INSTANCE_ID"):
                 continue
             pool = _MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS
             greeting = random.choice(pool)
             for phone in (agency.wa_admin_numbers or []):
-                await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", greeting)
+                await _send_wa(f"{phone}@c.us", greeting)
     finally:
         db.close()
 
@@ -344,7 +346,7 @@ async def send_wa_morning_followup():
     try:
         agencies = db.query(Agency).filter(Agency.is_active == True).all()
         for agency in agencies:
-            if not agency.wa_instance_id or not agency.wa_token:
+            if not os.getenv("WA_INSTANCE_ID"):
                 continue
             state = _day_state(agency.id)
             if state["morning_replied"] or state["follow_up_sent"]:
@@ -352,7 +354,7 @@ async def send_wa_morning_followup():
             state["follow_up_sent"] = True
             msg = random.choice(_FOLLOWUP_MSGS)
             for phone in (agency.wa_admin_numbers or []):
-                await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", msg)
+                await _send_wa(f"{phone}@c.us", msg)
     finally:
         db.close()
 
@@ -363,13 +365,13 @@ async def send_wa_midday_checkin():
     try:
         agencies = db.query(Agency).filter(Agency.is_active == True).all()
         for agency in agencies:
-            if not agency.wa_instance_id or not agency.wa_token:
+            if not os.getenv("WA_INSTANCE_ID"):
                 continue
             if _day_state(agency.id)["morning_replied"]:
                 continue
             msg = random.choice(_MIDDAY_MSGS)
             for phone in (agency.wa_admin_numbers or []):
-                await _send_wa(agency.wa_instance_id, agency.wa_token, f"{phone}@c.us", msg)
+                await _send_wa(f"{phone}@c.us", msg)
     finally:
         db.close()
 
@@ -387,25 +389,25 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 
     # Photos and videos are not inventory — inform admin
     if fname_lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".mp4", ".mov", ".avi")):
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        "📷 Фото/видео получено. Для добавления в базу брошюр используйте Telegram-канал агентства.")
         return
 
     # Non-data files
     if not fname_lower.endswith((".xlsx", ".xls", ".csv", ".pdf")):
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        "❓ Файл не распознан как база данных. Для инвентаря отправьте .xlsx, .xls, .csv "
                        "или PDF с названием «Инвентарий».")
         return
 
     # PDF without inventory keyword → brochure, not inventory
     if not _wa_is_inventory(file_name, caption):
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        f"📄 PDF «{file_name}» сохранён как брошюра.\n"
                        "Чтобы загрузить как инвентарий, напишите «Инвентарий» в названии файла или подписи.")
         return
 
-    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"📊 Читаю инвентарий *{file_name}*...")
+    await _send_wa(chat_id, f"📊 Читаю инвентарий *{file_name}*...")
 
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -413,7 +415,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
             file_bytes = resp.content
     except Exception:
         logger.exception("WA file download error")
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Не удалось скачать файл.")
+        await _send_wa(chat_id, "❌ Не удалось скачать файл.")
         return
 
     try:
@@ -424,11 +426,11 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         else:
             sheets_data = parse_excel(file_bytes)
     except Exception as e:
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, f"❌ Ошибка чтения файла: {e}")
+        await _send_wa(chat_id, f"❌ Ошибка чтения файла: {e}")
         return
 
     if not sheets_data:
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Файл пустой или без данных.")
+        await _send_wa(chat_id, "❌ Файл пустой или без данных.")
         return
 
     # All sheets → ONE project (same logic as Telegram bot)
@@ -475,7 +477,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 
     saved = [r for r in results if r["status"] != "skipped"]
     if not saved:
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, "❌ Юниты не найдены.")
+        await _send_wa(chat_id, "❌ Юниты не найдены.")
         return
 
     if len(saved) == 1:
@@ -490,7 +492,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
             lines.append(f"{'🔄' if r['status'] == 'updated' else '📁'} {r['name']} — {r['units']} юн.")
         msg = "\n".join(lines)
 
-    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, msg)
+    await _send_wa(chat_id, msg)
 
 
 # ─── Admin private message ────────────────────────────────────────────────────
@@ -508,7 +510,7 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
         if conv:
             conv.history = []
             db.commit()
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        "Khalas habibi — memory cleared! Fresh start 🔄🔥")
         return
 
@@ -516,10 +518,10 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
     try:
         reply = await agent.process(agency, f"wa_{sender_phone}", text, db, chat_id=chat_id)
         if reply and reply.strip():
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, reply)
+            await _send_wa(chat_id, reply)
     except Exception:
         logger.exception("WA admin agent error")
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        "Something went wrong, please try again.")
 
 
@@ -567,7 +569,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         parsed = json.loads(match.group())
     except Exception:
         logger.exception(f"WA Claude error for: {text[:80]}")
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        f"Ya habibi, something went wrong 😅 Contact {contact} 🙏")
         return
 
@@ -580,7 +582,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         if unit_numbers:
             await _respond_unit(chat_id, unit_numbers, projects, agency)
         else:
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+            await _send_wa(chat_id,
                            f"Ya habibi, which unit number? 😅 Contact {contact} 🙏")
     elif intent == "property_search":
         if project_name and project_name not in keywords:
@@ -598,15 +600,14 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                 file_id, file_name, export_mime = drive_result
                 file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if file_bytes:
-                    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                    await _send_wa(chat_id,
                                    f"Wallah great project habibi! 🏙️\nHere's the brochure 👇")
-                    await _send_wa_file(agency.wa_instance_id, agency.wa_token,
-                                        chat_id, file_bytes, file_name,
+                    await _send_wa_file(chat_id, file_bytes, file_name,
                                         f"{search_name} — Brochure 📄")
                     sent = True
         if not sent:
             contact = agency.umar_contact or "@support"
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+            await _send_wa(chat_id,
                            f"Ya habibi, brochure not found in Drive 😅 Contact {contact} 🙏")
     elif intent == "photo_request":
         import drive_service as _drive
@@ -617,17 +618,16 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         if svc and search_name:
             photos = _drive.find_photos(svc, search_name, limit=5, agency_root_id=root_id)
             if photos:
-                await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                await _send_wa(chat_id,
                                f"Wallah habibi — {search_name} photos incoming 📸👇")
                 for file_id, file_name in photos:
                     file_bytes = _drive.download_file(svc, file_id)
                     if file_bytes:
-                        await _send_wa_file(agency.wa_instance_id, agency.wa_token,
-                                            chat_id, file_bytes, file_name)
+                        await _send_wa_file(chat_id, file_bytes, file_name)
                 sent = True
         if not sent:
             contact = agency.umar_contact or "@support"
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+            await _send_wa(chat_id,
                            f"Ya habibi, no photos found in Drive 😅 Contact {contact} 🙏")
     elif intent == "video_request":
         import drive_service as _drive
@@ -641,20 +641,19 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                 file_id, file_name, export_mime = drive_result
                 file_bytes = _drive.download_file(svc, file_id, export_mime)
                 if file_bytes:
-                    await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                    await _send_wa(chat_id,
                                    f"Yalla habibi — {search_name} video 🎬👇")
-                    await _send_wa_file(agency.wa_instance_id, agency.wa_token,
-                                        chat_id, file_bytes, file_name,
+                    await _send_wa_file(chat_id, file_bytes, file_name,
                                         f"{search_name} 🎬")
                     sent = True
         if not sent:
             contact = agency.umar_contact or "@support"
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+            await _send_wa(chat_id,
                            f"Ya habibi, no video found in Drive 😅 Contact {contact} 🙏")
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id, reply)
+            await _send_wa(chat_id, reply)
 
     history.append({"role": "assistant", "content": raw})
     _save_group_history(db, conv, history)
@@ -662,9 +661,11 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
 
 # ─── Send file via WhatsApp ───────────────────────────────────────────────────
 
-async def _send_wa_file(instance_id: str, token: str, chat_id: str,
+async def _send_wa_file(chat_id: str,
                         file_bytes: bytes, file_name: str, caption: str = "") -> bool:
     """Send file to WhatsApp via Green API sendFileByUpload."""
+    instance_id = os.getenv("WA_INSTANCE_ID", "")
+    token = os.getenv("WA_TOKEN", "")
     if not instance_id or not token:
         return False
     url = _wa_url(instance_id, token, "sendFileByUpload")
@@ -716,14 +717,13 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                         file_id, file_name = drive_result
                         file_bytes = _drive.download_file(svc, file_id)
                         if file_bytes:
-                            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                            await _send_wa(chat_id,
                                            f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
-                            await _send_wa_file(agency.wa_instance_id, agency.wa_token,
-                                                chat_id, file_bytes, file_name, card)
+                            await _send_wa_file(chat_id, file_bytes, file_name, card)
                             break
 
                 # No Drive file — send text card
-                await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                await _send_wa(chat_id,
                                f"Wallah good choice habibi! 👀\n{card}")
                 break
 
@@ -738,12 +738,12 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 if alts:
                     break
 
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+            await _send_wa(chat_id,
                            f"Ya habibi — Unit {unit} not available right now 😔\n"
                            f"Sold or reserved wallah\n\nBut check these 👇" if alts else
                            f"Ya habibi — Unit {unit} not found 😔 Contact {contact} 🙏")
             for u_num, u_data, p_name in alts[:2]:
-                await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+                await _send_wa(chat_id,
                                format_unit_card(u_num, u_data, p_name))
 
 
@@ -774,10 +774,10 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
 
     if matched:
         for unit_num, data, proj_name in matched[:3]:
-            await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+            await _send_wa(chat_id,
                            format_unit_card(unit_num, data, proj_name))
     else:
-        await _send_wa(agency.wa_instance_id, agency.wa_token, chat_id,
+        await _send_wa(chat_id,
                        f"No matches found habibi 😅 Specify project, floor or room count — or contact {contact} 🙏")
 
 
@@ -791,7 +791,7 @@ async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> in
     for i, g in enumerate(groups):
         if i > 0:
             await asyncio.sleep(30)
-        await _send_wa(agency.wa_instance_id, agency.wa_token, g.chat_id, message)
+        await _send_wa(g.chat_id, message)
     return len(groups)
 
 
@@ -806,8 +806,7 @@ async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: 
     for i, g in enumerate(groups):
         if i > 0:
             await asyncio.sleep(30)
-        ok = await _send_wa_file(agency.wa_instance_id, agency.wa_token,
-                                  g.chat_id, file_bytes, file_name, caption)
+        ok = await _send_wa_file(g.chat_id, file_bytes, file_name, caption)
         if ok:
             sent += 1
     logger.info(f"announce_file_to_wa_groups: sent to {sent}/{len(groups)} groups")

@@ -295,9 +295,7 @@ class AdminAgent:
 
     async def _announce_to_groups(self, db: Session, message: str, agency) -> dict:
         import whatsapp_bot
-        wa_sent = 0
-        if agency.wa_instance_id and agency.wa_token:
-            wa_sent = await whatsapp_bot.announce_to_wa_groups(db, message, agency)
+        wa_sent = await whatsapp_bot.announce_to_wa_groups(db, message, agency)
         return {"sent_to_whatsapp": wa_sent}
 
     def _list_drive_projects(self) -> dict:
@@ -347,9 +345,7 @@ class AdminAgent:
                 if send_to == "groups":
                     n = await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, caption, agency)
                     return {"sent_to_groups": n, "file_name": file_name}
-                ok = await whatsapp_bot._send_wa_file(
-                    agency.wa_instance_id, agency.wa_token, chat_id, file_bytes, file_name, caption,
-                )
+                ok = await whatsapp_bot._send_wa_file(chat_id, file_bytes, file_name, caption)
                 return {"sent_to_admin": ok, "file_name": file_name}
 
             elif file_type == "photo":
@@ -367,9 +363,7 @@ class AdminAgent:
                     if send_to == "groups":
                         await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
                     else:
-                        await whatsapp_bot._send_wa_file(
-                            agency.wa_instance_id, agency.wa_token, chat_id, file_bytes, file_name,
-                        )
+                        await whatsapp_bot._send_wa_file(chat_id, file_bytes, file_name)
                     sent_count += 1
                 return {"sent": sent_count, "total": len(photos), "destination": send_to}
 
@@ -388,9 +382,7 @@ class AdminAgent:
                 if send_to == "groups":
                     n = await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, caption, agency)
                     return {"sent_to_groups": n, "file_name": file_name}
-                ok = await whatsapp_bot._send_wa_file(
-                    agency.wa_instance_id, agency.wa_token, chat_id, file_bytes, file_name, caption,
-                )
+                ok = await whatsapp_bot._send_wa_file(chat_id, file_bytes, file_name, caption)
                 return {"sent_to_admin": ok, "file_name": file_name}
 
             return {"error": f"Unknown file_type: {file_type}"}
