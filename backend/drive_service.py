@@ -157,6 +157,18 @@ _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 _PDF_EXT = ".pdf"
 _BROCHURE_KEYWORDS = {"brochure", "брошюр", "presentation", "презентац", "catalog", "каталог", "флайер", "flyer"}
 
+# Subfolder name hints for the new Drive structure:
+#   ProjectName/media/        ← photos, videos, brochures
+#   ProjectName/sales office/ ← unit PDFs, floor plans
+_MEDIA_FOLDER_NAMES = frozenset({
+    "media", "медиа", "photos", "photo", "фото", "фотографии",
+    "materials", "marketing", "материалы", "renders", "рендеры",
+})
+_OFFICE_FOLDER_NAMES = frozenset({
+    "salesoffice", "sales", "office", "офис",
+    "units", "юниты", "inventory", "инвентарь", "прайс",
+})
+
 
 def _ext(name: str) -> str:
     return ("." + name.rsplit(".", 1)[-1]).lower() if "." in name else ""
@@ -199,6 +211,48 @@ def _collect_files(svc, folder_id: str) -> list:
         elif not item["mimeType"].startswith("application/vnd.google-apps"):
             files.append(item)
     return files
+
+
+def _find_named_subfolder(svc, proj_id: str, name_hints: frozenset) -> Optional[str]:
+    """Return the first direct subfolder of proj_id whose name matches any hint."""
+    items = _list_folder(svc, proj_id)
+    for item in items:
+        if item["mimeType"] != "application/vnd.google-apps.folder":
+            continue
+        name_l = item["name"].lower().replace(" ", "").replace("_", "").replace("-", "")
+        for hint in name_hints:
+            h = hint.lower().replace(" ", "").replace("_", "").replace("-", "")
+            if h == name_l or h in name_l or name_l in h:
+                logger.info(f"Drive: subfolder '{item['name']}' matched hint '{hint}'")
+                return item["id"]
+    return None
+
+
+def find_all_media(svc, project_name: str, limit: int = 15, agency_root_id: str = "") -> list:
+    """Return ALL media files from the project's 'media' subfolder (photos, videos, PDFs).
+    Falls back to the whole project folder if no 'media' subfolder is found.
+    Returns list of (file_id, name, export_mime).
+    """
+    try:
+        proj_id = _find_project_folder(svc, project_name, agency_root_id)
+        if not proj_id:
+            return []
+        media_id = _find_named_subfolder(svc, proj_id, _MEDIA_FOLDER_NAMES)
+        search_id = media_id or proj_id
+        files = _collect_files(svc, search_id)
+        result = [
+            (f["id"], f["name"], f.get("_export_mime", ""))
+            for f in files
+            if _is_photo(f["name"]) or _is_video(f["name"]) or _is_brochure(f["name"])
+        ]
+        logger.info(
+            f"Drive: find_all_media '{project_name}' → {len(result)} files "
+            f"({'media subfolder' if media_id else 'project root fallback'})"
+        )
+        return result[:limit]
+    except Exception:
+        logger.exception(f"Drive: find_all_media failed {project_name}")
+    return []
 
 
 def find_brochure(svc, project_name: str, agency_root_id: str = "") -> Optional[tuple]:
@@ -260,12 +314,17 @@ def find_video(svc, project_name: str, agency_root_id: str = "") -> Optional[tup
 
 
 def find_unit_file(svc, project_name: str, unit_number: str, agency_root_id: str = "") -> Optional[tuple]:
-    """Find any file for a unit (e.g. '1507.pdf'). Returns (file_id, name) or None."""
+    """Find any file for a unit (e.g. '1507.pdf').
+    Looks in 'sales office' subfolder first, then falls back to whole project.
+    Returns (file_id, name) or None.
+    """
     try:
         proj_id = _find_project_folder(svc, project_name, agency_root_id)
         if not proj_id:
             return None
-        files = _collect_files(svc, proj_id)
+        office_id = _find_named_subfolder(svc, proj_id, _OFFICE_FOLDER_NAMES)
+        search_id = office_id or proj_id
+        files = _collect_files(svc, search_id)
         unit_lower = unit_number.lower()
         for f in files:
             if unit_lower in f["name"].lower():

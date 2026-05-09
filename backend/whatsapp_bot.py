@@ -101,7 +101,7 @@ You are in a group chat with real estate agents. Your name is Tony.
 
 Respond ONLY with valid JSON (no markdown, no code blocks):
 {
-  "intent": "unit_query" | "brochure_request" | "photo_request" | "video_request" | "property_search" | "direct_question" | "off_topic",
+  "intent": "unit_query" | "media_request" | "property_search" | "direct_question" | "off_topic",
   "unit_numbers": ["1507", "1435"],
   "project_name": "project name or null",
   "keywords": ["2 rooms", "villa", "floor 20"],
@@ -132,17 +132,15 @@ ALWAYS read the FULL conversation history before responding.
 → If you asked and got NO answer yet — still use off_topic, do not repeat the question
 
 Examples:
-• History shows "SAAS Hills" being discussed → someone says "send brochure"
-  → project_name = "SAAS Hills", intent = brochure_request ← NO questions asked
+• History shows "SAAS Hills" being discussed → someone says "send brochure" or "photos" or "video"
+  → project_name = "SAAS Hills", intent = media_request ← NO questions asked
 • No project in history → "send brochure"
   → intent = direct_question, reply lists available projects
-• "send me SAAS Hills brochure" → project_name = "SAAS Hills", intent = brochure_request ← immediate
+• "send me SAAS Hills brochure" → project_name = "SAAS Hills", intent = media_request ← immediate
 
 ━━━ INTENT RULES ━━━
 • unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
-• brochure_request: asking for brochure, PDF, price list, or project presentation
-• photo_request: asking for photos, pictures, renders of a project ("фото", "photo", "pictures", "renders")
-• video_request: asking for video, tour of a project ("видео", "video", "tour", "ролик")
+• media_request: asking for ANY media — brochure, PDF, photos, renders, video, tour, presentation ("фото", "photo", "brochure", "видео", "video", "renders", "tour", "ролик", "брошюра")
 • property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
 • direct_question: any other work question — answer in "reply" using the project context below
 • off_topic: personal talk or unrelated topic — leave reply as empty string
@@ -622,68 +620,25 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         if project_name and project_name not in keywords:
             keywords = [project_name] + keywords
         await _respond_search(chat_id, keywords, projects, agency)
-    elif intent == "brochure_request":
+    elif intent == "media_request":
         import drive_service as _drive
         svc = _drive.get_service()
         sent = False
         root_id = getattr(agency, "drive_root_id", "") or ""
         search_name = project_name or (keywords[0] if keywords else "")
         if svc and search_name:
-            drive_result = _drive.find_brochure(svc, search_name, root_id)
-            if drive_result:
-                file_id, file_name, export_mime = drive_result
-                file_bytes = _drive.download_file(svc, file_id, export_mime)
-                if file_bytes:
-                    await _send_wa(chat_id,
-                                   f"Wallah great project habibi! 🏙️\nHere's the brochure 👇")
-                    await _send_wa_file(chat_id, file_bytes, file_name,
-                                        f"{search_name} — Brochure 📄")
-                    sent = True
-        if not sent:
-            contact = agency.umar_contact or "@support"
-            await _send_wa(chat_id,
-                           f"Ya habibi, brochure not found in Drive 😅 Contact {contact} 🙏")
-    elif intent == "photo_request":
-        import drive_service as _drive
-        svc = _drive.get_service()
-        sent = False
-        root_id = getattr(agency, "drive_root_id", "") or ""
-        search_name = project_name or (keywords[0] if keywords else "")
-        if svc and search_name:
-            photos = _drive.find_photos(svc, search_name, limit=5, agency_root_id=root_id)
-            if photos:
-                await _send_wa(chat_id,
-                               f"Wallah habibi — {search_name} photos incoming 📸👇")
-                for file_id, file_name in photos:
-                    file_bytes = _drive.download_file(svc, file_id)
+            media_files = _drive.find_all_media(svc, search_name, limit=15, agency_root_id=root_id)
+            if media_files:
+                await _send_wa(chat_id, f"Yalla habibi — {search_name} media incoming 📸🎬👇")
+                for file_id, file_name, export_mime in media_files:
+                    file_bytes = _drive.download_file(svc, file_id, export_mime)
                     if file_bytes:
                         await _send_wa_file(chat_id, file_bytes, file_name)
                 sent = True
         if not sent:
             contact = agency.umar_contact or "@support"
             await _send_wa(chat_id,
-                           f"Ya habibi, no photos found in Drive 😅 Contact {contact} 🙏")
-    elif intent == "video_request":
-        import drive_service as _drive
-        svc = _drive.get_service()
-        sent = False
-        root_id = getattr(agency, "drive_root_id", "") or ""
-        search_name = project_name or (keywords[0] if keywords else "")
-        if svc and search_name:
-            drive_result = _drive.find_video(svc, search_name, root_id)
-            if drive_result:
-                file_id, file_name, export_mime = drive_result
-                file_bytes = _drive.download_file(svc, file_id, export_mime)
-                if file_bytes:
-                    await _send_wa(chat_id,
-                                   f"Yalla habibi — {search_name} video 🎬👇")
-                    await _send_wa_file(chat_id, file_bytes, file_name,
-                                        f"{search_name} 🎬")
-                    sent = True
-        if not sent:
-            contact = agency.umar_contact or "@support"
-            await _send_wa(chat_id,
-                           f"Ya habibi, no video found in Drive 😅 Contact {contact} 🙏")
+                           f"Ya habibi, no media found in Drive 😅 Contact {contact} 🙏")
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
