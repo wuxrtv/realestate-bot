@@ -152,10 +152,14 @@ async def _bg_webhook(data: dict, agency_id: int):
 @app.post("/whatsapp/webhook/{slug}")
 async def whatsapp_webhook(slug: str, request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
+    webhook_type = data.get("typeWebhook", "?")
+    sender = data.get("senderData", {}).get("sender", "?")
+    logger.info(f"WEBHOOK IN: type={webhook_type} sender={sender}")
     db = SessionLocal()
     try:
         agency = _resolve_agency(data, db)
         agency_id = agency.id if agency else None
+        logger.info(f"WEBHOOK agency={'found:'+str(agency_id) if agency_id else 'NOT FOUND'}")
     finally:
         db.close()
     if agency_id:
