@@ -287,7 +287,7 @@ class AdminAgent:
         if name == "send_drive_file":
             return await self._send_drive_file(
                 inp["project_name"], inp.get("file_type", "brochure"),
-                inp.get("send_to", "admin"), agency,
+                inp.get("send_to", "admin"), agency, db,
             )
         if name == "list_drive_projects":
             return self._list_drive_projects()
@@ -309,7 +309,7 @@ class AdminAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _send_drive_file(self, project_name: str, file_type: str, send_to: str, agency) -> dict:
+    async def _send_drive_file(self, project_name: str, file_type: str, send_to: str, agency, db: Session) -> dict:
         try:
             import drive_service as _drive
             import whatsapp_bot

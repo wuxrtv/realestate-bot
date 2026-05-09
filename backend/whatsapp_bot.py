@@ -701,6 +701,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
     import drive_service as _drive
     svc = _drive.get_service()
     contact = agency.umar_contact or "@support"
+    root_id = getattr(agency, "drive_root_id", "") or ""
 
     for unit in unit_numbers[:3]:
         found = False
@@ -712,7 +713,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
 
                 # Try Drive first — send PDF/file if available
                 if svc:
-                    drive_result = _drive.find_unit_file(svc, proj.project_name, unit)
+                    drive_result = _drive.find_unit_file(svc, proj.project_name, unit, root_id)
                     if drive_result:
                         file_id, file_name = drive_result
                         file_bytes = _drive.download_file(svc, file_id)

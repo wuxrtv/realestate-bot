@@ -133,7 +133,8 @@ def _resolve_agency(data: dict, db) -> Agency | None:
         if group and group.agency_id:
             return db.query(Agency).filter(Agency.id == group.agency_id, Agency.is_active == True).first()
 
-    return db.query(Agency).filter(Agency.slug == "default", Agency.is_active == True).first()
+    logger.warning(f"_resolve_agency: no client found for sender={sender_phone} chat={chat_id} — ignoring")
+    return None
 
 
 async def _bg_webhook(data: dict, agency_id: int):

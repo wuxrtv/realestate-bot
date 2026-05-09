@@ -18,12 +18,8 @@ def get_service():
     if _svc:
         return _svc
     creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "")
-    root_id = os.getenv("GOOGLE_DRIVE_ROOT_ID", "")
     if not creds_json:
         logger.error("Drive: GOOGLE_SERVICE_ACCOUNT_JSON env var is NOT SET — Drive disabled")
-        return None
-    if not root_id:
-        logger.error("Drive: GOOGLE_DRIVE_ROOT_ID env var is NOT SET — Drive disabled")
         return None
     try:
         from google.oauth2 import service_account
