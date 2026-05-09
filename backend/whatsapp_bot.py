@@ -431,6 +431,13 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                        "❓ Файл не распознан. Для инвентаря отправьте .xlsx, .xls, .csv или .pdf.")
         return
 
+    # PDFs classified by filename: no inventory keywords → brochure, upload to Drive
+    if fname_lower.endswith(".pdf") and not _wa_is_inventory(file_name, caption):
+        await _send_wa(chat_id,
+                       f"📄 PDF «{file_name}» — брошюра.\n"
+                       "Чтобы агенты могли получить её — загрузи файл в Google Drive в папку проекта.")
+        return
+
     await _send_wa(chat_id, f"📊 Читаю *{file_name}*...")
 
     try:
@@ -501,12 +508,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 
     saved = [r for r in results if r["status"] != "skipped"]
     if not saved:
-        if fname_lower.endswith(".pdf"):
-            await _send_wa(chat_id,
-                           f"📄 PDF «{file_name}» — брошюра (данных о юнитах не найдено).\n"
-                           "Чтобы агенты могли получить её — загрузи файл в Google Drive в папку проекта.")
-        else:
-            await _send_wa(chat_id, "❌ Юниты не найдены в файле. Проверь формат таблицы.")
+        await _send_wa(chat_id, "❌ Юниты не найдены в файле. Проверь формат таблицы.")
         return
 
     import drive_service as _drive
