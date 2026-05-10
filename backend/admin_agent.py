@@ -96,6 +96,7 @@ Groups = WhatsApp groups. That's it.
 • "what projects", "show database", "is there Breez" → list_projects
 • "unit 1507", "show 2301", "any 3-bedrooms" → search_units
 • "broadcast text to groups", "announce text" → announce_to_groups
+• "send 3 units", "скинь юниты", "отправь 5 юнитов в группы" → send_inventory_to_groups (count=N)
 • "send brochure/video/photo/media TO GROUPS" → send_drive_file (send_to="groups")
 • "send me brochure/video/photo/media" (to admin only) → send_drive_file (send_to="admin")
 • Any media request without "to groups" → send_drive_file (send_to="admin")
@@ -195,6 +196,24 @@ ADMIN_TOOLS = [
         "description": "List all project folders available in Google Drive.",
         "input_schema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "send_inventory_to_groups",
+        "description": "Pick N random units from inventory and send their cards to all WhatsApp groups. Use this when Admin says 'send 3 units', 'скинь юниты', 'отправь 5 юнитов' etc.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "count": {
+                    "type": "integer",
+                    "description": "Number of units to send per group (default 3, max 10)",
+                },
+                "project_name": {
+                    "type": "string",
+                    "description": "Optional: filter by project name. Leave empty to pick from all projects.",
+                },
+            },
+            "required": [],
+        },
+    },
 ]
 
 
@@ -293,6 +312,10 @@ class AdminAgent:
             )
         if name == "list_drive_projects":
             return self._list_drive_projects(agency)
+        if name == "send_inventory_to_groups":
+            return await self._send_inventory_to_groups(
+                db, inp.get("count", 3), inp.get("project_name", ""), agency
+            )
         return {"error": f"Unknown tool: {name}"}
 
     async def _announce_to_groups(self, db: Session, message: str, agency) -> dict:
@@ -354,6 +377,71 @@ class AdminAgent:
         except Exception as e:
             logger.exception("send_drive_file tool error")
             return {"error": str(e)}
+
+    async def _send_inventory_to_groups(self, db: Session, count: int, project_name: str, agency) -> dict:
+        import asyncio as _asyncio
+        import random as _random
+        import whatsapp_bot
+        from excel_parser import format_unit_card
+        from models import WhatsAppGroup
+
+        count = max(1, min(count or 3, 10))
+
+        projects = db.query(ToniProject).filter(
+            ToniProject.is_active == True, ToniProject.agency_id == agency.id
+        ).all()
+        if project_name:
+            projects = [p for p in projects if project_name.lower() in p.project_name.lower()]
+
+        all_units: list[tuple[str, dict, str]] = []
+        for proj in projects:
+            for unit_num, unit_data in (proj.unit_index or {}).items():
+                all_units.append((unit_num, unit_data, proj.project_name))
+
+        # Also try Drive inventory
+        import drive_service as _drive
+        svc = _drive.get_service()
+        root_id = getattr(agency, "drive_root_id", "") or ""
+        if svc:
+            seen = {u[0] for u in all_units}
+            search_projects = projects if projects else []
+            for proj in search_projects:
+                try:
+                    drive_idx = _drive.get_project_inventory(svc, proj.project_name, root_id)
+                    for unit_num, unit_data in drive_idx.items():
+                        if unit_num not in seen:
+                            all_units.append((unit_num, unit_data, proj.project_name))
+                            seen.add(unit_num)
+                except Exception:
+                    pass
+
+        if not all_units:
+            return {"error": "No units found in inventory or Drive"}
+
+        picks = _random.sample(all_units, min(count, len(all_units)))
+
+        groups = db.query(WhatsAppGroup).filter(
+            WhatsAppGroup.active == True,
+            WhatsAppGroup.agency_id == agency.id,
+        ).all()
+        if not groups:
+            return {"error": "No active WhatsApp groups registered"}
+
+        sent_groups = 0
+        for i, group in enumerate(groups):
+            if i > 0:
+                await _asyncio.sleep(30)
+            for unit_num, unit_data, proj_name in picks:
+                card = format_unit_card(unit_num, unit_data, proj_name)
+                await whatsapp_bot._send_wa(group.chat_id, card)
+                await _asyncio.sleep(2)
+            sent_groups += 1
+
+        return {
+            "sent_to_groups": sent_groups,
+            "units_sent": len(picks),
+            "units": [u[0] for u in picks],
+        }
 
     def _list_projects(self, db: Session, agency) -> dict:
         projects = (
