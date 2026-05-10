@@ -408,6 +408,83 @@ async def send_wa_midday_checkin():
         db.close()
 
 
+_DAILY_INVENTORY_INTROS = [
+    "Yalla habibi! 🔥 Today's picks from the inventory 👇",
+    "Morning! Check these units — fresh from the list 👇",
+    "Wallah good morning! Here's what I picked for today 👇",
+    "Habibi! Top 3 units for today 🏢 Let's go 👇",
+    "Good morning team! Today's featured units 💼👇",
+    "Yalla let's move! Today's inventory highlights 🔥👇",
+    "Morning habibi! I handpicked these for today 👀👇",
+]
+
+
+async def send_wa_daily_inventory():
+    """10:00 — send 3 auto-selected units to each active WhatsApp group."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not os.getenv("WA_INSTANCE_ID"):
+                continue
+
+            # Collect units from DB
+            projects = db.query(ToniProject).filter(
+                ToniProject.is_active == True,
+                ToniProject.agency_id == agency.id,
+            ).all()
+
+            all_units: list[tuple[str, dict, str]] = []
+            for proj in projects:
+                for unit_num, unit_data in (proj.unit_index or {}).items():
+                    all_units.append((unit_num, unit_data, proj.project_name))
+
+            # Also collect from Drive inventory if available
+            import drive_service as _drive
+            svc = _drive.get_service()
+            root_id = getattr(agency, "drive_root_id", "") or ""
+            if svc and projects:
+                seen_units = {u[0] for u in all_units}
+                for proj in projects:
+                    try:
+                        drive_idx = _drive.get_project_inventory(svc, proj.project_name, root_id)
+                        for unit_num, unit_data in drive_idx.items():
+                            if unit_num not in seen_units:
+                                all_units.append((unit_num, unit_data, proj.project_name))
+                                seen_units.add(unit_num)
+                    except Exception:
+                        pass
+
+            if not all_units:
+                logger.info(f"Daily inventory: no units for agency {agency.id} — skipping")
+                continue
+
+            groups = db.query(WhatsAppGroup).filter(
+                WhatsAppGroup.active == True,
+                WhatsAppGroup.agency_id == agency.id,
+            ).all()
+
+            for i, group in enumerate(groups):
+                if i > 0:
+                    await asyncio.sleep(30)
+
+                picks = random.sample(all_units, min(3, len(all_units)))
+                intro = random.choice(_DAILY_INVENTORY_INTROS)
+                await _send_wa(group.chat_id, intro)
+                await asyncio.sleep(2)
+
+                for unit_num, unit_data, proj_name in picks:
+                    card = format_unit_card(unit_num, unit_data, proj_name)
+                    await _send_wa(group.chat_id, card)
+                    await asyncio.sleep(3)
+
+            logger.info(f"Daily inventory sent: {len(groups)} groups, {len(all_units)} total units available")
+    except Exception:
+        logger.exception("send_wa_daily_inventory error")
+    finally:
+        db.close()
+
+
 # ─── Admin document upload ───────────────────────────────────────────────────
 
 _WA_SAVE_RE = re.compile(
