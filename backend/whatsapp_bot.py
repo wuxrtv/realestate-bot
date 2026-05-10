@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+from typing import Optional
 
 import anthropic
 import httpx
@@ -494,41 +495,168 @@ async def _handle_stranger_message(chat_id: str, agency: Agency):
     await _send_wa(chat_id, msg)
 
 
-# ─── Test schedule mode ───────────────────────────────────────────────────────
+# ─── Daily broadcast — optimized (1 API call per slot, N groups free) ─────────
 
-def _pick_diverse_units(units: list, count: int = 3) -> list:
-    """Pick up to count units trying to use a different unit_type for each."""
-    if not units:
-        return []
-    by_type: dict[str, list] = {}
-    for item in units:
-        _, unit_data, _ = item
-        t = unit_data.get("unit_type", "Other")
-        by_type.setdefault(t, []).append(item)
-    picks: list = []
-    type_list = list(by_type.keys())
-    random.shuffle(type_list)
-    i = 0
-    while len(picks) < count:
-        if not type_list:
+async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: str) -> str:
+    """Generate a WhatsApp sales caption via Claude Haiku — 1 call per broadcast slot."""
+    try:
+        from admin_agent import _parse_price, _get_floor
+        building = unit_data.get("building", "")
+        label = f"{building}-{unit_key}" if building else unit_key
+        u_type = unit_data.get("unit_type", "Unit")
+        floor_val = unit_data.get("floor") or _get_floor(unit_key, unit_data)
+        price_raw = _parse_price(unit_data)
+        price_str = f"AED {int(price_raw):,}".replace(",", " ") if price_raw else "price on request"
+        view = (unit_data.get("View") or unit_data.get("view", "")).strip()
+        payment = unit_data.get("payment_plan", "")
+
+        prompt = (
+            "You are TONY — Dubai real estate AI. Write a short WhatsApp group caption for this sales offer.\n"
+            "Rules: max 5 lines, plain text only (no markdown, no asterisks, no bullet symbols), "
+            "Dubai energy, 1-2 Arabic words (habibi/wallah/yalla/khalas), fire/home emojis ok.\n\n"
+            f"Unit: {label}\nProject: {project_name}\nType: {u_type}\n"
+            f"Floor: {floor_val or 'unknown'}\nPrice: {price_str}\n"
+            f"View: {view or 'city view'}\nPayment: {payment or 'flexible'}"
+        )
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=200,
+            system=[{"type": "text", "text": "You are Tony, Dubai real estate AI. Reply ONLY with the caption text — nothing else.", "cache_control": {"type": "ephemeral"}}],
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return (resp.content[0].text or "").strip()
+    except Exception:
+        logger.exception("_generate_offer_caption error")
+        return ""
+
+
+async def _send_offer_for_agency(
+    agency,
+    db,
+    unit_type: str,
+    slot_label: str,
+    notify_admin: bool = True,
+    group_delay: int = 20,
+) -> dict:
+    """Core broadcast: pick unit → caption ONCE → PDF ONCE → send to ALL groups → notify admin.
+
+    Cost: 1 Claude API call per slot regardless of group count.
+    """
+    import pdf_index as _idx
+    import drive_service as _drive
+    from admin_agent import _parse_price
+
+    # 1. Pick unit from index
+    all_units = _idx.as_unit_list(agency.id)
+    if not all_units:
+        logger.info(f"Daily offer [{slot_label}]: index empty for agency {agency.id}")
+        return {"error": "no_index"}
+
+    if unit_type:
+        pool = [u for u in all_units if unit_type.lower() in u[1].get("unit_type", "").lower()]
+        if not pool:
+            logger.info(f"Daily offer [{slot_label}]: no '{unit_type}' units — using any")
+            pool = all_units
+    else:
+        pool = all_units
+
+    unit_key, unit_data, proj_name = random.choice(pool)
+
+    # 2. Generate caption ONCE (1 API call)
+    caption = await _generate_offer_caption(unit_key, unit_data, proj_name)
+    if not caption:
+        caption = format_unit_card(unit_key, unit_data, proj_name)
+
+    # 3. Download PDF ONCE
+    svc = _drive.get_service()
+    file_id = unit_data.get("file_id", "")
+    pdf_bytes: Optional[bytes] = None
+    filename = unit_data.get("filename", f"{unit_key}.pdf")
+    if file_id and svc:
+        try:
+            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+        except Exception:
+            logger.exception(f"PDF download failed for {filename}")
+
+    # 4. Send SAME caption + PDF to ALL groups
+    groups = db.query(WhatsAppGroup).filter(
+        WhatsAppGroup.active == True,
+        WhatsAppGroup.agency_id == agency.id,
+    ).all()
+
+    sent_count = 0
+    for i, group in enumerate(groups):
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
             break
-        t = type_list[i % len(type_list)]
-        pool = by_type.get(t, [])
-        if pool:
-            chosen = random.choice(pool)
-            picks.append(chosen)
-            pool.remove(chosen)
-            if not pool:
-                type_list.remove(t)
-        i += 1
-    return picks
+        if i > 0:
+            await asyncio.sleep(group_delay)
+        await _send_wa(group.chat_id, caption)
+        if pdf_bytes:
+            await asyncio.sleep(1)
+            await _send_wa_file(group.chat_id, pdf_bytes, filename, "")
+        sent_count += 1
 
+    # 5. Notify admin
+    if notify_admin:
+        building = unit_data.get("building", "")
+        label = f"{building}-{unit_key}" if building else unit_key
+        u_type = unit_data.get("unit_type", "")
+        price_raw = _parse_price(unit_data)
+        price_str = f"AED {int(price_raw):,}".replace(",", " ") if price_raw else "price TBD"
+        admin_msg = (
+            f"📤 {slot_label} done habibi!\n"
+            f"Unit {label} {u_type} — {price_str}\n"
+            f"Sent to {sent_count} group(s) ✅\n"
+            f"Caption generated once — forwarded to all khalas 💪"
+        )
+        for phone in (agency.wa_admin_numbers or []):
+            await _send_wa(f"{phone}@c.us", admin_msg)
+
+    logger.info(f"Daily offer [{slot_label}]: unit={unit_key} sent to {sent_count} groups")
+    return {"unit": unit_key, "caption": caption, "sent": sent_count}
+
+
+async def _send_daily_offer_slot(unit_type: str, slot_label: str):
+    """Scheduler entry: run one offer slot across all active agencies."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not os.getenv("WA_INSTANCE_ID"):
+                continue
+            try:
+                await _send_offer_for_agency(agency, db, unit_type, slot_label, group_delay=20)
+            except Exception:
+                logger.exception(f"Offer slot [{slot_label}] failed for agency {agency.id}")
+    except Exception:
+        logger.exception(f"_send_daily_offer_slot error: {slot_label}")
+    finally:
+        db.close()
+
+
+async def send_daily_offer_11am():
+    """11:00 — Studio offer to all groups."""
+    await _send_daily_offer_slot("Studio", "11AM 🌅")
+
+
+async def send_daily_offer_14pm():
+    """14:00 — 1BR offer to all groups."""
+    await _send_daily_offer_slot("1 Bedroom", "2PM ☀️")
+
+
+async def send_daily_offer_17pm():
+    """17:00 — 2BR offer to all groups."""
+    await _send_daily_offer_slot("2 Bedroom", "5PM 🌆")
+
+
+# ─── Test schedule mode ────────────────────────────────────────────────────────
 
 async def run_test_schedule(chat_id: str, agency_id: int):
     """Simulate a full day schedule with 10-second gaps (triggered by 'test schedule')."""
     from datetime import datetime as _dt
     import pdf_index as _idx
-    import drive_service as _drive
 
     db = SessionLocal()
     try:
@@ -547,89 +675,54 @@ async def run_test_schedule(chat_id: str, agency_id: int):
 
         # ── Step 1: 08:00 — Morning greeting → admin ──────────────────────────
         is_friday = _dt.now().weekday() == 4
-        pool = _MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS
-        morning_msg = random.choice(pool)
+        morning_msg = random.choice(_MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS)
         await _send_wa(chat_id, f"☀️ *[08:00 TEST]* Morning greeting:\n\n{morning_msg}")
         await asyncio.sleep(10)
 
         # ── Step 2: 08:45 — Follow-up → admin ────────────────────────────────
-        followup_msg = random.choice(_FOLLOWUP_MSGS)
-        await _send_wa(chat_id, f"📲 *[08:45 TEST]* Follow-up (when admin hasn't replied):\n\n{followup_msg}")
+        await _send_wa(chat_id, f"📲 *[08:45 TEST]* Follow-up:\n\n{random.choice(_FOLLOWUP_MSGS)}")
         await asyncio.sleep(10)
 
-        # ── Steps 3–5: 10:00 / 14:00 / 17:00 — Sales offers → groups ─────────
-        all_units = _idx.as_unit_list(agency_id)
+        # ── Steps 3–5: Offer slots — same logic as real schedule, 3-sec group gap ─
+        slots = [
+            ("11:00", "Studio",     "11AM 🌅 TEST"),
+            ("14:00", "1 Bedroom",  "2PM ☀️ TEST"),
+            ("17:00", "2 Bedroom",  "5PM 🌆 TEST"),
+        ]
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
             WhatsAppGroup.agency_id == agency_id,
         ).all()
-        svc = _drive.get_service()
 
-        picks = _pick_diverse_units(all_units, 3)
-        if not picks and all_units:
-            picks = random.sample(all_units, min(3, len(all_units)))
-
-        if not picks:
-            await _send_wa(
-                chat_id,
-                "⚠️ *No units in index* — run 'update database' first!\n"
-                "Skipping sales offer steps 📭"
+        for t_str, unit_type, slot_lbl in slots:
+            await _send_wa(chat_id, f"📦 *[{t_str} TEST]* Generating {unit_type} caption (1 API call)...")
+            result = await _send_offer_for_agency(
+                agency, db, unit_type, slot_lbl,
+                notify_admin=False, group_delay=3,
             )
-        else:
-            slot_labels = [
-                ("10:00", "🌅 Morning pick"),
-                ("14:00", "☀️ Afternoon pick"),
-                ("17:00", "🌆 Evening pick"),
-            ]
-            for i, (unit_key, unit_data, proj_name) in enumerate(picks):
-                t_str, step_label = slot_labels[i] if i < 3 else (f"T+{i}", "Pick")
-                card = format_unit_card(unit_key, unit_data, proj_name)
-
-                # Notify admin what's going to groups
+            if result.get("error"):
+                await _send_wa(chat_id, f"⚠️ No units in index — run 'update database' first!\nSkipping {unit_type} step.")
+            else:
                 await _send_wa(
                     chat_id,
-                    f"📦 *[{t_str} TEST]* {step_label} — sending to *{len(groups)}* group(s):\n\n{card}"
+                    f"✅ {unit_type} sent to {result['sent']} group(s)\n"
+                    f"Caption preview:\n\n{result['caption']}"
                 )
-
-                # Send to every group
-                intro = random.choice(_DAILY_INVENTORY_INTROS)
-                for group in groups:
-                    await _send_wa(group.chat_id, f"🧪 *[TEST]* {intro}")
-                    await asyncio.sleep(1)
-                    file_id = unit_data.get("file_id", "")
-                    sent_pdf = False
-                    if file_id and svc:
-                        try:
-                            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                            if pdf_bytes:
-                                fname = unit_data.get("filename", f"{unit_key}.pdf")
-                                await _send_wa_file(group.chat_id, pdf_bytes, fname, "")
-                                sent_pdf = True
-                        except Exception:
-                            pass
-                    if not sent_pdf:
-                        await _send_wa(group.chat_id, card)
-
-                if i < len(picks) - 1:
-                    await asyncio.sleep(10)
-
-        await asyncio.sleep(10)
+            await asyncio.sleep(10)
 
         # ── Step 6: 20:00 — End of day report → admin only ────────────────────
         info = _idx.index_info(agency_id)
-        unit_count = info.get("count", 0)
         built_at = (info.get("built_at", "") or "")[:16].replace("T", " ")
         report = (
             f"🌙 *[20:00 TEST]* End of day report:\n\n"
-            f"📦 Sent *{len(picks)}* unit(s) to *{len(groups)}* group(s)\n"
-            f"🏢 Units in index: *{unit_count}*\n"
+            f"📦 3 offers sent (Studio + 1BR + 2BR)\n"
+            f"👥 Groups: {len(groups)}\n"
+            f"🏢 Units in index: {info.get('count', 0)}\n"
             f"🕐 Index built: {built_at or 'not built yet'}\n\n"
             f"Tomorrow starts at 8AM inshallah 🙏"
         )
         await _send_wa(chat_id, report)
         await asyncio.sleep(2)
-
-        # ── Final confirmation ─────────────────────────────────────────────────
         await _send_wa(chat_id, "Test complete wallah! ✅\nAll schedule functions working 🔥")
 
     except Exception:
