@@ -454,11 +454,11 @@ async def send_wa_daily_inventory():
                 for unit_num, unit_data in (proj.unit_index or {}).items():
                     all_units.append((unit_num, unit_data, proj.project_name))
 
-            # Also collect from Drive inventory if available
+            # Also collect from Drive inventory (Excel) + sales offer PDFs
             import drive_service as _drive
             svc = _drive.get_service()
             root_id = getattr(agency, "drive_root_id", "") or ""
-            if svc and projects:
+            if svc:
                 seen_units = {u[0] for u in all_units}
                 for proj in projects:
                     try:
@@ -469,6 +469,14 @@ async def send_wa_daily_inventory():
                                 seen_units.add(unit_num)
                     except Exception:
                         pass
+                try:
+                    offers = _drive.scan_sales_offers(svc, root_id)
+                    for unit_key, offer_data in offers.items():
+                        if unit_key not in seen_units:
+                            all_units.append((unit_key, offer_data, offer_data.get("project_name", "Project")))
+                            seen_units.add(unit_key)
+                except Exception:
+                    pass
 
             if not all_units:
                 logger.info(f"Daily inventory: no units for agency {agency.id} — skipping")
@@ -882,6 +890,34 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                     card = format_unit_card(unit, drive_idx[unit], p_name)
                     await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
                     break
+
+        # 3. Fallback: scan sales offer PDFs (SH_A311_40.60_1B.pdf)
+        if not found and svc:
+            try:
+                offers = _drive.scan_sales_offers(svc, root_id)
+                # Try exact match and "BUILDING+UNIT" match (e.g. "A311" for unit "311")
+                offer_data = offers.get(unit)
+                if not offer_data:
+                    for key, val in offers.items():
+                        if val.get("unit_number") == unit:
+                            offer_data = val
+                            break
+                if offer_data:
+                    enriched = _drive.enrich_offer_from_pdf(svc, offer_data)
+                    proj_name = enriched.get("project_name", "Project")
+                    card = format_unit_card(unit, enriched, proj_name)
+                    found = True
+                    # Also try to send the PDF file
+                    file_id = enriched.get("file_id", "")
+                    if file_id:
+                        file_bytes = _drive.download_file(svc, file_id)
+                        if file_bytes:
+                            await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                            await _send_wa_file(chat_id, file_bytes, enriched.get("filename", "offer.pdf"), "")
+                    else:
+                        await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+            except Exception:
+                logger.exception("_respond_unit: scan_sales_offers failed")
 
         if not found:
             alts = []

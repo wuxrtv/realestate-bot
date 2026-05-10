@@ -90,6 +90,7 @@ _folder_cache: dict[str, tuple[list, float]] = {}         # folder_id → (items
 _project_cache: dict[str, tuple[Optional[str], float]] = {}  # "root|name" → (folder_id, ts)
 _inventory_cache: dict[str, tuple[dict, float]] = {}         # "root|project" → (unit_index, ts)
 _offers_cache: dict[str, tuple[dict, float]] = {}            # "root" → (offers_index, ts)
+_pdf_data_cache: dict[str, tuple[dict, float]] = {}          # file_id → (extracted_data, ts)
 
 
 def clear_cache():
@@ -98,6 +99,7 @@ def clear_cache():
     _project_cache.clear()
     _inventory_cache.clear()
     _offers_cache.clear()
+    _pdf_data_cache.clear()
     logger.info("Drive: cache cleared")
 
 
@@ -495,6 +497,81 @@ def get_project_inventory(svc, project_name: str, agency_root_id: str = "") -> d
     return {}
 
 
+_PDF_PRICE_RE = re.compile(
+    r"(?:price|total|amount|aed|cost|value)[^\d]{0,20}([\d][,\d\s\.]{2,15})",
+    re.IGNORECASE,
+)
+_PDF_SIZE_RE = re.compile(
+    r"([\d,\.]+)\s*(?:sq\.?\s*ft|sqft|sq\.?\s*m|sqm|м²|кв\.?\s*м)",
+    re.IGNORECASE,
+)
+_PDF_VIEW_RE = re.compile(
+    r"(?:view|вид)[^\w]{0,10}([\w\s]+?)(?:\n|,|\.|$)",
+    re.IGNORECASE,
+)
+
+
+def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
+    """Extract price, size, and view from a sales offer PDF using pdfplumber text extraction.
+    Returns dict with keys: price, size, view (all strings, may be empty).
+    """
+    result: dict[str, str] = {"price": "", "size": "", "view": ""}
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            text = "\n".join(page.extract_text() or "" for page in pdf.pages[:3])
+
+        m = _PDF_PRICE_RE.search(text)
+        if m:
+            raw = m.group(1).replace(",", "").replace(" ", "").strip()
+            try:
+                num = float(raw)
+                if num >= 100_000:
+                    result["price"] = f"{int(num):,} AED".replace(",", " ")
+            except ValueError:
+                pass
+
+        m = _PDF_SIZE_RE.search(text)
+        if m:
+            result["size"] = m.group(0).strip()
+
+        m = _PDF_VIEW_RE.search(text)
+        if m:
+            result["view"] = m.group(1).strip().title()
+
+    except Exception:
+        logger.debug("extract_offer_data_from_pdf: pdfplumber not available or parse error")
+
+    return result
+
+
+def enrich_offer_from_pdf(svc, offer_data: dict) -> dict:
+    """Download offer PDF and extract price/size/view. Returns enriched copy (cached per file_id)."""
+    file_id = offer_data.get("file_id", "")
+    if not file_id:
+        return offer_data
+    now = time.time()
+    if file_id in _pdf_data_cache:
+        extra, ts = _pdf_data_cache[file_id]
+        if now - ts < _CACHE_TTL:
+            return {**offer_data, **extra}
+    extra: dict = {}
+    try:
+        pdf_bytes = download_file(svc, file_id)
+        if pdf_bytes:
+            inner = extract_offer_data_from_pdf(pdf_bytes)
+            if inner.get("price"):
+                extra["Price"] = inner["price"]
+            if inner.get("size"):
+                extra["Size"] = inner["size"]
+            if inner.get("view"):
+                extra["View"] = inner["view"]
+    except Exception:
+        pass
+    _pdf_data_cache[file_id] = (extra, now)
+    return {**offer_data, **extra}
+
+
 def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
     """Scan all project folders for PDFs matching the offer naming pattern.
 
@@ -529,7 +606,11 @@ def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
         for proj_folder in project_folders:
             office_id = _find_named_subfolder(svc, proj_folder["id"], _OFFICE_FOLDER_NAMES)
             search_ids = [office_id, proj_folder["id"]] if office_id else [proj_folder["id"]]
+            seen_sid: set[str] = set()
             for sid in search_ids:
+                if sid in seen_sid:
+                    continue
+                seen_sid.add(sid)
                 files = _list_folder(svc, sid)
                 for f in files:
                     if not f["name"].lower().endswith(".pdf"):
@@ -538,11 +619,7 @@ def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
                     if not parsed:
                         continue
                     unit_key = f"{parsed['building']}{parsed['unit_number']}"
-                    idx[unit_key] = {
-                        **parsed,
-                        "file_id": f["id"],
-                        "filename": f["name"],
-                    }
+                    idx[unit_key] = {**parsed, "file_id": f["id"], "filename": f["name"]}
 
         logger.info(f"Drive: scan_sales_offers → {len(idx)} offers found")
     except Exception:
