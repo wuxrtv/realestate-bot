@@ -442,19 +442,32 @@ class AdminAgent:
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+    @staticmethod
+    def _dubai_today() -> str:
+        from datetime import datetime, timezone, timedelta
+        return datetime.now(timezone(timedelta(hours=4))).strftime("%Y-%m-%d")
+
     def _load_history(self, db: Session, agency_id: int, user_id: str) -> tuple[AdminConversation, list]:
         conv = db.query(AdminConversation).filter(
             AdminConversation.agency_id == agency_id,
             AdminConversation.user_id == user_id,
         ).first()
+        today = self._dubai_today()
         if not conv:
-            conv = AdminConversation(agency_id=agency_id, user_id=user_id, history=[])
+            conv = AdminConversation(agency_id=agency_id, user_id=user_id, history=[], conversation_date=today)
             db.add(conv)
             db.flush()
+        elif conv.conversation_date != today:
+            # New day — reset history
+            logger.info(f"AdminAgent: new day ({today}), resetting history for user {user_id}")
+            conv.history = []
+            conv.conversation_date = today
+            db.commit()
         return conv, list(conv.history or [])
 
     def _save_history(self, db: Session, conv: AdminConversation, history: list):
-        conv.history = history[-30:]
+        conv.history = history  # full day — no artificial cut
+        conv.conversation_date = self._dubai_today()
         conv.updated_at = __import__("datetime").datetime.now()
         flag_modified(conv, "history")
         db.commit()

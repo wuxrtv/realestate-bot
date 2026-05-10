@@ -39,22 +39,34 @@ def mark_admin_active(agency_id: int):
 
 # ─── Group conversation history ───────────────────────────────────────────────
 
+def _dubai_today() -> str:
+    from datetime import datetime, timezone, timedelta
+    return datetime.now(timezone(timedelta(hours=4))).strftime("%Y-%m-%d")
+
+
 def _load_group_history(db, agency_id: int, chat_id: str):
     from datetime import datetime as _dt
     conv = db.query(GroupConversation).filter(
         GroupConversation.agency_id == agency_id,
         GroupConversation.chat_id == chat_id,
     ).first()
+    today = _dubai_today()
     if not conv:
-        conv = GroupConversation(agency_id=agency_id, chat_id=chat_id, history=[])
+        conv = GroupConversation(agency_id=agency_id, chat_id=chat_id, history=[], conversation_date=today)
         db.add(conv)
         db.flush()
+    elif conv.conversation_date != today:
+        logger.info(f"GroupConv: new day ({today}), resetting history for chat {chat_id}")
+        conv.history = []
+        conv.conversation_date = today
+        db.commit()
     return conv, list(conv.history or [])
 
 
 def _save_group_history(db, conv, history: list):
     from datetime import datetime as _dt
-    conv.history = history[-20:]
+    conv.history = history  # full day history, no artificial cut
+    conv.conversation_date = _dubai_today()
     conv.updated_at = _dt.now()
     flag_modified(conv, "history")
     db.commit()
