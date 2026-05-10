@@ -168,6 +168,23 @@ async def whatsapp_webhook(slug: str, request: Request, background_tasks: Backgr
     return {"ok": True}
 
 
+# ─── One-time manual send ────────────────────────────────────────────────────
+
+@app.get("/send-once")
+async def send_once(phone: str, pwd: str):
+    if not secrets.compare_digest(pwd.encode(), _OWNER_PASSWORD.encode()):
+        return {"ok": False, "error": "wrong password"}
+    msg = (
+        "Habibi! 👋 Tony here — wallah I was delayed studying your setup "
+        "and learning everything about you 😄\n"
+        "All good now bro — yalla, ready to work! 🔥\n"
+        "Let me know what you need inshallah 🤲"
+    )
+    chat_id = f"{phone.lstrip('+').replace(' ', '')}@c.us"
+    ok = await whatsapp_bot._send_wa(chat_id, msg)
+    return {"ok": ok, "sent_to": chat_id}
+
+
 # ─── Health ───────────────────────────────────────────────────────────────────
 
 @app.get("/health")
