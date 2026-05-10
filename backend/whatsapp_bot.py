@@ -293,6 +293,30 @@ def _is_realestate_query(text: str) -> bool:
     return bool(_REALESTATE_TRIGGERS.search(text))
 
 
+async def _transcribe_audio(audio_bytes: bytes) -> str:
+    """Transcribe voice message using Groq Whisper. Returns empty string on failure."""
+    api_key = os.getenv("GROQ_API_KEY", "")
+    if not api_key:
+        logger.warning("_transcribe_audio: GROQ_API_KEY not set — voice messages disabled")
+        return ""
+    try:
+        import io
+        from groq import AsyncGroq
+        client = AsyncGroq(api_key=api_key)
+        # Groq expects a file-like object with a name attribute
+        buf = io.BytesIO(audio_bytes)
+        buf.name = "voice.ogg"
+        result = await client.audio.transcriptions.create(
+            model="whisper-large-v3",
+            file=buf,
+            response_format="text",
+        )
+        return (result or "").strip()
+    except Exception:
+        logger.exception("_transcribe_audio error")
+        return ""
+
+
 def _is_admin(sender_phone: str, agency: Agency) -> bool:
     for num in (agency.wa_admin_numbers or []):
         clean = num.lstrip("+").strip()
@@ -314,7 +338,8 @@ async def handle_update(data: dict, agency: Agency):
     msg_type = message_data.get("typeMessage")
     logger.info(f"WA message type: {msg_type}")
 
-    if msg_type not in ("textMessage", "documentMessage", "imageMessage", "videoMessage"):
+    _AUDIO_TYPES = {"audioMessage", "pttMessage"}  # ptt = push-to-talk (voice note)
+    if msg_type not in ("textMessage", "documentMessage", "imageMessage", "videoMessage", *_AUDIO_TYPES):
         return
 
     sender_data = data.get("senderData", {})
@@ -335,6 +360,7 @@ async def handle_update(data: dict, agency: Agency):
 
     db = SessionLocal()
     try:
+        # ── File messages (admin private chat) ──────────────────────────────────
         if msg_type in ("documentMessage", "imageMessage", "videoMessage") and not is_group and admin_check:
             file_data = message_data.get("fileMessageData", {})
             download_url = file_data.get("downloadUrl", "")
@@ -343,6 +369,33 @@ async def handle_update(data: dict, agency: Agency):
             if download_url:
                 mark_admin_active(agency.id)
                 await _handle_admin_document(chat_id, sender_phone, download_url, file_name, caption, db, agency)
+
+        # ── Voice / audio messages ───────────────────────────────────────────────
+        elif msg_type in ("audioMessage", "pttMessage"):
+            file_data = message_data.get("fileMessageData", {})
+            download_url = file_data.get("downloadUrl", "")
+            if not download_url:
+                return
+            try:
+                async with httpx.AsyncClient(timeout=60) as client:
+                    resp = await client.get(download_url)
+                    audio_bytes = resp.content
+            except Exception:
+                logger.exception("WA voice download error")
+                return
+            text = await _transcribe_audio(audio_bytes)
+            if not text:
+                logger.info("WA voice: transcription empty — skipping")
+                return
+            logger.info(f"WA voice transcribed ({len(text)} chars): {text[:80]!r}")
+            if not is_group and admin_check:
+                mark_admin_active(agency.id)
+                await _handle_admin_message(chat_id, sender_phone, f"[Voice] {text}", db, agency)
+            elif is_group and (_is_tony_mentioned(text) or _is_realestate_query(text)):
+                group_title = sender_data.get("chatName", chat_id)
+                await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
+
+        # ── Text messages ────────────────────────────────────────────────────────
         elif msg_type == "textMessage":
             text: str = message_data.get("textMessageData", {}).get("textMessage", "").strip()
             logger.info(f"WA from={sender_wid} chat={chat_id} text={text[:50]!r}")
