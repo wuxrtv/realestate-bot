@@ -898,16 +898,14 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
             phone=_SPECIALIST_PHONE, handle=_SPECIALIST_HANDLE,
         )
         await _send_wa(chat_id, group_reply)
-        # ACTION 2 — notify admin privately
-        admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
-        if admin_numbers:
-            admin_chat_id = f"{admin_numbers[0]}@c.us"
-            notif = random.choice(_DISCOUNT_ADMIN_NOTIFS).format(
-                name=sender_name,
-                group=group_title,
-                question=text[:200],
-            )
-            await _send_wa(admin_chat_id, notif)
+        # ACTION 2 — notify ALL admins privately
+        notif = random.choice(_DISCOUNT_ADMIN_NOTIFS).format(
+            name=sender_name,
+            group=group_title,
+            question=text[:200],
+        )
+        for phone in (getattr(agency, "wa_admin_numbers", []) or []):
+            await _send_wa(f"{phone}@c.us", notif)
 
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
