@@ -294,24 +294,22 @@ def _is_realestate_query(text: str) -> bool:
 
 
 async def _transcribe_audio(audio_bytes: bytes) -> str:
-    """Transcribe voice message using Groq Whisper. Returns empty string on failure."""
-    api_key = os.getenv("GROQ_API_KEY", "")
+    """Transcribe voice message using OpenAI Whisper. Returns empty string on failure."""
+    api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
-        logger.warning("_transcribe_audio: GROQ_API_KEY not set — voice messages disabled")
+        logger.warning("_transcribe_audio: OPENAI_API_KEY not set — voice messages disabled")
         return ""
     try:
         import io
-        from groq import AsyncGroq
-        client = AsyncGroq(api_key=api_key)
-        # Groq expects a file-like object with a name attribute
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=api_key)
         buf = io.BytesIO(audio_bytes)
         buf.name = "voice.ogg"
         result = await client.audio.transcriptions.create(
-            model="whisper-large-v3",
+            model="whisper-1",
             file=buf,
-            response_format="text",
         )
-        return (result or "").strip()
+        return (result.text or "").strip()
     except Exception:
         logger.exception("_transcribe_audio error")
         return ""
