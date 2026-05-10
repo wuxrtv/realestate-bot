@@ -285,6 +285,7 @@ Groups = WhatsApp groups. That's it.
 • "send me brochure/video/photo/media" (to admin only) → send_drive_file (send_to="admin")
 • Any media request without "to groups" → send_drive_file (send_to="admin")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
+• "update database" / "обнови базу" / "refresh prices" / "rescan" → rebuild_index
 
 ━━━ CRITICAL — CONTEXT & SINGLE UNIT REQUESTS ━━━
 
@@ -511,6 +512,11 @@ ADMIN_TOOLS = [
         },
     },
     {
+        "name": "rebuild_index",
+        "description": "Rebuild the PDF search index by scanning all Google Drive PDFs and extracting price/size/view data. Use when admin says 'update database', 'обнови базу', 'refresh index', 'update prices', 'rescan drive'.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "send_inventory_to_groups",
         "description": "Pick exactly N units (filtered + optionally sorted) and send to WhatsApp groups OR admin. For 'cheapest'/'most expensive' requests — use sort_by to get exact order. count='all' sends ALL matching units.",
         "input_schema": {
@@ -667,6 +673,8 @@ class AdminAgent:
                 inp.get("send_to", "admin"),
                 agency, db,
             )
+        if name == "rebuild_index":
+            return await self._rebuild_index(agency)
         if name == "send_inventory_to_groups":
             return await self._send_inventory_to_groups(
                 db,
@@ -692,6 +700,23 @@ class AdminAgent:
         import whatsapp_bot
         wa_sent = await whatsapp_bot.announce_to_wa_groups(db, message, agency)
         return {"sent_to_whatsapp": wa_sent}
+
+    async def _rebuild_index(self, agency) -> dict:
+        import pdf_index as _idx
+        chat_id = getattr(self, "_chat_id", "")
+        if chat_id:
+            import whatsapp_bot
+            await whatsapp_bot._send_wa(chat_id, "Yalla habibi — scanning Drive 🔍 Give me a minute...")
+        try:
+            count = await _idx.build_index(agency)
+            info = _idx.index_info(agency.id)
+            return {
+                "rebuilt": True,
+                "units_indexed": count,
+                "built_at": info.get("built_at", ""),
+            }
+        except Exception as e:
+            return {"error": str(e)}
 
     def _list_drive_projects(self, agency) -> dict:
         try:
@@ -901,50 +926,60 @@ class AdminAgent:
             for unit_num, unit_data in (proj.unit_index or {}).items():
                 all_units.append((unit_num, unit_data, proj.project_name))
 
-        # Drive: inventory Excel files + sales offer PDFs
-        import drive_service as _drive
-        svc = _drive.get_service()
-        root_id = getattr(agency, "drive_root_id", "") or ""
-        if svc:
-            seen = {u[0] for u in all_units}
-            # Inventory files (Excel/CSV)
-            search_projects = projects if projects else []
-            for proj in search_projects:
+        seen = {u[0] for u in all_units}
+
+        # Fast path: pre-built index (price/size/view already extracted — no PDF reads)
+        import pdf_index as _idx
+        index_units = _idx.as_unit_list(agency.id, project_name)
+        if index_units:
+            for unit_key, data, proj in index_units:
+                if unit_key not in seen:
+                    all_units.append((unit_key, data, proj))
+                    seen.add(unit_key)
+        else:
+            # Slow path: scan Drive on-the-fly (fallback when index not built yet)
+            import drive_service as _drive
+            svc = _drive.get_service()
+            root_id = getattr(agency, "drive_root_id", "") or ""
+            if svc:
+                for proj in (projects if projects else []):
+                    try:
+                        drive_idx = await asyncio.to_thread(
+                            _drive.get_project_inventory, svc, proj.project_name, root_id
+                        )
+                        for unit_num, unit_data in drive_idx.items():
+                            if unit_num not in seen:
+                                all_units.append((unit_num, unit_data, proj.project_name))
+                                seen.add(unit_num)
+                    except Exception:
+                        pass
                 try:
-                    drive_idx = _drive.get_project_inventory(svc, proj.project_name, root_id)
-                    for unit_num, unit_data in drive_idx.items():
-                        if unit_num not in seen:
-                            all_units.append((unit_num, unit_data, proj.project_name))
-                            seen.add(unit_num)
+                    offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
+                    for unit_key, offer_data in offers.items():
+                        if project_name and project_name.lower() not in offer_data.get("project_name", "").lower():
+                            continue
+                        if unit_key not in seen:
+                            all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
+                            seen.add(unit_key)
                 except Exception:
                     pass
-            # Sales offer PDFs (SH_A311_40.60_1B.pdf pattern)
-            try:
-                offers = _drive.scan_sales_offers(svc, root_id)
-                for unit_key, offer_data in offers.items():
-                    if project_name and project_name.lower() not in offer_data.get("project_name", "").lower():
-                        continue
-                    if unit_key not in seen:
-                        all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
-                        seen.add(unit_key)
-            except Exception:
-                pass
+                # Slow path only: enrich PDFs for price/view filters
+                needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
+                if needs_pdf_read:
+                    enriched_units = []
+                    for unit_num, unit_data, proj_name in all_units:
+                        if unit_data.get("file_id"):
+                            try:
+                                unit_data = await asyncio.to_thread(
+                                    _drive.enrich_offer_from_pdf, svc, unit_data
+                                )
+                            except Exception:
+                                pass
+                        enriched_units.append((unit_num, unit_data, proj_name))
+                    all_units = enriched_units
 
         if not all_units:
             return {"error": "No units found in inventory or Drive"}
-
-        # If price or view filter is needed, enrich sales offer PDFs (read inside them)
-        needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
-        if needs_pdf_read and svc:
-            enriched_units = []
-            for unit_num, unit_data, proj_name in all_units:
-                if unit_data.get("file_id"):
-                    try:
-                        unit_data = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, unit_data)
-                    except Exception:
-                        pass
-                enriched_units.append((unit_num, unit_data, proj_name))
-            all_units = enriched_units
 
         # Apply filters + sort
         filtered = _filter_unit_list(
@@ -1090,13 +1125,39 @@ class AdminAgent:
         payment_plan: str = "", price_min=None, price_max=None, view: str = "",
     ) -> dict:
         from excel_parser import format_unit_card
+        import pdf_index as _idx
 
+        results = []
+
+        has_filter = any([
+            floor is not None, floor_min is not None, floor_max is not None,
+            unit_type, building, payment_plan, price_min is not None, price_max is not None, view,
+        ])
+
+        # Fast path: pre-built index (price/size/view already extracted)
+        index_units = _idx.load_index(agency.id)
+        if index_units:
+            matches = _idx.search_units(
+                agency.id, query=query,
+                floor=floor, floor_min=floor_min, floor_max=floor_max,
+                unit_type=unit_type, building=building, payment_plan=payment_plan,
+                price_min=price_min, price_max=price_max, view=view,
+            )
+            for unit_key, data, proj_name in matches[:limit]:
+                results.append({
+                    "unit": unit_key,
+                    "project": proj_name,
+                    "card": format_unit_card(unit_key, data, proj_name),
+                })
+            if results:
+                return {"found": len(results), "results": results}
+
+        # Slow path: DB + Drive scan (fallback when index not built yet)
         projects = db.query(ToniProject).filter(
             ToniProject.is_active == True, ToniProject.agency_id == agency.id
         ).all()
-        results = []
 
-        # 1. Exact unit-number lookup (if query contains digits)
+        # 1. Exact unit-number lookup in DB
         unit_match = re.search(r"\b(\d{3,5})\b", query) if query else None
         if unit_match:
             unit_num = unit_match.group(1)
@@ -1109,11 +1170,7 @@ class AdminAgent:
                         "card": format_unit_card(unit_num, idx[unit_num], proj.project_name),
                     })
 
-        # 2. Filter-based search
-        has_filter = any([
-            floor is not None, floor_min is not None, floor_max is not None,
-            unit_type, building, payment_plan, price_min is not None, price_max is not None, view,
-        ])
+        # 2. Filter-based search across DB + Drive
         if not results and has_filter:
             all_units: list[tuple] = []
             for proj in projects:
@@ -1127,7 +1184,9 @@ class AdminAgent:
                     seen = {u[0] for u in all_units}
                     for proj in projects:
                         try:
-                            drive_idx = await asyncio.to_thread(_drive.get_project_inventory, svc, proj.project_name, root_id)
+                            drive_idx = await asyncio.to_thread(
+                                _drive.get_project_inventory, svc, proj.project_name, root_id
+                            )
                             for u, d in drive_idx.items():
                                 if u not in seen:
                                     all_units.append((u, d, proj.project_name))
@@ -1142,8 +1201,6 @@ class AdminAgent:
                                 seen.add(unit_key)
                     except Exception:
                         pass
-
-                    # Enrich PDF offers if price or view filter is needed
                     needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
                     if needs_pdf_read:
                         enriched = []
@@ -1157,7 +1214,6 @@ class AdminAgent:
                         all_units = enriched
             except Exception:
                 pass
-
             filtered = _filter_unit_list(
                 all_units,
                 floor=floor, floor_min=floor_min, floor_max=floor_max,
@@ -1172,12 +1228,11 @@ class AdminAgent:
                     "card": format_unit_card(unit_num, data, proj_name),
                 })
 
-        # 3. Keyword fallback
+        # 3. Keyword fallback in DB
         if not results and query:
             kws = query.lower().split()
             for proj in projects:
-                idx = proj.unit_index or {}
-                for unit_num, data in idx.items():
+                for unit_num, data in (proj.unit_index or {}).items():
                     searchable = " ".join(str(v) for v in data.values()).lower()
                     if any(kw in searchable for kw in kws):
                         results.append({

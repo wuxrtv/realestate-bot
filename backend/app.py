@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse
 
 from database import SessionLocal, init_db
 from models import Agency, ToniProject
+import pdf_index
 import whatsapp_bot
 
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,21 @@ _OWNER_PASSWORD = os.getenv("ADMIN_PASSWORD", "toni2024")
 
 
 # ─── App lifespan ─────────────────────────────────────────────────────────────
+
+async def _rebuild_all_indexes():
+    """Rebuild PDF index for every active agency. Runs at 07:00 Dubai time."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            try:
+                count = await pdf_index.build_index(agency)
+                logger.info(f"Index rebuilt: agency={agency.slug} units={count}")
+            except Exception:
+                logger.exception(f"Index rebuild failed for agency {agency.slug}")
+    finally:
+        db.close()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,8 +61,20 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(whatsapp_bot.send_wa_morning_followup,  "cron", hour=8,  minute=45, id="wa_followup")
     scheduler.add_job(whatsapp_bot.send_wa_midday_checkin,    "cron", hour=14, minute=0,  id="wa_midday")
     scheduler.add_job(whatsapp_bot.send_wa_daily_inventory,   "cron", hour=10, minute=0,  id="wa_daily_inventory")
+    scheduler.add_job(_rebuild_all_indexes,                    "cron", hour=7,  minute=0,  id="rebuild_index")
     scheduler.start()
     logger.info("Scheduler started")
+
+    # Build PDF index for all active agencies in background
+    import asyncio as _asyncio
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            _asyncio.create_task(pdf_index.build_index(agency))
+            logger.info(f"Index build scheduled for agency {agency.slug}")
+    finally:
+        db.close()
 
     yield
     scheduler.shutdown()
@@ -166,20 +194,6 @@ async def whatsapp_webhook(slug: str, request: Request, background_tasks: Backgr
     if agency_id:
         background_tasks.add_task(_bg_webhook, data, agency_id)
     return {"ok": True}
-
-
-# ─── One-time manual send ────────────────────────────────────────────────────
-
-@app.get("/send-once")
-async def send_once():
-    msg = (
-        "Habibi! 👋 Tony here — wallah I was delayed studying your setup "
-        "and learning everything about you 😄\n"
-        "All good now bro — yalla, ready to work! 🔥\n"
-        "Let me know what you need inshallah 🤲"
-    )
-    ok = await whatsapp_bot._send_wa("971585816776@c.us", msg)
-    return {"ok": ok, "sent_to": "971585816776"}
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
