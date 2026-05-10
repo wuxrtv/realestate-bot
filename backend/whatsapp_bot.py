@@ -250,6 +250,10 @@ _STOP_RE = re.compile(
     r"^(stop|стоп|стопп|cancel|отмена|отмени|хватит|достаточно|stop it|нет не надо)[\s!.?]*$",
     re.IGNORECASE,
 )
+_TEST_SCHEDULE_RE = re.compile(
+    r"\b(test\s+schedule|test\s+mode|тест\s+расписание|тест\s+режим|test\s+scheduler)\b",
+    re.IGNORECASE,
+)
 _REALESTATE_TRIGGERS = re.compile(
     r"\b(unit|юнит|юнитов|юниты|"
     r"brochur|брошюр|брошур|"  # catches brochure, brochur, брошюра, брошура
@@ -488,6 +492,151 @@ _STRANGER_MSGS = [
 async def _handle_stranger_message(chat_id: str, agency: Agency):
     msg = random.choice(_STRANGER_MSGS).format(contact=agency.umar_contact or "@support")
     await _send_wa(chat_id, msg)
+
+
+# ─── Test schedule mode ───────────────────────────────────────────────────────
+
+def _pick_diverse_units(units: list, count: int = 3) -> list:
+    """Pick up to count units trying to use a different unit_type for each."""
+    if not units:
+        return []
+    by_type: dict[str, list] = {}
+    for item in units:
+        _, unit_data, _ = item
+        t = unit_data.get("unit_type", "Other")
+        by_type.setdefault(t, []).append(item)
+    picks: list = []
+    type_list = list(by_type.keys())
+    random.shuffle(type_list)
+    i = 0
+    while len(picks) < count:
+        if not type_list:
+            break
+        t = type_list[i % len(type_list)]
+        pool = by_type.get(t, [])
+        if pool:
+            chosen = random.choice(pool)
+            picks.append(chosen)
+            pool.remove(chosen)
+            if not pool:
+                type_list.remove(t)
+        i += 1
+    return picks
+
+
+async def run_test_schedule(chat_id: str, agency_id: int):
+    """Simulate a full day schedule with 10-second gaps (triggered by 'test schedule')."""
+    from datetime import datetime as _dt
+    import pdf_index as _idx
+    import drive_service as _drive
+
+    db = SessionLocal()
+    try:
+        agency = db.query(Agency).filter(Agency.id == agency_id, Agency.is_active == True).first()
+        if not agency:
+            await _send_wa(chat_id, "❌ Agency not found")
+            return
+
+        await _send_wa(
+            chat_id,
+            "Starting test mode habibi! 🔥\n"
+            "Full day simulation — ~60 seconds ⏱️\n"
+            "Watch what gets sent 👇"
+        )
+        await asyncio.sleep(2)
+
+        # ── Step 1: 08:00 — Morning greeting → admin ──────────────────────────
+        is_friday = _dt.now().weekday() == 4
+        pool = _MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS
+        morning_msg = random.choice(pool)
+        await _send_wa(chat_id, f"☀️ *[08:00 TEST]* Morning greeting:\n\n{morning_msg}")
+        await asyncio.sleep(10)
+
+        # ── Step 2: 08:45 — Follow-up → admin ────────────────────────────────
+        followup_msg = random.choice(_FOLLOWUP_MSGS)
+        await _send_wa(chat_id, f"📲 *[08:45 TEST]* Follow-up (when admin hasn't replied):\n\n{followup_msg}")
+        await asyncio.sleep(10)
+
+        # ── Steps 3–5: 10:00 / 14:00 / 17:00 — Sales offers → groups ─────────
+        all_units = _idx.as_unit_list(agency_id)
+        groups = db.query(WhatsAppGroup).filter(
+            WhatsAppGroup.active == True,
+            WhatsAppGroup.agency_id == agency_id,
+        ).all()
+        svc = _drive.get_service()
+
+        picks = _pick_diverse_units(all_units, 3)
+        if not picks and all_units:
+            picks = random.sample(all_units, min(3, len(all_units)))
+
+        if not picks:
+            await _send_wa(
+                chat_id,
+                "⚠️ *No units in index* — run 'update database' first!\n"
+                "Skipping sales offer steps 📭"
+            )
+        else:
+            slot_labels = [
+                ("10:00", "🌅 Morning pick"),
+                ("14:00", "☀️ Afternoon pick"),
+                ("17:00", "🌆 Evening pick"),
+            ]
+            for i, (unit_key, unit_data, proj_name) in enumerate(picks):
+                t_str, step_label = slot_labels[i] if i < 3 else (f"T+{i}", "Pick")
+                card = format_unit_card(unit_key, unit_data, proj_name)
+
+                # Notify admin what's going to groups
+                await _send_wa(
+                    chat_id,
+                    f"📦 *[{t_str} TEST]* {step_label} — sending to *{len(groups)}* group(s):\n\n{card}"
+                )
+
+                # Send to every group
+                intro = random.choice(_DAILY_INVENTORY_INTROS)
+                for group in groups:
+                    await _send_wa(group.chat_id, f"🧪 *[TEST]* {intro}")
+                    await asyncio.sleep(1)
+                    file_id = unit_data.get("file_id", "")
+                    sent_pdf = False
+                    if file_id and svc:
+                        try:
+                            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+                            if pdf_bytes:
+                                fname = unit_data.get("filename", f"{unit_key}.pdf")
+                                await _send_wa_file(group.chat_id, pdf_bytes, fname, "")
+                                sent_pdf = True
+                        except Exception:
+                            pass
+                    if not sent_pdf:
+                        await _send_wa(group.chat_id, card)
+
+                if i < len(picks) - 1:
+                    await asyncio.sleep(10)
+
+        await asyncio.sleep(10)
+
+        # ── Step 6: 20:00 — End of day report → admin only ────────────────────
+        info = _idx.index_info(agency_id)
+        unit_count = info.get("count", 0)
+        built_at = (info.get("built_at", "") or "")[:16].replace("T", " ")
+        report = (
+            f"🌙 *[20:00 TEST]* End of day report:\n\n"
+            f"📦 Sent *{len(picks)}* unit(s) to *{len(groups)}* group(s)\n"
+            f"🏢 Units in index: *{unit_count}*\n"
+            f"🕐 Index built: {built_at or 'not built yet'}\n\n"
+            f"Tomorrow starts at 8AM inshallah 🙏"
+        )
+        await _send_wa(chat_id, report)
+        await asyncio.sleep(2)
+
+        # ── Final confirmation ─────────────────────────────────────────────────
+        await _send_wa(chat_id, "Test complete wallah! ✅\nAll schedule functions working 🔥")
+
+    except Exception:
+        logger.exception("run_test_schedule error")
+        await _send_wa(chat_id, "❌ Test failed — check logs habibi 😅")
+    finally:
+        db.close()
 
 
 # ─── WhatsApp scheduled jobs ──────────────────────────────────────────────────
@@ -825,6 +974,11 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
     if _STOP_RE.match(text.strip()):
         set_cancel(agency.id)
         await _send_wa(chat_id, "Khalas habibi — stopped! ✋🔥")
+        return
+
+    # Test schedule mode: simulate full day in ~60 seconds
+    if _TEST_SCHEDULE_RE.search(text.strip()):
+        asyncio.create_task(run_test_schedule(chat_id, agency.id))
         return
 
     # New instruction — clear any stale cancel flag
