@@ -4,10 +4,80 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# ─── Sales Offer File Name Parser ─────────────────────────────────────────────
+# Format: SH_A311_40.60_1B.pdf
+# Floor calculation: last 2 digits of unit number = unit within floor, rest = floor number
+# 311 → floor 3, unit 11 | 2701 → floor 27, unit 01 | 1311 → floor 13, unit 11
+
+PROJECT_CODES: dict[str, str] = {
+    "SH": "SAAS Hills",
+}
+
+UNIT_TYPE_CODES: dict[str, str] = {
+    "ST": "Studio",
+    "1B": "1 Bedroom",
+    "2B": "2 Bedroom",
+    "3B": "3 Bedroom",
+    "4B": "4 Bedroom",
+}
+
+_OFFER_PATTERN = re.compile(
+    r"^([A-Z]{1,5})_([A-Z]+)(\d{2,5})_([\d]+\.[\d]+)_(\w+)\.pdf$",
+    re.IGNORECASE,
+)
+
+_INVENTORY_KEYWORDS = frozenset({
+    "inventory", "availability", "available", "инвентарь", "доступно",
+    "units_list", "price_list", "прайс", "all_units",
+})
+
+
+def get_floor_from_unit(unit_num: str) -> Optional[int]:
+    """Extract floor number. Last 2 digits = unit within floor, rest = floor."""
+    if not unit_num or len(unit_num) < 3:
+        return None
+    try:
+        return int(unit_num[:-2])
+    except ValueError:
+        return None
+
+
+def is_inventory_filename(name: str) -> bool:
+    """Return True if the filename looks like an inventory/availability file."""
+    name_l = name.lower()
+    return any(kw in name_l for kw in _INVENTORY_KEYWORDS)
+
+
+def parse_offer_filename(filename: str) -> Optional[dict]:
+    """Parse SH_A311_40.60_1B.pdf → structured unit data dict.
+    Returns None if filename doesn't match the offer naming format.
+    """
+    m = _OFFER_PATTERN.match(filename)
+    if not m:
+        return None
+    code, building, unit_digits, payment_raw, type_code = m.groups()
+    code = code.upper()
+    building = building.upper()
+    type_code = type_code.upper()
+    floor = get_floor_from_unit(unit_digits)
+    payment_plan = payment_raw.replace(".", "/")
+    return {
+        "project_code": code,
+        "project_name": PROJECT_CODES.get(code, code),
+        "building": building,
+        "unit_number": unit_digits,
+        "floor": floor,
+        "payment_plan": payment_plan,
+        "unit_type": UNIT_TYPE_CODES.get(type_code, type_code),
+        "unit_type_code": type_code,
+        "_sheet": "Sales Offers",
+    }
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
@@ -19,6 +89,7 @@ _CACHE_TTL = 1800  # 30 minutes
 _folder_cache: dict[str, tuple[list, float]] = {}         # folder_id → (items, ts)
 _project_cache: dict[str, tuple[Optional[str], float]] = {}  # "root|name" → (folder_id, ts)
 _inventory_cache: dict[str, tuple[dict, float]] = {}         # "root|project" → (unit_index, ts)
+_offers_cache: dict[str, tuple[dict, float]] = {}            # "root" → (offers_index, ts)
 
 
 def clear_cache():
@@ -26,6 +97,7 @@ def clear_cache():
     _folder_cache.clear()
     _project_cache.clear()
     _inventory_cache.clear()
+    _offers_cache.clear()
     logger.info("Drive: cache cleared")
 
 
@@ -421,6 +493,63 @@ def get_project_inventory(svc, project_name: str, agency_root_id: str = "") -> d
 
     _inventory_cache[cache_key] = ({}, now)
     return {}
+
+
+def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
+    """Scan all project folders for PDFs matching the offer naming pattern.
+
+    Returns {unit_key: offer_dict} where unit_key = "BUILDING+UNIT" (e.g. "A311").
+    Each offer_dict has: project_name, building, unit_number, floor, payment_plan,
+    unit_type, unit_type_code, file_id, filename, _sheet.
+    Results cached for 30 minutes.
+    """
+    cache_key = f"{agency_root_id}|offers"
+    now = time.time()
+    if cache_key in _offers_cache:
+        idx, ts = _offers_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            return idx
+
+    idx: dict[str, dict] = {}
+    try:
+        effective_root = _root_id(agency_root_id)
+        root_items = _list_folder(svc, effective_root)
+        folders = [i for i in root_items if i["mimeType"] == "application/vnd.google-apps.folder"]
+
+        # Search at root level and one level deep (client folders)
+        project_folders: list[dict] = []
+        for folder in folders:
+            sub = _list_folder(svc, folder["id"])
+            sub_folders = [s for s in sub if s["mimeType"] == "application/vnd.google-apps.folder"]
+            if sub_folders:
+                project_folders.extend(sub_folders)
+            else:
+                project_folders.append(folder)
+
+        for proj_folder in project_folders:
+            office_id = _find_named_subfolder(svc, proj_folder["id"], _OFFICE_FOLDER_NAMES)
+            search_ids = [office_id, proj_folder["id"]] if office_id else [proj_folder["id"]]
+            for sid in search_ids:
+                files = _list_folder(svc, sid)
+                for f in files:
+                    if not f["name"].lower().endswith(".pdf"):
+                        continue
+                    parsed = parse_offer_filename(f["name"])
+                    if not parsed:
+                        continue
+                    unit_key = f"{parsed['building']}{parsed['unit_number']}"
+                    idx[unit_key] = {
+                        **parsed,
+                        "file_id": f["id"],
+                        "filename": f["name"],
+                    }
+
+        logger.info(f"Drive: scan_sales_offers → {len(idx)} offers found")
+    except Exception:
+        logger.exception("Drive: scan_sales_offers failed")
+
+    _offers_cache[cache_key] = (idx, now)
+    return idx
 
 
 def list_project_names(svc, agency_root_id: str = "") -> list:

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+from typing import Optional
 
 import anthropic
 from sqlalchemy.orm import Session
@@ -15,51 +16,100 @@ from sqlalchemy.orm.attributes import flag_modified
 from models import AdminConversation, ToniProject
 
 
-def _filter_unit_list(units: list, floor=None, unit_type: str = "", building: str = "") -> list:
-    """Filter (unit_num, unit_data, proj_name) by floor / unit_type / building. All optional."""
-    if floor is None and not unit_type and not building:
+def _get_floor(unit_num: str, unit_data: dict) -> Optional[int]:
+    """Get floor for a unit: explicit column first, then calculated from unit number.
+    Formula: last 2 digits = unit within floor, everything before = floor number.
+    311 → floor 3 | 2701 → floor 27 | 1311 → floor 13
+    """
+    for k, v in unit_data.items():
+        if any(kw in k.lower() for kw in ("floor", "этаж", "fl.", "level")):
+            try:
+                return int(str(v).strip())
+            except (ValueError, TypeError):
+                pass
+    # Explicit floor stored by sales offer parser
+    if "floor" in unit_data and unit_data["floor"] is not None:
+        try:
+            return int(unit_data["floor"])
+        except (ValueError, TypeError):
+            pass
+    if len(unit_num) >= 3:
+        try:
+            return int(unit_num[:-2])
+        except ValueError:
+            pass
+    return None
+
+
+def _parse_price(unit_data: dict) -> Optional[float]:
+    """Extract numeric price from unit data fields."""
+    for k, v in unit_data.items():
+        if re.search(r"(price|cost|цена|стоимость|aed|amount|total|value)", k, re.I):
+            try:
+                return float(str(v).replace(",", "").replace(" ", "").replace("AED", ""))
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def _normalize_type(s: str) -> str:
+    """Normalize unit type string: '1BR' / '1 bedroom' / '1 Bed' → '1b', 'Studio' → 'studio'."""
+    s = s.lower().strip()
+    s = re.sub(r"(\d)\s*br(s)?(\b|$)", r"\1b", s)
+    s = re.sub(r"(\d)\s*bed(room)?s?(\b|$)", r"\1b", s)
+    return s
+
+
+def _filter_unit_list(
+    units: list,
+    floor: Optional[int] = None,
+    floor_min: Optional[int] = None,
+    floor_max: Optional[int] = None,
+    unit_type: str = "",
+    building: str = "",
+    payment_plan: str = "",
+    price_min: Optional[float] = None,
+    price_max: Optional[float] = None,
+    view: str = "",
+) -> list:
+    """Filter (unit_num, unit_data, proj_name) tuples. All criteria are optional."""
+    has_filter = any([
+        floor is not None, floor_min is not None, floor_max is not None,
+        unit_type, building, payment_plan, price_min is not None, price_max is not None, view,
+    ])
+    if not has_filter:
         return units
 
     result = []
     for unit_num, unit_data, proj_name in units:
-        # ── Floor ──────────────────────────────────────────────────────────
-        if floor is not None:
-            fl_str = str(floor)
-            matched = False
-            for k, v in unit_data.items():
-                if any(kw in k.lower() for kw in ("floor", "этаж", "fl.", "level")):
-                    if str(v).strip() == fl_str:
-                        matched = True
-                        break
-            if not matched:
-                # Derive floor from unit number: 311→3, 1507→15, 501→5
-                if len(unit_num) == 3:
-                    matched = unit_num[0] == fl_str
-                elif len(unit_num) == 4:
-                    matched = (unit_num[:2] == fl_str.zfill(2)) or (unit_num[0] == fl_str and unit_num[1] == "0")
-            if not matched:
+        # ── Floor ─────────────────────────────────────────────────────────────
+        if floor is not None or floor_min is not None or floor_max is not None:
+            f = _get_floor(unit_num, unit_data)
+            if f is None:
+                continue
+            if floor is not None and f != floor:
+                continue
+            if floor_min is not None and f < floor_min:
+                continue
+            if floor_max is not None and f > floor_max:
                 continue
 
-        # ── Unit type ──────────────────────────────────────────────────────
+        # ── Unit type ─────────────────────────────────────────────────────────
         if unit_type:
-            t = unit_type.lower().strip()
-            t = re.sub(r"(\d)\s*br(s)?$", r"\1b", t)
-            t = re.sub(r"(\d)\s*bed(room)?s?$", r"\1b", t)
+            t = _normalize_type(unit_type)
             matched = False
             for k, v in unit_data.items():
-                if any(kw in k.lower() for kw in ("type", "тип", "bed", "room", "flat", "apt", "layout")):
-                    vl = re.sub(r"(\d)\s*br(s)?", r"\1b", str(v).lower())
-                    vl = re.sub(r"(\d)\s*bed(room)?s?", r"\1b", vl)
-                    if t in vl or vl.startswith(t):
+                if any(kw in k.lower() for kw in ("type", "тип", "bed", "room", "flat", "apt", "layout", "unit_type")):
+                    if t in _normalize_type(str(v)):
                         matched = True
                         break
             if not matched:
-                all_vals = re.sub(r"(\d)\s*br", r"\1b", " ".join(str(v).lower() for v in unit_data.values()))
+                all_vals = _normalize_type(" ".join(str(v) for v in unit_data.values()))
                 matched = t in all_vals
             if not matched:
                 continue
 
-        # ── Building ───────────────────────────────────────────────────────
+        # ── Building ──────────────────────────────────────────────────────────
         if building:
             b = building.lower().strip()
             matched = False
@@ -71,6 +121,46 @@ def _filter_unit_list(units: list, floor=None, unit_type: str = "", building: st
             if not matched:
                 all_vals = " ".join(str(v).lower() for v in unit_data.values())
                 matched = b in all_vals
+            if not matched:
+                continue
+
+        # ── Payment plan ──────────────────────────────────────────────────────
+        if payment_plan:
+            pp = payment_plan.lower().strip()
+            matched = False
+            for k, v in unit_data.items():
+                if any(kw in k.lower() for kw in ("payment", "plan", "оплат", "рассрочк", "installment")):
+                    if pp in str(v).lower():
+                        matched = True
+                        break
+            if not matched:
+                all_vals = " ".join(str(v).lower() for v in unit_data.values())
+                matched = pp in all_vals
+            if not matched:
+                continue
+
+        # ── Price range ───────────────────────────────────────────────────────
+        if price_min is not None or price_max is not None:
+            price = _parse_price(unit_data)
+            if price is None:
+                continue
+            if price_min is not None and price < price_min:
+                continue
+            if price_max is not None and price > price_max:
+                continue
+
+        # ── View ──────────────────────────────────────────────────────────────
+        if view:
+            v_kw = view.lower().strip()
+            matched = False
+            for k, v in unit_data.items():
+                if "view" in k.lower() or "вид" in k.lower():
+                    if v_kw in str(v).lower():
+                        matched = True
+                        break
+            if not matched:
+                all_vals = " ".join(str(v).lower() for v in unit_data.values())
+                matched = v_kw in all_vals
             if not matched:
                 continue
 
@@ -171,13 +261,50 @@ Groups = WhatsApp groups. That's it.
 • Any media request without "to groups" → send_drive_file (send_to="admin")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
 
+━━━ STAGE 2.5 — UNIT FILE INTELLIGENCE ━━━
+
+SALES OFFER FILE NAMING FORMAT:
+[PROJECT]_[BUILDING+UNIT]_[PAYMENT]_[TYPE].pdf
+Example: SH_A311_40.60_1B.pdf
+
+Project codes: SH = SAAS Hills (more added as projects come)
+Unit types: ST=Studio, 1B=1BR, 2B=2BR, 3B=3BR, 4B=4BR
+Payment: 40.60 = 40/60, 50.50 = 50/50, 20.80 = 20/80
+
+FLOOR CALCULATION — ALWAYS use this formula:
+Last 2 digits of unit number = unit within floor
+Everything before last 2 digits = floor number
+Examples: 311→floor 3 | 2701→floor 27 | 1311→floor 13 | 403→floor 4
+
+Tony reads this from file names + internal inventory index automatically.
+
+INVENTORY FILE DETECTION:
+→ File name contains "inventory"/"availability"/"available"/"инвентарь" → it's inventory, NOT forwarded to groups
+→ Admin says "это инвентарь" / "this is inventory" → treat as inventory file
+→ Sales offer PDF (SH_A311_40.60_1B.pdf pattern) → unit offer, NOT forwarded to groups
+
 FILTER RULES:
-→ If Admin says "floor 5" / "5 этаж" / "на 5 этаже" → use floor=5
-→ If Admin says "1b" / "1br" / "1 bedroom" / "studio" → use unit_type=...
-→ If Admin says "building A" / "здание A" / "Tower B" → use building=...
-→ Multiple filters combine: "find 2 units of type 1b on floor 3" → count=2, floor=3, unit_type="1b"
-→ "найди юниты" without "в группы" → search_units (show to admin only)
+→ "floor 5" / "5 этаж" / "на 5 этаже" → floor=5
+→ "floor 15-20" / "между 15 и 20 этажом" → floor_min=15, floor_max=20
+→ "1b" / "1br" / "1 bedroom" / "studio" → unit_type=
+→ "building A" / "здание A" / "Tower B" → building=
+→ "40/60" / "40.60" / "40 60" → payment_plan="40/60"
+→ "budget 1M+" / "от 1М" / "under 2M" → price_min/price_max (in AED: 1M = 1000000)
+→ "pool view" / "burj view" / "marina view" → view=
+→ Multiple filters combine: "find 2 studios on floor 15-20 with pool view" → count=2, unit_type="studio", floor_min=15, floor_max=20, view="pool"
+
+→ "найди юниты" / "find units" WITHOUT "в группы/to groups" → search_units (show to admin only)
 → "найди и скинь в группы" / "send to groups" → send_inventory_to_groups
+→ "top 3" / "3 рандомных" → EXACTLY 3, never more — use count=3
+→ "all matching" / "все подходящие" → send_all=true
+→ "all 1BR between 15-20" → send_all=true, unit_type="1b", floor_min=15, floor_max=20
+
+FILE SENDING ORDER (ALWAYS):
+1. Brochure (PDF) — ALWAYS FIRST, no exceptions
+2. Floor plans (PDF) — second
+3. Photos — third
+4. Videos — LAST
+Never change this order.
 
 ━━━ GOOGLE DRIVE — CRITICAL RULES ━━━
 You ARE connected to Google Drive. You DO have access. This is a FACT.
@@ -242,15 +369,21 @@ ADMIN_TOOLS = [
     },
     {
         "name": "search_units",
-        "description": "Search units by number, keywords, or criteria (floor, type, building). Returns results to admin.",
+        "description": "Search units by number, keywords, or criteria. Returns results to admin (NOT sent to groups).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Unit number or keywords. Leave empty if using filters only."},
                 "limit": {"type": "integer", "description": "Max results (default 5)"},
-                "floor": {"type": "integer", "description": "Filter by floor number (e.g. 5 for 5th floor)"},
-                "unit_type": {"type": "string", "description": "Filter by apartment type: '1b', '2b', 'studio', '3b' etc."},
-                "building": {"type": "string", "description": "Filter by building/tower name: 'A', 'B', 'Tower 1' etc."},
+                "floor": {"type": "integer", "description": "Exact floor number"},
+                "floor_min": {"type": "integer", "description": "Floor range: minimum floor"},
+                "floor_max": {"type": "integer", "description": "Floor range: maximum floor"},
+                "unit_type": {"type": "string", "description": "Apartment type: 'studio', '1b', '2b', '3b', '4b'"},
+                "building": {"type": "string", "description": "Building/tower: 'A', 'B', 'Tower 1' etc."},
+                "payment_plan": {"type": "string", "description": "Payment plan: '40/60', '50/50', '20/80' etc."},
+                "price_min": {"type": "number", "description": "Minimum price in AED"},
+                "price_max": {"type": "number", "description": "Maximum price in AED"},
+                "view": {"type": "string", "description": "View type: 'pool', 'burj khalifa', 'marina', 'sea' etc."},
             },
             "required": [],
         },
@@ -278,30 +411,22 @@ ADMIN_TOOLS = [
     },
     {
         "name": "send_inventory_to_groups",
-        "description": "Pick N units from inventory (random or filtered) and send to all WhatsApp groups. Use for: 'send 3 units', 'скинь 3 юнита', 'найди 3 юнита на 5 этаже и скинь', 'отправь 1b юниты в группы' etc.",
+        "description": "Pick exactly N units (random or filtered) and SEND TO ALL WhatsApp groups. Use for: 'send 3 units', 'скинь 3 юнита', 'скинь 2 студии в группы', 'найди 3 юнита на 5 этаже и отправь'. count='all' sends ALL matching units.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "count": {
-                    "type": "integer",
-                    "description": "Number of units to send per group (default 3, max 10)",
-                },
-                "project_name": {
-                    "type": "string",
-                    "description": "Optional: filter by project name.",
-                },
-                "floor": {
-                    "type": "integer",
-                    "description": "Optional: filter by floor number (e.g. 5 → only units on floor 5)",
-                },
-                "unit_type": {
-                    "type": "string",
-                    "description": "Optional: filter by apartment type ('1b', '2b', 'studio', '3b' etc.)",
-                },
-                "building": {
-                    "type": "string",
-                    "description": "Optional: filter by building/tower ('A', 'B', 'Tower 1' etc.)",
-                },
+                "count": {"type": "integer", "description": "Exact number of units to send. Default 3, max 10. If 'all' requested pass 0."},
+                "send_all": {"type": "boolean", "description": "Set true to send ALL matching units (when admin says 'all')"},
+                "project_name": {"type": "string", "description": "Filter by project name"},
+                "floor": {"type": "integer", "description": "Exact floor number"},
+                "floor_min": {"type": "integer", "description": "Floor range minimum"},
+                "floor_max": {"type": "integer", "description": "Floor range maximum"},
+                "unit_type": {"type": "string", "description": "Apartment type: 'studio', '1b', '2b', '3b', '4b'"},
+                "building": {"type": "string", "description": "Building/tower: 'A', 'B' etc."},
+                "payment_plan": {"type": "string", "description": "Payment plan: '40/60', '50/50', '20/80'"},
+                "price_min": {"type": "number", "description": "Minimum price in AED"},
+                "price_max": {"type": "number", "description": "Maximum price in AED"},
+                "view": {"type": "string", "description": "View type: 'pool', 'burj khalifa', 'marina', 'sea' etc."},
             },
             "required": [],
         },
@@ -402,8 +527,14 @@ class AdminAgent:
                 inp.get("limit", 5),
                 agency,
                 floor=inp.get("floor"),
+                floor_min=inp.get("floor_min"),
+                floor_max=inp.get("floor_max"),
                 unit_type=inp.get("unit_type", ""),
                 building=inp.get("building", ""),
+                payment_plan=inp.get("payment_plan", ""),
+                price_min=inp.get("price_min"),
+                price_max=inp.get("price_max"),
+                view=inp.get("view", ""),
             )
         if name == "send_drive_file":
             return await self._send_drive_file(
@@ -418,9 +549,16 @@ class AdminAgent:
                 inp.get("count", 3),
                 inp.get("project_name", ""),
                 agency,
+                send_all=inp.get("send_all", False),
                 floor=inp.get("floor"),
+                floor_min=inp.get("floor_min"),
+                floor_max=inp.get("floor_max"),
                 unit_type=inp.get("unit_type", ""),
                 building=inp.get("building", ""),
+                payment_plan=inp.get("payment_plan", ""),
+                price_min=inp.get("price_min"),
+                price_max=inp.get("price_max"),
+                view=inp.get("view", ""),
             )
         return {"error": f"Unknown tool: {name}"}
 
@@ -484,8 +622,13 @@ class AdminAgent:
             logger.exception("send_drive_file tool error")
             return {"error": str(e)}
 
-    async def _send_inventory_to_groups(self, db: Session, count: int, project_name: str, agency,
-                                        floor=None, unit_type: str = "", building: str = "") -> dict:
+    async def _send_inventory_to_groups(
+        self, db: Session, count: int, project_name: str, agency,
+        send_all: bool = False,
+        floor=None, floor_min=None, floor_max=None,
+        unit_type: str = "", building: str = "",
+        payment_plan: str = "", price_min=None, price_max=None, view: str = "",
+    ) -> dict:
         import asyncio as _asyncio
         import random as _random
         import whatsapp_bot
@@ -505,12 +648,13 @@ class AdminAgent:
             for unit_num, unit_data in (proj.unit_index or {}).items():
                 all_units.append((unit_num, unit_data, proj.project_name))
 
-        # Also try Drive inventory
+        # Drive: inventory Excel files + sales offer PDFs
         import drive_service as _drive
         svc = _drive.get_service()
         root_id = getattr(agency, "drive_root_id", "") or ""
         if svc:
             seen = {u[0] for u in all_units}
+            # Inventory files (Excel/CSV)
             search_projects = projects if projects else []
             for proj in search_projects:
                 try:
@@ -521,23 +665,46 @@ class AdminAgent:
                             seen.add(unit_num)
                 except Exception:
                     pass
+            # Sales offer PDFs (SH_A311_40.60_1B.pdf pattern)
+            try:
+                offers = _drive.scan_sales_offers(svc, root_id)
+                for unit_key, offer_data in offers.items():
+                    if project_name and project_name.lower() not in offer_data.get("project_name", "").lower():
+                        continue
+                    if unit_key not in seen:
+                        all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
+                        seen.add(unit_key)
+            except Exception:
+                pass
 
         if not all_units:
             return {"error": "No units found in inventory or Drive"}
 
-        # Apply filters if specified
-        filtered = _filter_unit_list(all_units, floor=floor, unit_type=unit_type, building=building)
+        # Apply filters
+        filtered = _filter_unit_list(
+            all_units,
+            floor=floor, floor_min=floor_min, floor_max=floor_max,
+            unit_type=unit_type, building=building,
+            payment_plan=payment_plan, price_min=price_min, price_max=price_max,
+            view=view,
+        )
         if not filtered:
             criteria = []
-            if floor is not None:
-                criteria.append(f"floor={floor}")
-            if unit_type:
-                criteria.append(f"type={unit_type}")
-            if building:
-                criteria.append(f"building={building}")
+            if floor is not None: criteria.append(f"floor={floor}")
+            if floor_min is not None: criteria.append(f"floor≥{floor_min}")
+            if floor_max is not None: criteria.append(f"floor≤{floor_max}")
+            if unit_type: criteria.append(f"type={unit_type}")
+            if building: criteria.append(f"building={building}")
+            if payment_plan: criteria.append(f"plan={payment_plan}")
+            if price_min is not None: criteria.append(f"price≥{price_min:,.0f}")
+            if price_max is not None: criteria.append(f"price≤{price_max:,.0f}")
+            if view: criteria.append(f"view={view}")
             return {"error": f"No units match criteria: {', '.join(criteria)}"}
 
-        picks = _random.sample(filtered, min(count, len(filtered)))
+        if send_all:
+            picks = filtered
+        else:
+            picks = _random.sample(filtered, min(count or 3, len(filtered)))
 
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
@@ -583,8 +750,12 @@ class AdminAgent:
             ],
         }
 
-    def _search_units(self, db: Session, query: str, limit: int, agency,
-                      floor=None, unit_type: str = "", building: str = "") -> dict:
+    def _search_units(
+        self, db: Session, query: str, limit: int, agency,
+        floor=None, floor_min=None, floor_max=None,
+        unit_type: str = "", building: str = "",
+        payment_plan: str = "", price_min=None, price_max=None, view: str = "",
+    ) -> dict:
         from excel_parser import format_unit_card
 
         projects = db.query(ToniProject).filter(
@@ -605,13 +776,16 @@ class AdminAgent:
                         "card": format_unit_card(unit_num, idx[unit_num], proj.project_name),
                     })
 
-        # 2. Filter-based search (floor / unit_type / building)
-        if not results and (floor is not None or unit_type or building):
+        # 2. Filter-based search
+        has_filter = any([
+            floor is not None, floor_min is not None, floor_max is not None,
+            unit_type, building, payment_plan, price_min is not None, price_max is not None, view,
+        ])
+        if not results and has_filter:
             all_units: list[tuple] = []
             for proj in projects:
                 for u, d in (proj.unit_index or {}).items():
                     all_units.append((u, d, proj.project_name))
-            # Also Drive inventory
             try:
                 import drive_service as _drive
                 svc = _drive.get_service()
@@ -627,10 +801,24 @@ class AdminAgent:
                                     seen.add(u)
                         except Exception:
                             pass
+                    try:
+                        offers = _drive.scan_sales_offers(svc, root_id)
+                        for unit_key, offer_data in offers.items():
+                            if unit_key not in seen:
+                                all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
+                                seen.add(unit_key)
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
-            filtered = _filter_unit_list(all_units, floor=floor, unit_type=unit_type, building=building)
+            filtered = _filter_unit_list(
+                all_units,
+                floor=floor, floor_min=floor_min, floor_max=floor_max,
+                unit_type=unit_type, building=building,
+                payment_plan=payment_plan, price_min=price_min, price_max=price_max,
+                view=view,
+            )
             for unit_num, data, proj_name in filtered[:limit]:
                 results.append({
                     "unit": unit_num,

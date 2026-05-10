@@ -188,7 +188,22 @@ def _wa_is_inventory(fname: str, caption: str) -> bool:
     fl, cl = fname.lower(), (caption or "").lower()
     if fl.endswith((".xlsx", ".xls", ".csv")):
         return True
+    try:
+        from drive_service import is_inventory_filename
+        if is_inventory_filename(fname):
+            return True
+    except Exception:
+        pass
     return any(kw in cl or kw in fl for kw in _WA_INVENTORY_KEYWORDS)
+
+
+def _wa_is_sales_offer(fname: str) -> bool:
+    """Return True if file matches sales offer naming pattern (e.g. SH_A311_40.60_1B.pdf)."""
+    try:
+        from drive_service import parse_offer_filename
+        return parse_offer_filename(fname) is not None
+    except Exception:
+        return False
 
 
 logger = logging.getLogger(__name__)
@@ -521,7 +536,11 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         await _send_wa(chat_id, "❓ Файл не распознан.")
         return
 
-    if not is_inventory_ext and not has_save_intent:
+    # Sales offer PDFs (SH_A311_40.60_1B.pdf) and inventory PDFs → never forward
+    is_sales_offer = _wa_is_sales_offer(file_name)
+    is_inventory_file = _wa_is_inventory(file_name, caption)
+
+    if not is_inventory_ext and not has_save_intent and not is_sales_offer and not is_inventory_file:
         # Download and instantly forward to all groups
         try:
             async with httpx.AsyncClient(timeout=60) as client:
@@ -535,9 +554,28 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         await _send_wa(chat_id, f"Khalas habibi! ✅\nForwarded to {n} groups 💪")
         return
 
+    # Sales offer PDF detected — tell admin it's recognized, not forwarded
+    if is_sales_offer and not has_save_intent:
+        try:
+            from drive_service import parse_offer_filename
+            parsed = parse_offer_filename(file_name) or {}
+        except Exception:
+            parsed = {}
+        unit_info = ""
+        if parsed:
+            unit_info = (f"\nProject: {parsed.get('project_name', parsed.get('project_code', '?'))} "
+                         f"| Building {parsed.get('building', '?')} | Unit {parsed.get('unit_number', '?')} "
+                         f"| Floor {parsed.get('floor', '?')} | {parsed.get('unit_type', '?')} "
+                         f"| {parsed.get('payment_plan', '?')}")
+        await _send_wa(chat_id,
+                       f"📋 Sales offer detected: *{file_name}*{unit_info}\n"
+                       "Upload to Drive → project's 'sales office' folder. "
+                       "Tony reads it automatically 🔥")
+        return
+
     # ── SAVE PATH: Excel/CSV, or forwardable file with explicit save intent ──
     # PDFs with save intent but no unit data → brochure, tell admin to put in Drive
-    if fname_lower.endswith(".pdf") and has_save_intent and not _wa_is_inventory(file_name, caption):
+    if fname_lower.endswith(".pdf") and has_save_intent and not is_inventory_file:
         await _send_wa(chat_id,
                        f"📄 PDF «{file_name}» — брошюра.\n"
                        "Загрузи файл в Google Drive в папку проекта, чтобы агенты могли его получить.")
