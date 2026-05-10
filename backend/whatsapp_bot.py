@@ -24,6 +24,22 @@ from models import Agency, GroupConversation, ToniProject, WhatsAppGroup
 
 _daily: dict[str, dict] = {}
 
+# ─── Cancel / stop flags ──────────────────────────────────────────────────────
+
+_cancel_flags: dict[int, bool] = {}
+
+
+def set_cancel(agency_id: int):
+    _cancel_flags[agency_id] = True
+
+
+def is_cancelled(agency_id: int) -> bool:
+    return _cancel_flags.get(agency_id, False)
+
+
+def clear_cancel(agency_id: int):
+    _cancel_flags.pop(agency_id, None)
+
 
 def _day_state(agency_id: int) -> dict:
     from datetime import datetime as _dt
@@ -230,9 +246,13 @@ def _wa_is_sales_offer(fname: str) -> bool:
 logger = logging.getLogger(__name__)
 
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
+_STOP_RE = re.compile(
+    r"^(stop|стоп|стопп|cancel|отмена|отмени|хватит|достаточно|stop it|нет не надо)[\s!.?]*$",
+    re.IGNORECASE,
+)
 _REALESTATE_TRIGGERS = re.compile(
     r"\b(unit|юнит|юнитов|юниты|"
-    r"brochur|брошюр|брошур|брошур|"  # catches brochure, brochur, брошюра, брошура
+    r"brochur|брошюр|брошур|"  # catches brochure, brochur, брошюра, брошура
     r"floor\s*plan|планировк|price\s*list|прайс|"
     r"bedroom|спальн|villa|вилла|available|наличи|"
     r"видео|video\s*tour|фото|render|renders|"
@@ -418,6 +438,11 @@ async def handle_update(data: dict, agency: Agency):
                 return
             text = await _transcribe_audio(audio_bytes)
             if not text:
+                if not is_group and admin_check:
+                    if not os.getenv("OPENAI_API_KEY"):
+                        await _send_wa(chat_id, "Habibi voice not set up yet 🎙️❌\nAdd OPENAI_API_KEY in Railway — text me for now!")
+                    else:
+                        await _send_wa(chat_id, "Didn't catch that habibi 😅 Try again or send text 🎙️")
                 logger.info("WA voice: transcription empty — skipping")
                 return
             logger.info(f"WA voice transcribed ({len(text)} chars): {text[:80]!r}")
@@ -796,6 +821,15 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
                        "Khalas habibi — memory cleared! Fresh start 🔄🔥")
         return
 
+    # Stop/cancel: halt any running broadcast immediately
+    if _STOP_RE.match(text.strip()):
+        set_cancel(agency.id)
+        await _send_wa(chat_id, "Khalas habibi — stopped! ✋🔥")
+        return
+
+    # New instruction — clear any stale cancel flag
+    clear_cancel(agency.id)
+
     agent = AdminAgent()
     try:
         reply = await agent.process(agency, f"wa_{sender_phone}", text, db, chat_id=chat_id)
@@ -1098,11 +1132,16 @@ async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> in
         WhatsAppGroup.active == True,
         WhatsAppGroup.agency_id == agency.id,
     ).all()
+    sent = 0
     for i, g in enumerate(groups):
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            break
         if i > 0:
             await asyncio.sleep(30)
         await _send_wa(g.chat_id, message)
-    return len(groups)
+        sent += 1
+    return sent
 
 
 async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: str,
@@ -1114,6 +1153,9 @@ async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: 
     ).all()
     sent = 0
     for i, g in enumerate(groups):
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            break
         if i > 0:
             await asyncio.sleep(30)
         ok = await _send_wa_file(g.chat_id, file_bytes, file_name, caption)

@@ -417,6 +417,19 @@ list_projects = Excel inventory database (units, prices)
 send_drive_file = all media from project's "media" folder in Drive (photos, videos, brochures)
 These are SEPARATE sources. Both are available to you.
 
+━━━ STOP / CANCEL ━━━
+If Admin says "stop", "стоп", "cancel", "отмена", "хватит" or similar:
+→ Acknowledge immediately: "Khalas habibi — stopped! ✋🔥"
+→ NO tool calls. NO further actions. Just acknowledge.
+→ If nothing was in progress: "All clear habibi 👌"
+
+━━━ VOICE MESSAGES ━━━
+Admin may send voice messages (marked with [Voice] prefix in transcript).
+→ Treat [Voice] messages EXACTLY like text — same tools, same logic
+→ If transcript unclear or garbled — ask once to clarify
+→ "[Voice] скинь 3 юнита в группы" = send_inventory_to_groups(count=3, send_to="groups")
+→ Never mention that it's a voice message in your reply — just act on it
+
 ━━━ ADMIN PERSONALITY ADAPTATION ━━━
 Tony learns Admin through daily conversation — silently:
 • Does he prefer questions or independent action?
@@ -1049,6 +1062,9 @@ class AdminAgent:
             await whatsapp_bot._send_wa(chat_id, "\n".join(summary_lines))
             await asyncio.sleep(1)
             for unit_num, unit_data, proj_name in picks:
+                if whatsapp_bot.is_cancelled(agency.id):
+                    whatsapp_bot.clear_cancel(agency.id)
+                    break
                 file_id = unit_data.get("file_id", "")
                 fname = unit_data.get("filename", f"{unit_num}.pdf")
                 if file_id and svc:
@@ -1075,8 +1091,12 @@ class AdminAgent:
         if not groups:
             return {"error": "No active WhatsApp groups registered"}
 
+        whatsapp_bot.clear_cancel(agency.id)
         sent_groups = 0
         for i, group in enumerate(groups):
+            if whatsapp_bot.is_cancelled(agency.id):
+                whatsapp_bot.clear_cancel(agency.id)
+                break
             if i > 0:
                 await asyncio.sleep(30)
 
