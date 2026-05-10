@@ -113,7 +113,7 @@ You are in a group chat with real estate agents. Your name is Tony.
 
 Respond ONLY with valid JSON (no markdown, no code blocks):
 {
-  "intent": "unit_query" | "media_request" | "property_search" | "direct_question" | "off_topic",
+  "intent": "unit_query" | "media_request" | "property_search" | "direct_question" | "discount_inquiry" | "off_topic",
   "unit_numbers": ["1507", "1435"],
   "project_name": "project name or null",
   "keywords": ["2 rooms", "villa", "floor 20"],
@@ -125,6 +125,7 @@ Respond ONLY with valid JSON (no markdown, no code blocks):
 • Someone mentions "Tony" or "Тони" — always respond
 • Someone asks about units, prices, availability — even WITHOUT mentioning Tony
 • Someone asks for brochure, video, photos — even WITHOUT mentioning Tony
+• Someone asks about discounts, DLD, payment plans, special offers — even WITHOUT mentioning Tony
 • Question is clearly real-estate related
 
 ❌ Use "off_topic" intent when:
@@ -157,6 +158,11 @@ Examples:
   → NEVER send video before brochure — order is fixed
 • property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
 • direct_question: any other work question — answer in "reply" using the project context below
+• discount_inquiry: ANY question about pricing flexibility — discounts, DLD waiver, "4%", payment plans
+  ("50/50", "60/40", "40/60"), special offers, "best price", negotiation, "chegirma", "скидка"
+  → reply = "" (Tony redirects to specialist via code — do NOT write the reply yourself)
+  → NEVER confirm or deny discounts — Tony doesn't know
+  → NEVER say "no discount" or "yes discount"
 • off_topic: personal talk or unrelated topic — leave reply as empty string
 
 ━━━ TONY'S CHARACTER (use in "reply" field only) ━━━
@@ -226,12 +232,36 @@ _REALESTATE_TRIGGERS = re.compile(
     r"bedroom|спальн|villa|вилла|available|наличи|"
     r"видео|video\s*tour|фото|render|renders|"
     r"presentation|презентац|каталог|catalog|"
-    r"apartment|апартамент|availability|pdf)\b"
-    r"|\b\d{3,5}\b",
+    r"apartment|апартамент|availability|pdf|"
+    r"discount|скидка|chegirma|DLD|payment\s*plan|рассрочк|"
+    r"special\s*offer|best\s*price|negotiat|50/50|60/40|40/60)\b",
     re.IGNORECASE,
 )
 _AUDIO_TYPES = frozenset({"audioMessage", "pttMessage"})
 _WA_BASE = "https://api.green-api.com"
+
+# ─── Discount / Lead notification system ──────────────────────────────────────
+
+_SPECIALIST_PHONE = "+971 58 581 6776"
+_SPECIALIST_HANDLE = "@Khamudilloh SAAS"
+
+_DISCOUNT_GROUP_REPLIES = [
+    "Great question habibi! 👆\nFor discounts and payment details —\nspeak directly with our specialist:\n\n📞 {phone}\n{handle}\n\nHe'll give you the full picture wallah 🤲",
+    "Wallah this one needs the specialist habibi 💯\nFor all payment plans and pricing —\nreach out directly:\n\n📞 {phone}\n{handle}\n\nHe knows every deal khalas 🔥",
+    "Habibi for pricing and offers —\nyou need to speak to the man himself 👆\n\n📞 {phone}\n{handle}\n\nYalla — he'll sort you out wallah 🤲",
+    "Good question! 🔥\nPayment plans and discounts —\nour specialist has all the details:\n\n📞 {phone}\n{handle}\n\nHit him up habibi, khalas ✅",
+    "Wallah great timing habibi 👀\nFor DLD, payment plans, and special offers —\ngo directly to:\n\n📞 {phone}\n{handle}\n\nHe's got you covered inshallah 🙏",
+    "Habibi this is above my pay grade 😄\nFor real discounts and deals —\none person to call:\n\n📞 {phone}\n{handle}\n\nWallah he'll make it happen 💪",
+]
+
+_DISCOUNT_ADMIN_NOTIFS = [
+    "Habibi heads up 👆\n*{name}* in _{group}_ asking:\n\"{question}\"\nRedirected them to you —\ncould be a hot one wallah 🔥",
+    "Bro 👀 *{name}* in _{group}_ just asked:\n\"{question}\"\nI sent them your number — sounds serious habibi 📞",
+    "Hey habibi! Lead alert 🔔\n*{name}* ({group}):\n\"{question}\"\nPointed them your way — yalla follow up! 💪",
+    "Wallah this could be something 🔥\n*{name}* in _{group}_ wants:\n\"{question}\"\nI redirected — khalas. Your move habibi 📞",
+    "Heads up boss 👆\n*{name}* from _{group}_ asking about pricing:\n\"{question}\"\nSent them to you — might be hot habibi 🎯",
+    "🔔 *{name}* ({group}):\n\"{question}\"\nDirty work done — redirected to specialist.\nYalla follow up habibi, wallah this one's worth it 🔥",
+]
 
 
 # ─── Low-level Green API helpers ─────────────────────────────────────────────
@@ -862,6 +892,23 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                     f"Habibi, media for *{search_name}* not found in Drive 🙏\n"
                     f"Can you send it? I'll forward to the groups khalas 🔥"
                 )
+    elif intent == "discount_inquiry":
+        # ACTION 1 — redirect in group
+        group_reply = random.choice(_DISCOUNT_GROUP_REPLIES).format(
+            phone=_SPECIALIST_PHONE, handle=_SPECIALIST_HANDLE,
+        )
+        await _send_wa(chat_id, group_reply)
+        # ACTION 2 — notify admin privately
+        admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
+        if admin_numbers:
+            admin_chat_id = f"{admin_numbers[0]}@c.us"
+            notif = random.choice(_DISCOUNT_ADMIN_NOTIFS).format(
+                name=sender_name,
+                group=group_title,
+                question=text[:200],
+            )
+            await _send_wa(admin_chat_id, notif)
+
     elif intent == "direct_question":
         reply = (parsed.get("reply") or "").strip()
         if reply:
