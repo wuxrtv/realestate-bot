@@ -18,20 +18,6 @@ from sqlalchemy.orm.attributes import flag_modified
 from models import AdminConversation, ToniProject
 
 
-_MAX_HISTORY = 20  # keep last N messages to control token cost
-
-
-def _trim_history(history: list) -> list:
-    """Keep last _MAX_HISTORY messages. Always start with a user message."""
-    if len(history) <= _MAX_HISTORY:
-        return history
-    trimmed = history[-_MAX_HISTORY:]
-    # Drop leading assistant/tool messages — API requires first message is user
-    while trimmed and trimmed[0].get("role") != "user":
-        trimmed = trimmed[1:]
-    return trimmed
-
-
 def _get_floor(unit_num: str, unit_data: dict) -> Optional[int]:
     """Get floor for a unit: explicit column first, then calculated from unit number.
     Formula: last 2 digits = unit within floor, everything before = floor number.
@@ -596,7 +582,7 @@ class AdminAgent:
         return conv, list(conv.history or [])
 
     def _save_history(self, db: Session, conv: AdminConversation, history: list):
-        conv.history = _trim_history(history)
+        conv.history = history
         conv.conversation_date = self._dubai_today()
         conv.updated_at = datetime.now()
         flag_modified(conv, "history")

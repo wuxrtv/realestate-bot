@@ -63,12 +63,9 @@ def _load_group_history(db, agency_id: int, chat_id: str):
     return conv, list(conv.history or [])
 
 
-_MAX_GROUP_HISTORY = 15  # keep last N group messages per day
-
 def _save_group_history(db, conv, history: list):
     from datetime import datetime as _dt
-    trimmed = history[-_MAX_GROUP_HISTORY:] if len(history) > _MAX_GROUP_HISTORY else history
-    conv.history = trimmed
+    conv.history = history
     conv.conversation_date = _dubai_today()
     conv.updated_at = _dt.now()
     flag_modified(conv, "history")
