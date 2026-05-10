@@ -63,9 +63,12 @@ def _load_group_history(db, agency_id: int, chat_id: str):
     return conv, list(conv.history or [])
 
 
+_MAX_GROUP_HISTORY = 15  # keep last N group messages per day
+
 def _save_group_history(db, conv, history: list):
     from datetime import datetime as _dt
-    conv.history = history  # full day history, no artificial cut
+    trimmed = history[-_MAX_GROUP_HISTORY:] if len(history) > _MAX_GROUP_HISTORY else history
+    conv.history = trimmed
     conv.conversation_date = _dubai_today()
     conv.updated_at = _dt.now()
     flag_modified(conv, "history")
@@ -839,8 +842,8 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = await ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=800,
-            system=system,
+            max_tokens=500,
+            system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
             messages=history,
         )
         raw = resp.content[0].text.strip()
