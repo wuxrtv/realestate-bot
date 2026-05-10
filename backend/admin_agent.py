@@ -335,6 +335,14 @@ SORTING ROUTING:
 → "highest floor unit" → send_inventory_to_groups(sort_by="highest_floor", count=1, send_to="admin")
 → "above 1M studios" → send_inventory_to_groups(unit_type="studio", price_min=1000000, send_to="admin")
 
+MULTI-CONDITION RULE — CRITICAL:
+→ "cheapest AND most expensive" → TWO separate tool calls:
+   Call 1: send_inventory_to_groups(sort_by="cheapest", count=1, send_to="admin")
+   Call 2: send_inventory_to_groups(sort_by="most_expensive", count=1, send_to="admin")
+→ "highest floor AND lowest floor" → TWO calls: sort_by="highest_floor" then sort_by="lowest_floor"
+→ "cheapest studio AND cheapest 1BR" → TWO calls with different unit_type each
+→ Never try to return both in one call — always make separate calls for each condition
+
 VERIFY WORKFLOW (always):
 1. Read price from price_raw (exact integer from PDF)
 2. Sort correctly
@@ -928,7 +936,12 @@ class AdminAgent:
 
         seen = {u[0] for u in all_units}
 
-        # Fast path: pre-built index (price/size/view already extracted — no PDF reads)
+        # Always init Drive service — needed for PDF downloads even in fast path
+        import drive_service as _drive
+        svc = _drive.get_service()
+        root_id = getattr(agency, "drive_root_id", "") or ""
+
+        # Fast path: pre-built index (price/size/view already extracted — no PDF reads needed)
         import pdf_index as _idx
         index_units = _idx.as_unit_list(agency.id, project_name)
         if index_units:
@@ -936,47 +949,43 @@ class AdminAgent:
                 if unit_key not in seen:
                     all_units.append((unit_key, data, proj))
                     seen.add(unit_key)
-        else:
+        elif svc:
             # Slow path: scan Drive on-the-fly (fallback when index not built yet)
-            import drive_service as _drive
-            svc = _drive.get_service()
-            root_id = getattr(agency, "drive_root_id", "") or ""
-            if svc:
-                for proj in (projects if projects else []):
-                    try:
-                        drive_idx = await asyncio.to_thread(
-                            _drive.get_project_inventory, svc, proj.project_name, root_id
-                        )
-                        for unit_num, unit_data in drive_idx.items():
-                            if unit_num not in seen:
-                                all_units.append((unit_num, unit_data, proj.project_name))
-                                seen.add(unit_num)
-                    except Exception:
-                        pass
+            for proj in (projects if projects else []):
                 try:
-                    offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
-                    for unit_key, offer_data in offers.items():
-                        if project_name and project_name.lower() not in offer_data.get("project_name", "").lower():
-                            continue
-                        if unit_key not in seen:
-                            all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
-                            seen.add(unit_key)
+                    drive_idx = await asyncio.to_thread(
+                        _drive.get_project_inventory, svc, proj.project_name, root_id
+                    )
+                    for unit_num, unit_data in drive_idx.items():
+                        if unit_num not in seen:
+                            all_units.append((unit_num, unit_data, proj.project_name))
+                            seen.add(unit_num)
                 except Exception:
                     pass
-                # Slow path only: enrich PDFs for price/view filters
-                needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
-                if needs_pdf_read:
-                    enriched_units = []
-                    for unit_num, unit_data, proj_name in all_units:
-                        if unit_data.get("file_id"):
-                            try:
-                                unit_data = await asyncio.to_thread(
-                                    _drive.enrich_offer_from_pdf, svc, unit_data
-                                )
-                            except Exception:
-                                pass
-                        enriched_units.append((unit_num, unit_data, proj_name))
-                    all_units = enriched_units
+            try:
+                offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
+                for unit_key, offer_data in offers.items():
+                    if project_name and project_name.lower() not in offer_data.get("project_name", "").lower():
+                        continue
+                    if unit_key not in seen:
+                        all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
+                        seen.add(unit_key)
+            except Exception:
+                pass
+            # Slow path only: enrich PDFs for price/view filters
+            needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
+            if needs_pdf_read:
+                enriched_units = []
+                for unit_num, unit_data, proj_name in all_units:
+                    if unit_data.get("file_id"):
+                        try:
+                            unit_data = await asyncio.to_thread(
+                                _drive.enrich_offer_from_pdf, svc, unit_data
+                            )
+                        except Exception:
+                            pass
+                    enriched_units.append((unit_num, unit_data, proj_name))
+                all_units = enriched_units
 
         if not all_units:
             return {"error": "No units found in inventory or Drive"}
@@ -1032,13 +1041,20 @@ class AdminAgent:
             await asyncio.sleep(1)
             for unit_num, unit_data, proj_name in picks:
                 file_id = unit_data.get("file_id", "")
-                if file_id:
-                    pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                    if pdf_bytes:
-                        fname = unit_data.get("filename", f"{unit_num}.pdf")
-                        await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
-                        await asyncio.sleep(2)
-                        continue
+                fname = unit_data.get("filename", f"{unit_num}.pdf")
+                if file_id and svc:
+                    try:
+                        pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+                        if pdf_bytes:
+                            await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
+                            await asyncio.sleep(2)
+                            continue
+                        else:
+                            logger.warning(f"PDF download returned empty for {fname} (file_id={file_id})")
+                            await whatsapp_bot._send_wa(chat_id, f"Habibi, PDF for *{unit_num}* not downloading from Drive 😅\nFile: {fname}\nHere's the details instead 👇")
+                    except Exception:
+                        logger.exception(f"PDF download failed for {fname}")
+                        await whatsapp_bot._send_wa(chat_id, f"Habibi, couldn't grab PDF for *{unit_num}* 😅\nHere's the info:")
                 await whatsapp_bot._send_wa(chat_id, format_unit_card(unit_num, unit_data, proj_name))
                 await asyncio.sleep(1)
             return {"sent_to_admin": True, "units_sent": len(picks), "units": [u[0] for u in picks]}
@@ -1077,17 +1093,23 @@ class AdminAgent:
             # Send exactly N files — PDF if available, else text card
             for unit_num, unit_data, proj_name in picks:
                 file_id = unit_data.get("file_id", "")
-                if file_id:
-                    pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                    if pdf_bytes:
-                        fname = unit_data.get("filename", f"{unit_num}.pdf")
-                        await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
-                        await asyncio.sleep(3)
-                        continue
-                # Fallback: text card
-                card = format_unit_card(unit_num, unit_data, proj_name)
-                await whatsapp_bot._send_wa(group.chat_id, card)
-                await asyncio.sleep(2)
+                fname = unit_data.get("filename", f"{unit_num}.pdf")
+                pdf_sent = False
+                if file_id and svc:
+                    try:
+                        pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+                        if pdf_bytes:
+                            await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
+                            await asyncio.sleep(3)
+                            pdf_sent = True
+                        else:
+                            logger.warning(f"PDF empty for {fname} in groups send")
+                    except Exception:
+                        logger.exception(f"PDF download failed for {fname} in groups send")
+                if not pdf_sent:
+                    card = format_unit_card(unit_num, unit_data, proj_name)
+                    await whatsapp_bot._send_wa(group.chat_id, card)
+                    await asyncio.sleep(2)
 
             sent_groups += 1
 
