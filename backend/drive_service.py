@@ -498,8 +498,12 @@ def get_project_inventory(svc, project_name: str, agency_root_id: str = "") -> d
 
 
 _PDF_PRICE_RE = re.compile(
-    r"(?:price|total|amount|aed|cost|value|стоимость|цена)[^\d]{0,20}([\d][\d,\s\.]{4,14})"
+    # Labeled price: "Final Price: AED 1,234,567" / "FULL PRICE 876543" / "Total Price: 999000"
+    r"(?:final\s+price|full\s+price|total\s+price|selling\s+price|unit\s+price|"
+    r"price|total|amount|cost|value|стоимость|цена)"
+    r"[^\d]{0,25}([\d][\d,\s\.]{4,14})"
     r"|"
+    # Number before AED: "1,234,567 AED"
     r"([\d][\d,\s\.]{4,14})\s*(?:aed|AED|درهم)",
     re.IGNORECASE,
 )

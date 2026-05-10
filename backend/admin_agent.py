@@ -261,6 +261,33 @@ Groups = WhatsApp groups. That's it.
 • Any media request without "to groups" → send_drive_file (send_to="admin")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
 
+━━━ CRITICAL — CONTEXT & SINGLE UNIT REQUESTS ━━━
+
+"Send me this unit" / "send that one" / "yes send it" / "отправь этот" / "скинь тот":
+→ ALWAYS use send_unit_offer — sends exactly ONE PDF
+→ Look at conversation history to identify WHICH unit was just discussed
+→ NEVER use send_drive_file (sends entire folder) for single unit requests
+→ NEVER send more than what was asked
+
+"Send me the highest floor 1BR" / "find best studio and send":
+→ Step 1: search_units(unit_type="1b") — find it
+→ Step 2: send_unit_offer(unit_key=...) — send that ONE PDF only
+
+EXACT COUNT RULE — NON-NEGOTIABLE:
+→ "send 1" / "one unit" = exactly 1 PDF — not 2, not 3
+→ "top 3" / "send 3" = exactly 3 PDFs — count before sending
+→ "all studios" = all matching — send_all=true
+→ Tony COUNTS before sending. Never dumps entire folder.
+
+WORKFLOW — ALWAYS follow this order:
+1. Find exact unit(s) from database (reading prices from inside PDFs)
+2. Confirm in text FIRST: "Found habibi! A-311 — Floor 3 — 1BR — AED 476,601 — sending now 👇"
+3. Send EXACTLY the PDF(s) requested — nothing more
+4. Confirm: "Khalas habibi! ✅ Sent [X] file(s)"
+
+send_unit_offer = ONE specific unit PDF (use for: "this unit", "that one", "unit A311", "yes send it")
+send_inventory_to_groups = N random/filtered units to ALL groups (use for: "send 3 to groups")
+
 ━━━ STAGE 2.5 — UNIT FILE INTELLIGENCE ━━━
 
 SALES OFFER FILE NAMING FORMAT:
@@ -410,6 +437,28 @@ ADMIN_TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
+        "name": "send_unit_offer",
+        "description": "Find ONE specific unit's PDF offer, confirm details in text, then send EXACTLY that one PDF. Use when someone says 'send me this unit', 'that one', 'yes send it', 'unit A311', 'highest floor 1BR'. Never sends more than 1 file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "unit_key": {
+                    "type": "string",
+                    "description": "Unit identifier: 'A311', 'B2701', '311'. Use building+unit from context.",
+                },
+                "project_name": {"type": "string", "description": "Project name if known"},
+                "building": {"type": "string", "description": "Building letter if known (A, B)"},
+                "send_to": {
+                    "type": "string",
+                    "enum": ["admin", "groups"],
+                    "description": "'admin' = this chat only. 'groups' = all WhatsApp groups.",
+                    "default": "admin",
+                },
+            },
+            "required": ["unit_key"],
+        },
+    },
+    {
         "name": "send_inventory_to_groups",
         "description": "Pick exactly N units (random or filtered) and SEND TO ALL WhatsApp groups. Use for: 'send 3 units', 'скинь 3 юнита', 'скинь 2 студии в группы', 'найди 3 юнита на 5 этаже и отправь'. count='all' sends ALL matching units.",
         "input_schema": {
@@ -556,6 +605,14 @@ class AdminAgent:
             )
         if name == "list_drive_projects":
             return self._list_drive_projects(agency)
+        if name == "send_unit_offer":
+            return await self._send_unit_offer(
+                inp["unit_key"],
+                inp.get("project_name", ""),
+                inp.get("building", ""),
+                inp.get("send_to", "admin"),
+                agency, db,
+            )
         if name == "send_inventory_to_groups":
             return await self._send_inventory_to_groups(
                 db,
@@ -634,6 +691,132 @@ class AdminAgent:
         except Exception as e:
             logger.exception("send_drive_file tool error")
             return {"error": str(e)}
+
+    async def _send_unit_offer(
+        self, unit_key: str, project_name: str, building: str,
+        send_to: str, agency, db: Session,
+    ) -> dict:
+        import drive_service as _drive
+        import whatsapp_bot
+
+        svc = _drive.get_service()
+        if not svc:
+            return {"error": "Google Drive not configured"}
+        root_id = getattr(agency, "drive_root_id", "") or ""
+        chat_id = getattr(self, "_chat_id", "")
+
+        # Normalize lookup key
+        key_clean = unit_key.upper().replace("-", "").replace(" ", "")
+
+        # Search: 1) sales offer PDFs, 2) DB inventory, 3) Drive inventory
+        offer_data: Optional[dict] = None
+        proj_name_found = project_name
+
+        # 1. Sales offers (SH_A311_40.60_1B.pdf)
+        try:
+            offers = _drive.scan_sales_offers(svc, root_id)
+            if key_clean in offers:
+                offer_data = offers[key_clean]
+            else:
+                for key, data in offers.items():
+                    b = data.get("building", "")
+                    u = data.get("unit_number", "")
+                    if (b + u).upper() == key_clean or u.upper() == key_clean:
+                        offer_data = data
+                        break
+                    if building and u.upper() == unit_key.upper():
+                        offer_data = data
+                        break
+        except Exception:
+            pass
+
+        # 2. DB unit index fallback
+        unit_data_fallback: Optional[dict] = None
+        if not offer_data:
+            from models import ToniProject
+            projects = db.query(ToniProject).filter(
+                ToniProject.is_active == True, ToniProject.agency_id == agency.id
+            ).all()
+            for proj in projects:
+                idx = proj.unit_index or {}
+                if key_clean in idx:
+                    unit_data_fallback = idx[key_clean]
+                    proj_name_found = proj.project_name
+                    break
+
+        if not offer_data and not unit_data_fallback:
+            return {"error": f"Unit '{unit_key}' not found in offers or inventory"}
+
+        # Enrich offer from PDF to get price/size/view
+        unit_info: dict = {}
+        file_id = ""
+        filename = ""
+        if offer_data:
+            enriched = _drive.enrich_offer_from_pdf(svc, offer_data)
+            unit_info = enriched
+            file_id = enriched.get("file_id", "")
+            filename = enriched.get("filename", "offer.pdf")
+            proj_name_found = enriched.get("project_name", proj_name_found)
+        else:
+            unit_info = unit_data_fallback or {}
+
+        # Build confirmation text
+        bld = unit_info.get("building", building)
+        u_num = unit_info.get("unit_number", unit_key)
+        floor_val = unit_info.get("floor") or _get_floor(u_num, unit_info)
+        u_type = unit_info.get("unit_type", "")
+        price = unit_info.get("Price", "") or ""
+        plan = unit_info.get("payment_plan", "")
+        label = f"{bld}-{u_num}" if bld else u_num
+
+        confirm = f"Found habibi! 🔥\n*{label}*"
+        if proj_name_found:
+            confirm += f" — {proj_name_found}"
+        if floor_val:
+            confirm += f"\nFloor {floor_val}"
+        if u_type:
+            confirm += f" | {u_type}"
+        if price:
+            confirm += f"\n💰 {price}"
+        if plan:
+            confirm += f" | Payment {plan}"
+        confirm += "\nSending now 👇"
+
+        # Send confirmation text first
+        if send_to == "groups":
+            await whatsapp_bot.announce_to_wa_groups(db, confirm, agency)
+        else:
+            await whatsapp_bot._send_wa(chat_id, confirm)
+
+        # Send exactly ONE PDF
+        pdf_sent = False
+        if file_id:
+            pdf_bytes = _drive.download_file(svc, file_id)
+            if pdf_bytes:
+                if send_to == "groups":
+                    await whatsapp_bot.announce_file_to_wa_groups(db, pdf_bytes, filename, "", agency)
+                else:
+                    await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, filename)
+                pdf_sent = True
+
+        if not pdf_sent:
+            # No PDF — send text card only
+            from excel_parser import format_unit_card
+            card = format_unit_card(u_num, unit_info, proj_name_found)
+            if send_to == "groups":
+                await whatsapp_bot.announce_to_wa_groups(db, card, agency)
+            else:
+                await whatsapp_bot._send_wa(chat_id, card)
+
+        return {
+            "sent": True,
+            "unit": label,
+            "floor": floor_val,
+            "type": u_type,
+            "price": price,
+            "pdf_sent": pdf_sent,
+            "destination": send_to,
+        }
 
     async def _send_inventory_to_groups(
         self, db: Session, count: int, project_name: str, agency,
@@ -743,10 +926,41 @@ class AdminAgent:
         for i, group in enumerate(groups):
             if i > 0:
                 await _asyncio.sleep(30)
+
+            # Text summary FIRST — confirm what's being sent
+            summary_lines = [f"🔥 {len(picks)} unit(s) incoming:"]
             for unit_num, unit_data, proj_name in picks:
+                bld = unit_data.get("building", "")
+                floor_val = unit_data.get("floor") or _get_floor(unit_num, unit_data)
+                u_type = unit_data.get("unit_type", "")
+                price = _parse_price(unit_data)
+                label = f"{bld}-{unit_num}" if bld else unit_num
+                line = f"• {label}"
+                if floor_val:
+                    line += f" — Floor {floor_val}"
+                if u_type:
+                    line += f" — {u_type}"
+                if price:
+                    line += f" — AED {int(price):,}".replace(",", " ")
+                summary_lines.append(line)
+            await whatsapp_bot._send_wa(group.chat_id, "\n".join(summary_lines))
+            await _asyncio.sleep(2)
+
+            # Send exactly N files — PDF if available, else text card
+            for unit_num, unit_data, proj_name in picks:
+                file_id = unit_data.get("file_id", "")
+                if file_id:
+                    pdf_bytes = _drive.download_file(svc, file_id)
+                    if pdf_bytes:
+                        fname = unit_data.get("filename", f"{unit_num}.pdf")
+                        await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
+                        await _asyncio.sleep(3)
+                        continue
+                # Fallback: text card
                 card = format_unit_card(unit_num, unit_data, proj_name)
                 await whatsapp_bot._send_wa(group.chat_id, card)
                 await _asyncio.sleep(2)
+
             sent_groups += 1
 
         return {
