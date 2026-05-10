@@ -3,6 +3,7 @@ Admin AI agent — handles requests from the agency administrator.
 Routes admin Telegram messages to a separate Claude instance with admin tools.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -636,7 +637,7 @@ class AdminAgent:
         if name == "list_projects":
             return self._list_projects(db, agency)
         if name == "search_units":
-            return self._search_units(
+            return await self._search_units(
                 db,
                 inp.get("query", ""),
                 inp.get("limit", 5),
@@ -653,7 +654,7 @@ class AdminAgent:
             )
         if name == "send_drive_file":
             return await self._send_drive_file(
-                inp["project_name"], inp.get("file_type", ""),
+                inp["project_name"],
                 inp.get("send_to", "admin"), agency, db,
             )
         if name == "list_drive_projects":
@@ -704,7 +705,7 @@ class AdminAgent:
         except Exception as e:
             return {"error": str(e)}
 
-    async def _send_drive_file(self, project_name: str, file_type: str, send_to: str, agency, db: Session) -> dict:
+    async def _send_drive_file(self, project_name: str, send_to: str, agency, db: Session) -> dict:
         try:
             import drive_service as _drive
             import whatsapp_bot
@@ -733,7 +734,7 @@ class AdminAgent:
 
             sent_count = 0
             for file_id, file_name, export_mime in media_files:
-                file_bytes = _drive.download_file(svc, file_id, export_mime)
+                file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
                 if not file_bytes:
                     continue
                 if send_to == "groups":
@@ -807,7 +808,7 @@ class AdminAgent:
         file_id = ""
         filename = ""
         if offer_data:
-            enriched = _drive.enrich_offer_from_pdf(svc, offer_data)
+            enriched = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, offer_data)
             unit_info = enriched
             file_id = enriched.get("file_id", "")
             filename = enriched.get("filename", "offer.pdf")
@@ -846,7 +847,7 @@ class AdminAgent:
         # Send exactly ONE PDF
         pdf_sent = False
         if file_id:
-            pdf_bytes = _drive.download_file(svc, file_id)
+            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
             if pdf_bytes:
                 if send_to == "groups":
                     await whatsapp_bot.announce_file_to_wa_groups(db, pdf_bytes, filename, "", agency)
@@ -882,7 +883,6 @@ class AdminAgent:
         payment_plan: str = "", price_min=None, price_max=None, view: str = "",
         sort_by: str = "",
     ) -> dict:
-        import asyncio as _asyncio
         import random as _random
         import whatsapp_bot
         from excel_parser import format_unit_card
@@ -940,7 +940,7 @@ class AdminAgent:
             for unit_num, unit_data, proj_name in all_units:
                 if unit_data.get("file_id"):
                     try:
-                        unit_data = _drive.enrich_offer_from_pdf(svc, unit_data)
+                        unit_data = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, unit_data)
                     except Exception:
                         pass
                 enriched_units.append((unit_num, unit_data, proj_name))
@@ -994,19 +994,18 @@ class AdminAgent:
                 if price: line += f" — AED {int(price):,}".replace(",", " ")
                 summary_lines.append(line)
             await whatsapp_bot._send_wa(chat_id, "\n".join(summary_lines))
-            await _asyncio.sleep(1)
+            await asyncio.sleep(1)
             for unit_num, unit_data, proj_name in picks:
                 file_id = unit_data.get("file_id", "")
                 if file_id:
-                    pdf_bytes = _drive.download_file(svc, file_id)
+                    pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
                     if pdf_bytes:
                         fname = unit_data.get("filename", f"{unit_num}.pdf")
                         await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
-                        await _asyncio.sleep(2)
+                        await asyncio.sleep(2)
                         continue
-                from excel_parser import format_unit_card
                 await whatsapp_bot._send_wa(chat_id, format_unit_card(unit_num, unit_data, proj_name))
-                await _asyncio.sleep(1)
+                await asyncio.sleep(1)
             return {"sent_to_admin": True, "units_sent": len(picks), "units": [u[0] for u in picks]}
 
         groups = db.query(WhatsAppGroup).filter(
@@ -1019,7 +1018,7 @@ class AdminAgent:
         sent_groups = 0
         for i, group in enumerate(groups):
             if i > 0:
-                await _asyncio.sleep(30)
+                await asyncio.sleep(30)
 
             # Text summary FIRST — confirm what's being sent
             summary_lines = [f"🔥 {len(picks)} unit(s) incoming:"]
@@ -1038,22 +1037,22 @@ class AdminAgent:
                     line += f" — AED {int(price):,}".replace(",", " ")
                 summary_lines.append(line)
             await whatsapp_bot._send_wa(group.chat_id, "\n".join(summary_lines))
-            await _asyncio.sleep(2)
+            await asyncio.sleep(2)
 
             # Send exactly N files — PDF if available, else text card
             for unit_num, unit_data, proj_name in picks:
                 file_id = unit_data.get("file_id", "")
                 if file_id:
-                    pdf_bytes = _drive.download_file(svc, file_id)
+                    pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
                     if pdf_bytes:
                         fname = unit_data.get("filename", f"{unit_num}.pdf")
                         await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
-                        await _asyncio.sleep(3)
+                        await asyncio.sleep(3)
                         continue
                 # Fallback: text card
                 card = format_unit_card(unit_num, unit_data, proj_name)
                 await whatsapp_bot._send_wa(group.chat_id, card)
-                await _asyncio.sleep(2)
+                await asyncio.sleep(2)
 
             sent_groups += 1
 
@@ -1084,7 +1083,7 @@ class AdminAgent:
             ],
         }
 
-    def _search_units(
+    async def _search_units(
         self, db: Session, query: str, limit: int, agency,
         floor=None, floor_min=None, floor_max=None,
         unit_type: str = "", building: str = "",
@@ -1128,7 +1127,7 @@ class AdminAgent:
                     seen = {u[0] for u in all_units}
                     for proj in projects:
                         try:
-                            drive_idx = _drive.get_project_inventory(svc, proj.project_name, root_id)
+                            drive_idx = await asyncio.to_thread(_drive.get_project_inventory, svc, proj.project_name, root_id)
                             for u, d in drive_idx.items():
                                 if u not in seen:
                                     all_units.append((u, d, proj.project_name))
@@ -1136,7 +1135,7 @@ class AdminAgent:
                         except Exception:
                             pass
                     try:
-                        offers = _drive.scan_sales_offers(svc, root_id)
+                        offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
                         for unit_key, offer_data in offers.items():
                             if unit_key not in seen:
                                 all_units.append((unit_key, offer_data, offer_data.get("project_name", "Unknown")))
@@ -1151,7 +1150,7 @@ class AdminAgent:
                         for u, d, p in all_units:
                             if d.get("file_id"):
                                 try:
-                                    d = _drive.enrich_offer_from_pdf(svc, d)
+                                    d = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, d)
                                 except Exception:
                                     pass
                             enriched.append((u, d, p))

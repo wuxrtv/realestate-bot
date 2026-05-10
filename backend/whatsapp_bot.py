@@ -230,6 +230,7 @@ _REALESTATE_TRIGGERS = re.compile(
     r"|\b\d{3,5}\b",
     re.IGNORECASE,
 )
+_AUDIO_TYPES = frozenset({"audioMessage", "pttMessage"})
 _WA_BASE = "https://api.green-api.com"
 
 
@@ -336,7 +337,6 @@ async def handle_update(data: dict, agency: Agency):
     msg_type = message_data.get("typeMessage")
     logger.info(f"WA message type: {msg_type}")
 
-    _AUDIO_TYPES = {"audioMessage", "pttMessage"}  # ptt = push-to-talk (voice note)
     if msg_type not in ("textMessage", "documentMessage", "imageMessage", "videoMessage", *_AUDIO_TYPES):
         return
 
@@ -847,7 +847,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
             if media_files:
                 await _send_wa(chat_id, f"Yalla habibi — {search_name} media incoming 📸🎬👇")
                 for file_id, file_name, export_mime in media_files:
-                    file_bytes = _drive.download_file(svc, file_id, export_mime)
+                    file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
                     if file_bytes:
                         await _send_wa_file(chat_id, file_bytes, file_name)
                 sent = True
@@ -931,7 +931,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                     drive_result = _drive.find_unit_file(svc, proj.project_name, unit, root_id)
                     if drive_result:
                         file_id, file_name = drive_result
-                        file_bytes = _drive.download_file(svc, file_id)
+                        file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
                         if file_bytes:
                             await _send_wa(chat_id,
                                            f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
@@ -966,14 +966,14 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                             offer_data = val
                             break
                 if offer_data:
-                    enriched = _drive.enrich_offer_from_pdf(svc, offer_data)
+                    enriched = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, offer_data)
                     proj_name = enriched.get("project_name", "Project")
                     card = format_unit_card(unit, enriched, proj_name)
                     found = True
                     # Also try to send the PDF file
                     file_id = enriched.get("file_id", "")
                     if file_id:
-                        file_bytes = _drive.download_file(svc, file_id)
+                        file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
                         if file_bytes:
                             await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
                             await _send_wa_file(chat_id, file_bytes, enriched.get("filename", "offer.pdf"), "")

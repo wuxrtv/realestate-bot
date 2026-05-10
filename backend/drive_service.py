@@ -530,7 +530,7 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
         # Try labeled price first (Final Price / Full Price / etc.)
         m = _PDF_PRICE_RE.search(text)
         if m:
-            raw = (m.group(1) or m.group(2) or "").replace(",", "").replace(" ", "").strip()
+            raw = next((g for g in m.groups() if g), "").replace(",", "").replace(" ", "").strip()
             raw = re.sub(r"\.0+$", "", raw)  # strip trailing .00
             try:
                 num = int(float(raw))
@@ -614,10 +614,10 @@ def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
             else:
                 project_folders.append(folder)
 
+        seen_sid: set[str] = set()
         for proj_folder in project_folders:
             office_id = _find_named_subfolder(svc, proj_folder["id"], _OFFICE_FOLDER_NAMES)
             search_ids = [office_id, proj_folder["id"]] if office_id else [proj_folder["id"]]
-            seen_sid: set[str] = set()
             for sid in search_ids:
                 if sid in seen_sid:
                     continue
