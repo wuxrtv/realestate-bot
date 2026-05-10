@@ -642,7 +642,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
 
     if intent == "unit_query":
         if unit_numbers:
-            await _respond_unit(chat_id, unit_numbers, projects, agency)
+            await _respond_unit(chat_id, unit_numbers, projects, agency, project_name)
         else:
             await _send_wa(chat_id,
                            f"Ya habibi, which unit number? 😅 Contact {contact} 🙏")
@@ -723,7 +723,8 @@ async def _send_wa_file(chat_id: str,
 
 # ─── Unit lookup ──────────────────────────────────────────────────────────────
 
-async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency: Agency):
+async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency: Agency,
+                        hint_project: str = ""):
     import drive_service as _drive
     svc = _drive.get_service()
     contact = agency.umar_contact or "@support"
@@ -731,13 +732,15 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
 
     for unit in unit_numbers[:3]:
         found = False
+
+        # 1. Search DB inventory
         for proj in projects:
             idx: dict = proj.unit_index or {}
             if unit in idx:
                 found = True
                 card = format_unit_card(unit, idx[unit], proj.project_name)
 
-                # Try Drive first — send PDF/file if available
+                # Try to send unit PDF from Drive if available
                 if svc:
                     drive_result = _drive.find_unit_file(svc, proj.project_name, unit, root_id)
                     if drive_result:
@@ -749,13 +752,23 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                             await _send_wa_file(chat_id, file_bytes, file_name, card)
                             break
 
-                # No Drive file — send text card
-                await _send_wa(chat_id,
-                               f"Wallah good choice habibi! 👀\n{card}")
+                await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
                 break
 
+        # 2. Fallback: read inventory Excel from Drive
+        if not found and svc:
+            proj_names = [p.project_name for p in projects]
+            if hint_project and hint_project not in proj_names:
+                proj_names.insert(0, hint_project)
+            for p_name in proj_names:
+                drive_idx = _drive.get_project_inventory(svc, p_name, root_id)
+                if unit in drive_idx:
+                    found = True
+                    card = format_unit_card(unit, drive_idx[unit], p_name)
+                    await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                    break
+
         if not found:
-            # Unit not in inventory — show alternatives
             alts = []
             for proj in projects:
                 idx = proj.unit_index or {}
@@ -770,8 +783,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                            f"Sold or reserved wallah\n\nBut check these 👇" if alts else
                            f"Ya habibi — Unit {unit} not found 😔 Contact {contact} 🙏")
             for u_num, u_data, p_name in alts[:2]:
-                await _send_wa(chat_id,
-                               format_unit_card(u_num, u_data, p_name))
+                await _send_wa(chat_id, format_unit_card(u_num, u_data, p_name))
 
 
 # ─── Property search ──────────────────────────────────────────────────────────

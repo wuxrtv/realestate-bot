@@ -18,12 +18,14 @@ _CACHE_TTL = 1800  # 30 minutes
 
 _folder_cache: dict[str, tuple[list, float]] = {}         # folder_id → (items, ts)
 _project_cache: dict[str, tuple[Optional[str], float]] = {}  # "root|name" → (folder_id, ts)
+_inventory_cache: dict[str, tuple[dict, float]] = {}         # "root|project" → (unit_index, ts)
 
 
 def clear_cache():
     """Call after uploading new files to Drive so next search is fresh."""
     _folder_cache.clear()
     _project_cache.clear()
+    _inventory_cache.clear()
     logger.info("Drive: cache cleared")
 
 
@@ -154,6 +156,7 @@ def _find_project_folder(svc, project_name: str, agency_root_id: str = "") -> Op
 # File type categories
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
+_EXCEL_EXTS = {".xlsx", ".xls", ".csv"}
 _PDF_EXT = ".pdf"
 _BROCHURE_KEYWORDS = {"brochure", "брошюр", "presentation", "презентац", "catalog", "каталог", "флайер", "flyer"}
 
@@ -377,6 +380,47 @@ def download_file(svc, file_id: str, export_mime: str = "") -> Optional[bytes]:
     except Exception:
         logger.exception(f"Drive: download failed {file_id}")
         return None
+
+
+def get_project_inventory(svc, project_name: str, agency_root_id: str = "") -> dict:
+    """Download + parse inventory Excel/CSV from Drive, return unit_index dict (cached 30 min).
+    Looks in 'sales office' subfolder first, then project root.
+    Returns {} if no inventory file found.
+    """
+    cache_key = f"{agency_root_id}|inv|{project_name.lower()}"
+    now = time.time()
+    if cache_key in _inventory_cache:
+        idx, ts = _inventory_cache[cache_key]
+        if now - ts < _CACHE_TTL:
+            logger.info(f"Drive: inventory cache hit for '{project_name}' ({len(idx)} units)")
+            return idx
+
+    try:
+        proj_id = _find_project_folder(svc, project_name, agency_root_id)
+        if not proj_id:
+            _inventory_cache[cache_key] = ({}, now)
+            return {}
+        office_id = _find_named_subfolder(svc, proj_id, _OFFICE_FOLDER_NAMES)
+        search_id = office_id or proj_id
+        files = _collect_files(svc, search_id)
+        for f in files:
+            if _ext(f["name"]) in _EXCEL_EXTS:
+                data = download_file(svc, f["id"])
+                if data:
+                    from excel_parser import build_unit_index, parse_csv, parse_excel
+                    if f["name"].lower().endswith(".csv"):
+                        sheets = parse_csv(data)
+                    else:
+                        sheets = parse_excel(data)
+                    idx = build_unit_index(sheets)
+                    _inventory_cache[cache_key] = (idx, now)
+                    logger.info(f"Drive: loaded inventory '{f['name']}' for '{project_name}' — {len(idx)} units")
+                    return idx
+    except Exception:
+        logger.exception(f"Drive: get_project_inventory failed {project_name}")
+
+    _inventory_cache[cache_key] = ({}, now)
+    return {}
 
 
 def list_project_names(svc, agency_root_id: str = "") -> list:
