@@ -6,12 +6,77 @@ Routes admin Telegram messages to a separate Claude instance with admin tools.
 import json
 import logging
 import os
+import re
 
 import anthropic
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from models import AdminConversation, ToniProject
+
+
+def _filter_unit_list(units: list, floor=None, unit_type: str = "", building: str = "") -> list:
+    """Filter (unit_num, unit_data, proj_name) by floor / unit_type / building. All optional."""
+    if floor is None and not unit_type and not building:
+        return units
+
+    result = []
+    for unit_num, unit_data, proj_name in units:
+        # ── Floor ──────────────────────────────────────────────────────────
+        if floor is not None:
+            fl_str = str(floor)
+            matched = False
+            for k, v in unit_data.items():
+                if any(kw in k.lower() for kw in ("floor", "этаж", "fl.", "level")):
+                    if str(v).strip() == fl_str:
+                        matched = True
+                        break
+            if not matched:
+                # Derive floor from unit number: 311→3, 1507→15, 501→5
+                if len(unit_num) == 3:
+                    matched = unit_num[0] == fl_str
+                elif len(unit_num) == 4:
+                    matched = (unit_num[:2] == fl_str.zfill(2)) or (unit_num[0] == fl_str and unit_num[1] == "0")
+            if not matched:
+                continue
+
+        # ── Unit type ──────────────────────────────────────────────────────
+        if unit_type:
+            t = unit_type.lower().strip()
+            t = re.sub(r"(\d)\s*br(s)?$", r"\1b", t)
+            t = re.sub(r"(\d)\s*bed(room)?s?$", r"\1b", t)
+            matched = False
+            for k, v in unit_data.items():
+                if any(kw in k.lower() for kw in ("type", "тип", "bed", "room", "flat", "apt", "layout")):
+                    vl = re.sub(r"(\d)\s*br(s)?", r"\1b", str(v).lower())
+                    vl = re.sub(r"(\d)\s*bed(room)?s?", r"\1b", vl)
+                    if t in vl or vl.startswith(t):
+                        matched = True
+                        break
+            if not matched:
+                all_vals = re.sub(r"(\d)\s*br", r"\1b", " ".join(str(v).lower() for v in unit_data.values()))
+                matched = t in all_vals
+            if not matched:
+                continue
+
+        # ── Building ───────────────────────────────────────────────────────
+        if building:
+            b = building.lower().strip()
+            matched = False
+            for k, v in unit_data.items():
+                if any(kw in k.lower() for kw in ("building", "здание", "tower", "block", "корпус", "bld")):
+                    if b in str(v).lower():
+                        matched = True
+                        break
+            if not matched:
+                all_vals = " ".join(str(v).lower() for v in unit_data.values())
+                matched = b in all_vals
+            if not matched:
+                continue
+
+        result.append((unit_num, unit_data, proj_name))
+
+    return result
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +159,25 @@ Groups = WhatsApp groups. That's it.
 
 ━━━ TOOLS — use automatically, without being asked ━━━
 • "what projects", "show database", "is there Breez" → list_projects
-• "unit 1507", "show 2301", "any 3-bedrooms" → search_units
+• "unit 1507", "show 2301" → search_units (query="1507")
+• "find units on floor 5", "show 1b apartments", "units in building A" → search_units (floor=5 / unit_type="1b" / building="A")
 • "broadcast text to groups", "announce text" → announce_to_groups
 • "send 3 units", "скинь юниты", "отправь 5 юнитов в группы" → send_inventory_to_groups (count=N)
+• "send 3 units on floor 5", "скинь 3 юнита на 5 этаже" → send_inventory_to_groups (count=3, floor=5)
+• "send 2 studio units to groups", "скинь 2 юнита 1b в группы" → send_inventory_to_groups (count=2, unit_type="studio"/"1b")
+• "send building A units", "юниты здания B в группы" → send_inventory_to_groups (building="A")
 • "send brochure/video/photo/media TO GROUPS" → send_drive_file (send_to="groups")
 • "send me brochure/video/photo/media" (to admin only) → send_drive_file (send_to="admin")
 • Any media request without "to groups" → send_drive_file (send_to="admin")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
+
+FILTER RULES:
+→ If Admin says "floor 5" / "5 этаж" / "на 5 этаже" → use floor=5
+→ If Admin says "1b" / "1br" / "1 bedroom" / "studio" → use unit_type=...
+→ If Admin says "building A" / "здание A" / "Tower B" → use building=...
+→ Multiple filters combine: "find 2 units of type 1b on floor 3" → count=2, floor=3, unit_type="1b"
+→ "найди юниты" without "в группы" → search_units (show to admin only)
+→ "найди и скинь в группы" / "send to groups" → send_inventory_to_groups
 
 ━━━ GOOGLE DRIVE — CRITICAL RULES ━━━
 You ARE connected to Google Drive. You DO have access. This is a FACT.
@@ -165,14 +242,17 @@ ADMIN_TOOLS = [
     },
     {
         "name": "search_units",
-        "description": "Поиск юнитов по номеру или ключевым словам во всех проектах.",
+        "description": "Search units by number, keywords, or criteria (floor, type, building). Returns results to admin.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Номер юнита или текстовый запрос"},
-                "limit": {"type": "integer", "description": "Максимум результатов (по умолчанию 5)"},
+                "query": {"type": "string", "description": "Unit number or keywords. Leave empty if using filters only."},
+                "limit": {"type": "integer", "description": "Max results (default 5)"},
+                "floor": {"type": "integer", "description": "Filter by floor number (e.g. 5 for 5th floor)"},
+                "unit_type": {"type": "string", "description": "Filter by apartment type: '1b', '2b', 'studio', '3b' etc."},
+                "building": {"type": "string", "description": "Filter by building/tower name: 'A', 'B', 'Tower 1' etc."},
             },
-            "required": ["query"],
+            "required": [],
         },
     },
     {
@@ -198,7 +278,7 @@ ADMIN_TOOLS = [
     },
     {
         "name": "send_inventory_to_groups",
-        "description": "Pick N random units from inventory and send their cards to all WhatsApp groups. Use this when Admin says 'send 3 units', 'скинь юниты', 'отправь 5 юнитов' etc.",
+        "description": "Pick N units from inventory (random or filtered) and send to all WhatsApp groups. Use for: 'send 3 units', 'скинь 3 юнита', 'найди 3 юнита на 5 этаже и скинь', 'отправь 1b юниты в группы' etc.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -208,7 +288,19 @@ ADMIN_TOOLS = [
                 },
                 "project_name": {
                     "type": "string",
-                    "description": "Optional: filter by project name. Leave empty to pick from all projects.",
+                    "description": "Optional: filter by project name.",
+                },
+                "floor": {
+                    "type": "integer",
+                    "description": "Optional: filter by floor number (e.g. 5 → only units on floor 5)",
+                },
+                "unit_type": {
+                    "type": "string",
+                    "description": "Optional: filter by apartment type ('1b', '2b', 'studio', '3b' etc.)",
+                },
+                "building": {
+                    "type": "string",
+                    "description": "Optional: filter by building/tower ('A', 'B', 'Tower 1' etc.)",
                 },
             },
             "required": [],
@@ -304,7 +396,15 @@ class AdminAgent:
         if name == "list_projects":
             return self._list_projects(db, agency)
         if name == "search_units":
-            return self._search_units(db, inp["query"], inp.get("limit", 5), agency)
+            return self._search_units(
+                db,
+                inp.get("query", ""),
+                inp.get("limit", 5),
+                agency,
+                floor=inp.get("floor"),
+                unit_type=inp.get("unit_type", ""),
+                building=inp.get("building", ""),
+            )
         if name == "send_drive_file":
             return await self._send_drive_file(
                 inp["project_name"], inp.get("file_type", ""),
@@ -314,7 +414,13 @@ class AdminAgent:
             return self._list_drive_projects(agency)
         if name == "send_inventory_to_groups":
             return await self._send_inventory_to_groups(
-                db, inp.get("count", 3), inp.get("project_name", ""), agency
+                db,
+                inp.get("count", 3),
+                inp.get("project_name", ""),
+                agency,
+                floor=inp.get("floor"),
+                unit_type=inp.get("unit_type", ""),
+                building=inp.get("building", ""),
             )
         return {"error": f"Unknown tool: {name}"}
 
@@ -378,7 +484,8 @@ class AdminAgent:
             logger.exception("send_drive_file tool error")
             return {"error": str(e)}
 
-    async def _send_inventory_to_groups(self, db: Session, count: int, project_name: str, agency) -> dict:
+    async def _send_inventory_to_groups(self, db: Session, count: int, project_name: str, agency,
+                                        floor=None, unit_type: str = "", building: str = "") -> dict:
         import asyncio as _asyncio
         import random as _random
         import whatsapp_bot
@@ -418,7 +525,19 @@ class AdminAgent:
         if not all_units:
             return {"error": "No units found in inventory or Drive"}
 
-        picks = _random.sample(all_units, min(count, len(all_units)))
+        # Apply filters if specified
+        filtered = _filter_unit_list(all_units, floor=floor, unit_type=unit_type, building=building)
+        if not filtered:
+            criteria = []
+            if floor is not None:
+                criteria.append(f"floor={floor}")
+            if unit_type:
+                criteria.append(f"type={unit_type}")
+            if building:
+                criteria.append(f"building={building}")
+            return {"error": f"No units match criteria: {', '.join(criteria)}"}
+
+        picks = _random.sample(filtered, min(count, len(filtered)))
 
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
@@ -464,8 +583,8 @@ class AdminAgent:
             ],
         }
 
-    def _search_units(self, db: Session, query: str, limit: int, agency) -> dict:
-        import re as _re
+    def _search_units(self, db: Session, query: str, limit: int, agency,
+                      floor=None, unit_type: str = "", building: str = "") -> dict:
         from excel_parser import format_unit_card
 
         projects = db.query(ToniProject).filter(
@@ -473,7 +592,8 @@ class AdminAgent:
         ).all()
         results = []
 
-        unit_match = _re.search(r"\b(\d{3,5})\b", query)
+        # 1. Exact unit-number lookup (if query contains digits)
+        unit_match = re.search(r"\b(\d{3,5})\b", query) if query else None
         if unit_match:
             unit_num = unit_match.group(1)
             for proj in projects:
@@ -485,7 +605,41 @@ class AdminAgent:
                         "card": format_unit_card(unit_num, idx[unit_num], proj.project_name),
                     })
 
-        if not results:
+        # 2. Filter-based search (floor / unit_type / building)
+        if not results and (floor is not None or unit_type or building):
+            all_units: list[tuple] = []
+            for proj in projects:
+                for u, d in (proj.unit_index or {}).items():
+                    all_units.append((u, d, proj.project_name))
+            # Also Drive inventory
+            try:
+                import drive_service as _drive
+                svc = _drive.get_service()
+                root_id = getattr(agency, "drive_root_id", "") or ""
+                if svc:
+                    seen = {u[0] for u in all_units}
+                    for proj in projects:
+                        try:
+                            drive_idx = _drive.get_project_inventory(svc, proj.project_name, root_id)
+                            for u, d in drive_idx.items():
+                                if u not in seen:
+                                    all_units.append((u, d, proj.project_name))
+                                    seen.add(u)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            filtered = _filter_unit_list(all_units, floor=floor, unit_type=unit_type, building=building)
+            for unit_num, data, proj_name in filtered[:limit]:
+                results.append({
+                    "unit": unit_num,
+                    "project": proj_name,
+                    "card": format_unit_card(unit_num, data, proj_name),
+                })
+
+        # 3. Keyword fallback
+        if not results and query:
             kws = query.lower().split()
             for proj in projects:
                 idx = proj.unit_index or {}
