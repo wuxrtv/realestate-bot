@@ -519,21 +519,24 @@ _PDF_VIEW_RE = re.compile(
 
 def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
     """Extract price, size, and view from a sales offer PDF using pdfplumber text extraction.
-    Returns dict with keys: price, size, view (all strings, may be empty).
+    Returns dict with keys: price (formatted string), price_raw (int), size, view.
     """
-    result: dict[str, str] = {"price": "", "size": "", "view": ""}
+    result: dict = {"price": "", "price_raw": None, "size": "", "view": ""}
     try:
         import pdfplumber
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages[:3])
 
+        # Try labeled price first (Final Price / Full Price / etc.)
         m = _PDF_PRICE_RE.search(text)
         if m:
             raw = (m.group(1) or m.group(2) or "").replace(",", "").replace(" ", "").strip()
+            raw = re.sub(r"\.0+$", "", raw)  # strip trailing .00
             try:
-                num = float(raw)
+                num = int(float(raw))
                 if num >= 100_000:
-                    result["price"] = f"{int(num):,} AED".replace(",", " ")
+                    result["price_raw"] = num                          # exact integer
+                    result["price"] = f"AED {num:,}"                  # "AED 1,015,663"
             except ValueError:
                 pass
 
@@ -568,6 +571,8 @@ def enrich_offer_from_pdf(svc, offer_data: dict) -> dict:
             inner = extract_offer_data_from_pdf(pdf_bytes)
             if inner.get("price"):
                 extra["Price"] = inner["price"]
+            if inner.get("price_raw") is not None:
+                extra["price_raw"] = inner["price_raw"]   # exact integer for sorting
             if inner.get("size"):
                 extra["Size"] = inner["size"]
             if inner.get("view"):

@@ -42,11 +42,21 @@ def _get_floor(unit_num: str, unit_data: dict) -> Optional[int]:
 
 
 def _parse_price(unit_data: dict) -> Optional[float]:
-    """Extract numeric price from unit data fields."""
+    """Extract exact numeric price. Uses price_raw (integer) first — most accurate."""
+    # 1. Exact integer from PDF extraction (most accurate — never rounded)
+    if unit_data.get("price_raw") is not None:
+        try:
+            return float(unit_data["price_raw"])
+        except (ValueError, TypeError):
+            pass
+    # 2. Formatted price string: "AED 1,015,663" or "1 015 663 AED"
     for k, v in unit_data.items():
         if re.search(r"(price|cost|цена|стоимость|aed|amount|total|value)", k, re.I):
             try:
-                return float(str(v).replace(",", "").replace(" ", "").replace("AED", ""))
+                clean = re.sub(r"[^\d\.]", "", str(v))
+                num = float(clean)
+                if num >= 10_000:
+                    return num
             except (ValueError, TypeError):
                 pass
     return None
@@ -60,6 +70,19 @@ def _normalize_type(s: str) -> str:
     return s
 
 
+def _sort_units(units: list, sort_by: str) -> list:
+    """Sort (unit_num, unit_data, proj_name) list by sort_by criterion."""
+    if sort_by in ("cheapest", "lowest_price", "ascending", "cheap"):
+        return sorted(units, key=lambda x: _parse_price(x[1]) or float("inf"))
+    if sort_by in ("most_expensive", "highest_price", "descending", "expensive"):
+        return sorted(units, key=lambda x: _parse_price(x[1]) or 0.0, reverse=True)
+    if sort_by in ("highest_floor", "top_floor"):
+        return sorted(units, key=lambda x: _get_floor(x[0], x[1]) or 0, reverse=True)
+    if sort_by in ("lowest_floor", "ground_floor"):
+        return sorted(units, key=lambda x: _get_floor(x[0], x[1]) or float("inf"))
+    return units
+
+
 def _filter_unit_list(
     units: list,
     floor: Optional[int] = None,
@@ -71,6 +94,7 @@ def _filter_unit_list(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     view: str = "",
+    sort_by: str = "",
 ) -> list:
     """Filter (unit_num, unit_data, proj_name) tuples. All criteria are optional."""
     has_filter = any([
@@ -166,7 +190,7 @@ def _filter_unit_list(
 
         result.append((unit_num, unit_data, proj_name))
 
-    return result
+    return _sort_units(result, sort_by) if sort_by else result
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +310,26 @@ WORKFLOW — ALWAYS follow this order:
 4. Confirm: "Khalas habibi! ✅ Sent [X] file(s)"
 
 send_unit_offer = ONE specific unit PDF (use for: "this unit", "that one", "unit A311", "yes send it")
-send_inventory_to_groups = N random/filtered units to ALL groups (use for: "send 3 to groups")
+send_inventory_to_groups = N filtered/sorted units → groups OR admin (use for: "send 3 to groups", "send me cheapest studio")
+
+━━━ PRICE ACCURACY — NON-NEGOTIABLE ━━━
+→ Price = exact integer read from INSIDE PDF (never approximated, never rounded)
+→ AED 1,015,663 ≠ AED 1,100,000 — 75,000 difference = wrong unit, wrong client
+→ Always use sort_by for cheapest/most expensive — never guess
+
+SORTING ROUTING:
+→ "cheapest studio" / "самая дешёвая студия" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "top 3 cheapest" → send_inventory_to_groups(sort_by="cheapest", count=3, send_to="admin")
+→ "most expensive 1BR" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=1, send_to="admin")
+→ "cheapest to groups" → send_inventory_to_groups(sort_by="cheapest", count=1, send_to="groups")
+→ "highest floor" → send_inventory_to_groups(sort_by="highest_floor", count=1, send_to="admin")
+→ "above 1M studios" → send_inventory_to_groups(unit_type="studio", price_min=1000000, send_to="admin")
+
+VERIFY WORKFLOW (always):
+1. Read price from price_raw (exact integer from PDF)
+2. Sort correctly
+3. Confirm in text: "Habibi cheapest studio I have 👇\nA-315 — Floor 3 — AED 1,015,663\nSending now!"
+4. Send EXACTLY that file — nothing else
 
 ━━━ STAGE 2.5 — UNIT FILE INTELLIGENCE ━━━
 
@@ -460,12 +503,13 @@ ADMIN_TOOLS = [
     },
     {
         "name": "send_inventory_to_groups",
-        "description": "Pick exactly N units (random or filtered) and SEND TO ALL WhatsApp groups. Use for: 'send 3 units', 'скинь 3 юнита', 'скинь 2 студии в группы', 'найди 3 юнита на 5 этаже и отправь'. count='all' sends ALL matching units.",
+        "description": "Pick exactly N units (filtered + optionally sorted) and send to WhatsApp groups OR admin. For 'cheapest'/'most expensive' requests — use sort_by to get exact order. count='all' sends ALL matching units.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "count": {"type": "integer", "description": "Exact number of units to send. Default 3, max 10. If 'all' requested pass 0."},
-                "send_all": {"type": "boolean", "description": "Set true to send ALL matching units (when admin says 'all')"},
+                "count": {"type": "integer", "description": "Exact number of units to send. Default 3, max 10."},
+                "send_all": {"type": "boolean", "description": "Set true to send ALL matching units"},
+                "send_to": {"type": "string", "enum": ["groups", "admin"], "description": "'groups' = all WhatsApp groups. 'admin' = this chat only. Default: groups"},
                 "project_name": {"type": "string", "description": "Filter by project name"},
                 "floor": {"type": "integer", "description": "Exact floor number"},
                 "floor_min": {"type": "integer", "description": "Floor range minimum"},
@@ -476,6 +520,7 @@ ADMIN_TOOLS = [
                 "price_min": {"type": "number", "description": "Minimum price in AED"},
                 "price_max": {"type": "number", "description": "Maximum price in AED"},
                 "view": {"type": "string", "description": "View type: 'pool', 'burj khalifa', 'marina', 'sea' etc."},
+                "sort_by": {"type": "string", "description": "Sort order: 'cheapest' (lowest price first), 'most_expensive' (highest price first), 'highest_floor', 'lowest_floor'. When set — picks first N from sorted list, not random."},
             },
             "required": [],
         },
@@ -620,6 +665,7 @@ class AdminAgent:
                 inp.get("project_name", ""),
                 agency,
                 send_all=inp.get("send_all", False),
+                send_to=inp.get("send_to", "groups"),
                 floor=inp.get("floor"),
                 floor_min=inp.get("floor_min"),
                 floor_max=inp.get("floor_max"),
@@ -629,6 +675,7 @@ class AdminAgent:
                 price_min=inp.get("price_min"),
                 price_max=inp.get("price_max"),
                 view=inp.get("view", ""),
+                sort_by=inp.get("sort_by", ""),
             )
         return {"error": f"Unknown tool: {name}"}
 
@@ -821,9 +868,11 @@ class AdminAgent:
     async def _send_inventory_to_groups(
         self, db: Session, count: int, project_name: str, agency,
         send_all: bool = False,
+        send_to: str = "groups",
         floor=None, floor_min=None, floor_max=None,
         unit_type: str = "", building: str = "",
         payment_plan: str = "", price_min=None, price_max=None, view: str = "",
+        sort_by: str = "",
     ) -> dict:
         import asyncio as _asyncio
         import random as _random
@@ -889,13 +938,13 @@ class AdminAgent:
                 enriched_units.append((unit_num, unit_data, proj_name))
             all_units = enriched_units
 
-        # Apply filters
+        # Apply filters + sort
         filtered = _filter_unit_list(
             all_units,
             floor=floor, floor_min=floor_min, floor_max=floor_max,
             unit_type=unit_type, building=building,
             payment_plan=payment_plan, price_min=price_min, price_max=price_max,
-            view=view,
+            view=view, sort_by=sort_by,
         )
         if not filtered:
             criteria = []
@@ -912,8 +961,45 @@ class AdminAgent:
 
         if send_all:
             picks = filtered
+        elif sort_by:
+            # Sorted request: take first N in sorted order (not random)
+            picks = filtered[:max(1, count or 3)]
         else:
             picks = _random.sample(filtered, min(count or 3, len(filtered)))
+
+        # Determine destinations
+        chat_id = getattr(self, "_chat_id", "")
+        if send_to == "admin":
+            # Send to admin private chat only
+            if not chat_id:
+                return {"error": "No admin chat_id"}
+            summary_lines = [f"🔥 {len(picks)} unit(s):"]
+            for unit_num, unit_data, proj_name in picks:
+                bld = unit_data.get("building", "")
+                floor_val = unit_data.get("floor") or _get_floor(unit_num, unit_data)
+                u_type = unit_data.get("unit_type", "")
+                price = _parse_price(unit_data)
+                label = f"{bld}-{unit_num}" if bld else unit_num
+                line = f"• {label}"
+                if floor_val: line += f" — Floor {floor_val}"
+                if u_type: line += f" — {u_type}"
+                if price: line += f" — AED {int(price):,}".replace(",", " ")
+                summary_lines.append(line)
+            await whatsapp_bot._send_wa(chat_id, "\n".join(summary_lines))
+            await _asyncio.sleep(1)
+            for unit_num, unit_data, proj_name in picks:
+                file_id = unit_data.get("file_id", "")
+                if file_id:
+                    pdf_bytes = _drive.download_file(svc, file_id)
+                    if pdf_bytes:
+                        fname = unit_data.get("filename", f"{unit_num}.pdf")
+                        await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
+                        await _asyncio.sleep(2)
+                        continue
+                from excel_parser import format_unit_card
+                await whatsapp_bot._send_wa(chat_id, format_unit_card(unit_num, unit_data, proj_name))
+                await _asyncio.sleep(1)
+            return {"sent_to_admin": True, "units_sent": len(picks), "units": [u[0] for u in picks]}
 
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
