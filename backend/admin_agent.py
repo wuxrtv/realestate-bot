@@ -104,7 +104,8 @@ def _filter_unit_list(
         unit_type, building, payment_plan, price_min is not None, price_max is not None, view,
     ])
     if not has_filter:
-        return units
+        # Still need to sort even when no filters applied
+        return _sort_units(units, sort_by) if sort_by else units
 
     result = []
     for unit_num, unit_data, proj_name in units:
@@ -282,11 +283,33 @@ Groups = WhatsApp groups. That's it.
 • "send 3 units on floor 5", "скинь 3 юнита на 5 этаже" → send_inventory_to_groups (count=3, floor=5, send_to="groups")
 • "send 2 studio units to groups", "скинь 2 юнита 1b в группы" → send_inventory_to_groups (count=2, unit_type="studio"/"1b", send_to="groups")
 • "send building A units", "юниты здания B в группы" → send_inventory_to_groups (building="A", send_to="groups")
-• "send brochure/video/photo/media TO GROUPS" → send_drive_file (send_to="groups")
-• "send me brochure/video/photo/media" (to admin only) → send_drive_file (send_to="admin")
-• Any media request without "to groups" → send_drive_file (send_to="admin")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
 • "update database" / "обнови базу" / "refresh prices" / "rescan" → rebuild_index
+
+━━━ TWO COMPLETELY DIFFERENT TOOLS — NEVER CONFUSE THEM ━━━
+
+send_inventory_to_groups = finds and sends UNIT PDFs (sales offers) from the indexed database
+→ Use for: ANY request with count/price/type/floor/sort (cheapest, top 3, studio, 1BR, etc.)
+→ "cheapest studio [sales offer]" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "top 3 most expensive 1BR" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=3, send_to="admin")
+→ "send me a studio sales offer" → send_inventory_to_groups(unit_type="studio", count=1, send_to="admin")
+→ "send all studio offers to groups" → send_inventory_to_groups(unit_type="studio", send_all=True, send_to="groups")
+→ "cheapest unit above floor 15" → send_inventory_to_groups(sort_by="cheapest", floor_min=15, count=1, send_to="admin")
+→ "give me/find me/show me [unit type/price/floor]" = ALWAYS send_inventory_to_groups
+
+send_drive_file = finds and sends project MEDIA FILES (brochures PDF, photos, videos, presentations)
+→ Use for: "send SAAS Hills brochure", "send photos for project X", "send media to groups"
+→ NEVER use for: filtered unit searches, cheapest/most expensive, top N, type filters
+→ "send SAAS Hills brochure to groups" → send_drive_file(project_name="SAAS Hills", send_to="groups")
+→ "send me the project photos" → send_drive_file(project_name=..., send_to="admin")
+
+KEY DISTINCTION:
+"sales offer" ALONE = send_inventory_to_groups (it's a unit PDF search)
+"brochure" / "photos" / "video" / "media" = send_drive_file (project marketing materials)
+ANY filter/sort word = send_inventory_to_groups regardless of other words
+
+• "send me brochure/video/photo/media" (to admin only) → send_drive_file (send_to="admin")
+• "send brochure/video/photo/media TO GROUPS" → send_drive_file (send_to="groups")
 
 ━━━ CRITICAL — CONTEXT & SINGLE UNIT REQUESTS ━━━
 
@@ -328,13 +351,20 @@ DESTINATION RULE — MOST IMPORTANT:
 → DEFAULT when unclear → send_to="groups"
 
 SORTING ROUTING:
-→ "cheapest studio" (no mention of groups) → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "cheapest studio" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "cheapest studio sales offer" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "send me a studio sales offer" → send_inventory_to_groups(unit_type="studio", count=1, send_to="admin")
 → "cheapest studio в группы" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="groups")
 → "top 3 cheapest" → send_inventory_to_groups(sort_by="cheapest", count=3, send_to="admin")
 → "top 3 cheapest to groups" → send_inventory_to_groups(sort_by="cheapest", count=3, send_to="groups")
 → "most expensive 1BR" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=1, send_to="admin")
+→ "most expensive 1BR sales offer" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=1, send_to="admin")
 → "highest floor unit" → send_inventory_to_groups(sort_by="highest_floor", count=1, send_to="admin")
 → "above 1M studios" → send_inventory_to_groups(unit_type="studio", price_min=1000000, send_to="admin")
+→ "under 1.5M" → send_inventory_to_groups(price_max=1500000, send_to="admin")
+→ "between 1M and 2M" → send_inventory_to_groups(price_min=1000000, price_max=2000000, send_to="admin")
+→ "cheapest studio above floor 15" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", floor_min=15, count=1, send_to="admin")
+→ "1" / "one" = count=1, "top 3" = count=3, "top 5" = count=5, "all" = send_all=True
 
 MULTI-CONDITION RULE — CRITICAL:
 → "cheapest AND most expensive" → TWO separate tool calls:
@@ -494,7 +524,7 @@ ADMIN_TOOLS = [
     },
     {
         "name": "send_drive_file",
-        "description": "Find and send ALL media files from a project's 'media' folder in Drive. Can send to admin only OR broadcast to all WhatsApp groups.",
+        "description": "Find and send project MEDIA FILES (brochures, photos, videos, presentations) from Drive 'media' folder. Use ONLY for: 'send brochure', 'send photos', 'send video', 'send media'. Do NOT use for unit search (cheapest/most expensive/type filter) — use send_inventory_to_groups for that.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -542,7 +572,7 @@ ADMIN_TOOLS = [
     },
     {
         "name": "send_inventory_to_groups",
-        "description": "Pick exactly N units (filtered + optionally sorted) and send to WhatsApp groups OR admin. For 'cheapest'/'most expensive' requests — use sort_by to get exact order. count='all' sends ALL matching units.",
+        "description": "Find unit PDFs (sales offers) from the database index, filter/sort them, and send to admin or groups. Use for: ANY request with count/price/type/floor/sort filters. 'cheapest studio', 'top 3 most expensive 1BR', 'send me a studio sales offer', 'units above floor 15' — all go here. Never use send_drive_file for these requests.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -947,27 +977,30 @@ class AdminAgent:
         if project_name:
             projects = [p for p in projects if project_name.lower() in p.project_name.lower()]
 
-        all_units: list[tuple[str, dict, str]] = []
-        for proj in projects:
-            for unit_num, unit_data in (proj.unit_index or {}).items():
-                all_units.append((unit_num, unit_data, proj.project_name))
-
-        seen = {u[0] for u in all_units}
-
-        # Always init Drive service — needed for PDF downloads even in fast path
         import drive_service as _drive
+        import pdf_index as _idx
+
         svc = _drive.get_service()
         root_id = getattr(agency, "drive_root_id", "") or ""
 
-        # Fast path: pre-built index (price/size/view already extracted — no PDF reads needed)
-        import pdf_index as _idx
+        all_units: list[tuple[str, dict, str]] = []
+        seen: set[str] = set()
+
+        # PRIMARY: pre-built index (has price_raw, floor, unit_type from PDFs — use for ALL filtering/sorting)
         index_units = _idx.as_unit_list(agency.id, project_name)
-        if index_units:
-            for unit_key, data, proj in index_units:
-                if unit_key not in seen:
-                    all_units.append((unit_key, data, proj))
-                    seen.add(unit_key)
-        elif svc:
+        for unit_key, data, proj in index_units:
+            all_units.append((unit_key, data, proj))
+            seen.add(unit_key)
+
+        # SUPPLEMENT: DB units that are NOT in index (different keys or index not built yet)
+        for proj in projects:
+            for unit_num, unit_data in (proj.unit_index or {}).items():
+                if unit_num not in seen:
+                    all_units.append((unit_num, unit_data, proj.project_name))
+                    seen.add(unit_num)
+
+        # SLOW PATH: Drive scan — only when index is empty (first run, rebuild pending)
+        if not index_units and svc:
             # Slow path: scan Drive on-the-fly (fallback when index not built yet)
             for proj in (projects if projects else []):
                 try:
