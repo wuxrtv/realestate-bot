@@ -680,6 +680,19 @@ class AdminAgent:
         if not all_units:
             return {"error": "No units found in inventory or Drive"}
 
+        # If price or view filter is needed, enrich sales offer PDFs (read inside them)
+        needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
+        if needs_pdf_read and svc:
+            enriched_units = []
+            for unit_num, unit_data, proj_name in all_units:
+                if unit_data.get("file_id"):
+                    try:
+                        unit_data = _drive.enrich_offer_from_pdf(svc, unit_data)
+                    except Exception:
+                        pass
+                enriched_units.append((unit_num, unit_data, proj_name))
+            all_units = enriched_units
+
         # Apply filters
         filtered = _filter_unit_list(
             all_units,
@@ -809,6 +822,19 @@ class AdminAgent:
                                 seen.add(unit_key)
                     except Exception:
                         pass
+
+                    # Enrich PDF offers if price or view filter is needed
+                    needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
+                    if needs_pdf_read:
+                        enriched = []
+                        for u, d, p in all_units:
+                            if d.get("file_id"):
+                                try:
+                                    d = _drive.enrich_offer_from_pdf(svc, d)
+                                except Exception:
+                                    pass
+                            enriched.append((u, d, p))
+                        all_units = enriched
             except Exception:
                 pass
 

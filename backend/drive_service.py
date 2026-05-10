@@ -498,7 +498,9 @@ def get_project_inventory(svc, project_name: str, agency_root_id: str = "") -> d
 
 
 _PDF_PRICE_RE = re.compile(
-    r"(?:price|total|amount|aed|cost|value)[^\d]{0,20}([\d][,\d\s\.]{2,15})",
+    r"(?:price|total|amount|aed|cost|value|стоимость|цена)[^\d]{0,20}([\d][\d,\s\.]{4,14})"
+    r"|"
+    r"([\d][\d,\s\.]{4,14})\s*(?:aed|AED|درهم)",
     re.IGNORECASE,
 )
 _PDF_SIZE_RE = re.compile(
@@ -523,7 +525,7 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
 
         m = _PDF_PRICE_RE.search(text)
         if m:
-            raw = m.group(1).replace(",", "").replace(" ", "").strip()
+            raw = (m.group(1) or m.group(2) or "").replace(",", "").replace(" ", "").strip()
             try:
                 num = float(raw)
                 if num >= 100_000:
