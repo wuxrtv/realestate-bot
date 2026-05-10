@@ -178,8 +178,8 @@ async def send_once():
         "All good now bro — yalla, ready to work! 🔥\n"
         "Let me know what you need inshallah 🤲"
     )
-    ok = await whatsapp_bot._send_wa("971585369077@c.us", msg)
-    return {"ok": ok, "sent_to": "971585369077"}
+    ok = await whatsapp_bot._send_wa("971585816776@c.us", msg)
+    return {"ok": ok, "sent_to": "971585816776"}
 
 
 # ─── Health ───────────────────────────────────────────────────────────────────
