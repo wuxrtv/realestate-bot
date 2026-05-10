@@ -276,10 +276,10 @@ Groups = WhatsApp groups. That's it.
 • "unit 1507", "show 2301" → search_units (query="1507")
 • "find units on floor 5", "show 1b apartments", "units in building A" → search_units (floor=5 / unit_type="1b" / building="A")
 • "broadcast text to groups", "announce text" → announce_to_groups
-• "send 3 units", "скинь юниты", "отправь 5 юнитов в группы" → send_inventory_to_groups (count=N)
-• "send 3 units on floor 5", "скинь 3 юнита на 5 этаже" → send_inventory_to_groups (count=3, floor=5)
-• "send 2 studio units to groups", "скинь 2 юнита 1b в группы" → send_inventory_to_groups (count=2, unit_type="studio"/"1b")
-• "send building A units", "юниты здания B в группы" → send_inventory_to_groups (building="A")
+• "send 3 units", "скинь юниты", "отправь 5 юнитов в группы" → send_inventory_to_groups (count=N, send_to="groups")
+• "send 3 units on floor 5", "скинь 3 юнита на 5 этаже" → send_inventory_to_groups (count=3, floor=5, send_to="groups")
+• "send 2 studio units to groups", "скинь 2 юнита 1b в группы" → send_inventory_to_groups (count=2, unit_type="studio"/"1b", send_to="groups")
+• "send building A units", "юниты здания B в группы" → send_inventory_to_groups (building="A", send_to="groups")
 • "send brochure/video/photo/media TO GROUPS" → send_drive_file (send_to="groups")
 • "send me brochure/video/photo/media" (to admin only) → send_drive_file (send_to="admin")
 • Any media request without "to groups" → send_drive_file (send_to="admin")
@@ -317,12 +317,20 @@ send_inventory_to_groups = N filtered/sorted units → groups OR admin (use for:
 → AED 1,015,663 ≠ AED 1,100,000 — 75,000 difference = wrong unit, wrong client
 → Always use sort_by for cheapest/most expensive — never guess
 
+DESTINATION RULE — MOST IMPORTANT:
+→ Message contains "в группы" / "to groups" / "groups" → send_to="groups" ALWAYS
+→ Message says "send me" / "покажи" / "скинь мне" / no group mention → send_to="admin"
+→ "скинь 3 юнита в группы" → send_to="groups"
+→ "send 3 units to groups" → send_to="groups"
+→ DEFAULT when unclear → send_to="groups"
+
 SORTING ROUTING:
-→ "cheapest studio" / "самая дешёвая студия" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "cheapest studio" (no mention of groups) → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
+→ "cheapest studio в группы" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="groups")
 → "top 3 cheapest" → send_inventory_to_groups(sort_by="cheapest", count=3, send_to="admin")
+→ "top 3 cheapest to groups" → send_inventory_to_groups(sort_by="cheapest", count=3, send_to="groups")
 → "most expensive 1BR" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=1, send_to="admin")
-→ "cheapest to groups" → send_inventory_to_groups(sort_by="cheapest", count=1, send_to="groups")
-→ "highest floor" → send_inventory_to_groups(sort_by="highest_floor", count=1, send_to="admin")
+→ "highest floor unit" → send_inventory_to_groups(sort_by="highest_floor", count=1, send_to="admin")
 → "above 1M studios" → send_inventory_to_groups(unit_type="studio", price_min=1000000, send_to="admin")
 
 VERIFY WORKFLOW (always):
