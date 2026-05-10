@@ -243,15 +243,14 @@ _WA_BASE = "https://api.green-api.com"
 # ─── Discount / Lead notification system ──────────────────────────────────────
 
 _SPECIALIST_PHONE = "+971 58 581 6776"
-_SPECIALIST_HANDLE = "@Khamudilloh SAAS"
 
 _DISCOUNT_GROUP_REPLIES = [
-    "Great question habibi! 👆\nFor discounts and payment details —\nspeak directly with our specialist:\n\n📞 {phone}\n{handle}\n\nHe'll give you the full picture wallah 🤲",
-    "Wallah this one needs the specialist habibi 💯\nFor all payment plans and pricing —\nreach out directly:\n\n📞 {phone}\n{handle}\n\nHe knows every deal khalas 🔥",
-    "Habibi for pricing and offers —\nyou need to speak to the man himself 👆\n\n📞 {phone}\n{handle}\n\nYalla — he'll sort you out wallah 🤲",
-    "Good question! 🔥\nPayment plans and discounts —\nour specialist has all the details:\n\n📞 {phone}\n{handle}\n\nHit him up habibi, khalas ✅",
-    "Wallah great timing habibi 👀\nFor DLD, payment plans, and special offers —\ngo directly to:\n\n📞 {phone}\n{handle}\n\nHe's got you covered inshallah 🙏",
-    "Habibi this is above my pay grade 😄\nFor real discounts and deals —\none person to call:\n\n📞 {phone}\n{handle}\n\nWallah he'll make it happen 💪",
+    "Great question habibi! 👆\nFor discounts and payment details —\nspeak directly with our specialist:\n\n📞 {phone}\n\nHe'll give you the full picture wallah 🤲",
+    "Wallah this one needs the specialist habibi 💯\nFor all payment plans and pricing —\nreach out directly:\n\n📞 {phone}\n\nHe knows every deal khalas 🔥",
+    "Habibi for pricing and offers —\nyou need to speak to the man himself 👆\n\n📞 {phone}\n\nYalla — he'll sort you out wallah 🤲",
+    "Good question! 🔥\nPayment plans and discounts —\nour specialist has all the details:\n\n📞 {phone}\n\nHit him up habibi, khalas ✅",
+    "Wallah great timing habibi 👀\nFor DLD, payment plans, and special offers —\ngo directly to:\n\n📞 {phone}\n\nHe's got you covered inshallah 🙏",
+    "Habibi this is above my pay grade 😄\nFor real discounts and deals —\none person to call:\n\n📞 {phone}\n\nWallah he'll make it happen 💪",
 ]
 
 _DISCOUNT_ADMIN_NOTIFS = [
@@ -895,7 +894,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     elif intent == "discount_inquiry":
         # ACTION 1 — redirect in group
         group_reply = random.choice(_DISCOUNT_GROUP_REPLIES).format(
-            phone=_SPECIALIST_PHONE, handle=_SPECIALIST_HANDLE,
+            phone=_SPECIALIST_PHONE,
         )
         await _send_wa(chat_id, group_reply)
         # ACTION 2 — notify ALL admins privately
