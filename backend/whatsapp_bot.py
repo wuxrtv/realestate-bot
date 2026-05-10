@@ -153,9 +153,12 @@ Examples:
 
 ━━━ INTENT RULES ━━━
 • unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
-• media_request: asking for ANY media — brochure, PDF, photos, renders, video, tour, presentation ("фото", "photo", "brochure", "видео", "video", "renders", "tour", "ролик", "брошюра")
+• media_request: asking for ANY media — brochure, PDF, photos, renders, video, tour, presentation ("фото", "photo", "brochure", "видео", "video", "renders", "tour", "ролик", "брошюра", "брошура")
   → Tony sends ALL files from project's media folder in order: Brochure → Payment Plan → Photos → Video
   → NEVER send video before brochure — order is fixed
+  → project_name MUST be set and non-null. If project unclear → use direct_question instead, NEVER media_request with empty project_name
+  → "send brochure" (no project) → direct_question, ask which project
+  → "send SAAS Hills brochure" → media_request, project_name="SAAS Hills"
 • property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
 • direct_question: any other work question — answer in "reply" using the project context below
 • discount_inquiry: ANY question about pricing flexibility — discounts, DLD waiver, "4%", payment plans
@@ -228,13 +231,16 @@ logger = logging.getLogger(__name__)
 
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
 _REALESTATE_TRIGGERS = re.compile(
-    r"\b(unit|юнит|brochure|брошюр|floor\s*plan|планировк|price\s*list|прайс|"
+    r"\b(unit|юнит|юнитов|юниты|"
+    r"brochur|брошюр|брошур|брошур|"  # catches brochure, brochur, брошюра, брошура
+    r"floor\s*plan|планировк|price\s*list|прайс|"
     r"bedroom|спальн|villa|вилла|available|наличи|"
     r"видео|video\s*tour|фото|render|renders|"
     r"presentation|презентац|каталог|catalog|"
     r"apartment|апартамент|availability|pdf|"
-    r"discount|скидка|chegirma|DLD|payment\s*plan|рассрочк|"
-    r"special\s*offer|best\s*price|negotiat|50/50|60/40|40/60)\b",
+    r"discount|скидк|chegirm|DLD|payment\s*plan|рассрочк|"
+    r"special\s*offer|best\s*price|negotiat|50/50|60/40|40/60|"
+    r"дешев|дорог|дорош|самый|cheapest|expensive|floor)\b",
     re.IGNORECASE,
 )
 _AUDIO_TYPES = frozenset({"audioMessage", "pttMessage"})
@@ -618,7 +624,6 @@ _INVENTORY_EXTS = (".xlsx", ".xls", ".csv")
 
 async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: str,
                                  file_name: str, caption: str, db: Session, agency: Agency):
-    import re as _re
     from datetime import datetime as _dt
     from excel_parser import (build_unit_index, diff_unit_indexes, format_diff_report,
                               normalize_project_name, parse_csv, parse_excel, parse_pdf)
@@ -708,7 +713,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         return
 
     # All sheets → ONE project (same logic as Telegram bot)
-    _GENERIC = _re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", _re.IGNORECASE)
+    _GENERIC = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
     non_generic = [s for s in sheets_data.keys() if not _GENERIC.match(s.strip())]
     if caption.strip():
         name = caption.strip()
@@ -870,8 +875,16 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         svc = _drive.get_service()
         sent = False
         root_id = getattr(agency, "drive_root_id", "") or ""
-        search_name = project_name or (keywords[0] if keywords else "")
-        if svc and search_name:
+        search_name = project_name  # must be an explicit project — never use random keywords
+
+        if not search_name:
+            # Project not clear — ask which one
+            proj_list = "\n".join(f"• {p.project_name}" for p in projects)
+            msg = "Habibi which project? 😊"
+            if proj_list:
+                msg += f"\nWe have:\n{proj_list}"
+            await _send_wa(chat_id, msg)
+        elif svc:
             media_files = _drive.find_all_media(svc, search_name, limit=15, agency_root_id=root_id)
             if media_files:
                 await _send_wa(chat_id, f"Yalla habibi — {search_name} media incoming 📸🎬👇")
@@ -880,17 +893,17 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                     if file_bytes:
                         await _send_wa_file(chat_id, file_bytes, file_name)
                 sent = True
-        if not sent:
-            # Tell group to wait, then notify admin privately
-            await _send_wa(chat_id, "Give me a sec habibi 🙏")
-            admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
-            if admin_numbers:
-                admin_chat_id = f"{admin_numbers[0]}@c.us"
-                await _send_wa(
-                    admin_chat_id,
-                    f"Habibi, media for *{search_name}* not found in Drive 🙏\n"
-                    f"Can you send it? I'll forward to the groups khalas 🔥"
-                )
+            if not sent:
+                # Media not found in Drive — notify admin
+                await _send_wa(chat_id, "Give me a sec habibi 🙏")
+                admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
+                if admin_numbers:
+                    admin_chat_id = f"{admin_numbers[0]}@c.us"
+                    await _send_wa(
+                        admin_chat_id,
+                        f"Habibi, media for *{search_name}* not found in Drive 🙏\n"
+                        f"Can you send it? I'll forward to the groups khalas 🔥"
+                    )
     elif intent == "discount_inquiry":
         # ACTION 1 — redirect in group
         group_reply = random.choice(_DISCOUNT_GROUP_REPLIES).format(

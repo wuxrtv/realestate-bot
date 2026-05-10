@@ -355,63 +355,6 @@ def find_all_media(svc, project_name: str, limit: int = 15, agency_root_id: str 
     return []
 
 
-def find_brochure(svc, project_name: str, agency_root_id: str = "") -> Optional[tuple]:
-    """Find a brochure (PDF) for a project. Returns (file_id, name, export_mime) or None."""
-    try:
-        proj_id = _find_project_folder(svc, project_name, agency_root_id)
-        if not proj_id:
-            return None
-        files = _collect_files(svc, proj_id)
-        all_names = [f["name"] for f in files]
-        logger.info(f"Drive: all files in '{project_name}': {all_names}")
-        # Prefer files explicitly named as brochures, then any PDF, then Google Slides
-        for f in files:
-            if _is_brochure(f["name"]) and any(kw in f["name"].lower() for kw in _BROCHURE_KEYWORDS):
-                logger.info(f"Drive: selected brochure '{f['name']}' (keyword match)")
-                return f["id"], f["name"], f.get("_export_mime", "")
-        for f in files:
-            if _ext(f["name"]) == _PDF_EXT:
-                logger.info(f"Drive: selected brochure '{f['name']}' (any PDF fallback)")
-                return f["id"], f["name"], f.get("_export_mime", "")
-        # Last resort: Google Slides presentation
-        for f in files:
-            if f.get("_export_mime"):
-                logger.info(f"Drive: selected brochure '{f['name']}' (Google Slides export)")
-                return f["id"], f["name"], f["_export_mime"]
-        logger.warning(f"Drive: no PDF/Slides found in '{project_name}', files: {all_names}")
-    except Exception:
-        logger.exception(f"Drive: find_brochure failed {project_name}")
-    return None
-
-
-def find_photos(svc, project_name: str, limit: int = 5, agency_root_id: str = "") -> list:
-    """Find photo files for a project. Returns list of (file_id, name)."""
-    try:
-        proj_id = _find_project_folder(svc, project_name, agency_root_id)
-        if not proj_id:
-            return []
-        files = _collect_files(svc, proj_id)
-        photos = [(f["id"], f["name"]) for f in files if _is_photo(f["name"])]
-        return photos[:limit]
-    except Exception:
-        logger.exception(f"Drive: find_photos failed {project_name}")
-    return []
-
-
-def find_video(svc, project_name: str, agency_root_id: str = "") -> Optional[tuple]:
-    """Find first video file for a project. Returns (file_id, name, export_mime) or None."""
-    try:
-        proj_id = _find_project_folder(svc, project_name, agency_root_id)
-        if not proj_id:
-            return None
-        files = _collect_files(svc, proj_id)
-        for f in files:
-            if _is_video(f["name"]):
-                return f["id"], f["name"], f.get("_export_mime", "")
-    except Exception:
-        logger.exception(f"Drive: find_video failed {project_name}")
-    return None
-
 
 def find_unit_file(svc, project_name: str, unit_number: str, agency_root_id: str = "") -> Optional[tuple]:
     """Find any file for a unit (e.g. '1507.pdf').

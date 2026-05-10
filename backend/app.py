@@ -14,8 +14,11 @@ from fastapi import BackgroundTasks, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
+import asyncio
+
 from database import SessionLocal, init_db
 from models import Agency, ToniProject
+import client_registry
 import pdf_index
 import whatsapp_bot
 
@@ -47,6 +50,8 @@ async def _rebuild_all_indexes():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    client_registry.load_all()
+    client_registry.sync_to_db()
 
     # Set ONE global WhatsApp webhook
     public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_URL")
@@ -66,12 +71,11 @@ async def lifespan(app: FastAPI):
     logger.info("Scheduler started")
 
     # Build PDF index for all active agencies in background
-    import asyncio as _asyncio
     db = SessionLocal()
     try:
         agencies = db.query(Agency).filter(Agency.is_active == True).all()
         for agency in agencies:
-            _asyncio.create_task(pdf_index.build_index(agency))
+            asyncio.create_task(pdf_index.build_index(agency))
             logger.info(f"Index build scheduled for agency {agency.slug}")
     finally:
         db.close()

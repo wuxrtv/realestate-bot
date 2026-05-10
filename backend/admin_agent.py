@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Optional
 
 import anthropic
@@ -342,6 +343,8 @@ MULTI-CONDITION RULE — CRITICAL:
 → "highest floor AND lowest floor" → TWO calls: sort_by="highest_floor" then sort_by="lowest_floor"
 → "cheapest studio AND cheapest 1BR" → TWO calls with different unit_type each
 → Never try to return both in one call — always make separate calls for each condition
+→ If both calls return the SAME unit: say "Habibi, only 1 unit in database — that's both cheapest and most expensive 😄"
+→ If price data is missing (no price_raw): say "Habibi prices not loaded yet — say 'update database' first 🔍"
 
 VERIFY WORKFLOW (always):
 1. Read price from price_raw (exact integer from PDF)
@@ -551,10 +554,6 @@ ADMIN_TOOLS = [
 ]
 
 
-def is_admin(user_id: str, agency) -> bool:
-    return user_id in (agency.admin_ids or [])
-
-
 class AdminAgent:
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -585,7 +584,7 @@ class AdminAgent:
     def _save_history(self, db: Session, conv: AdminConversation, history: list):
         conv.history = history  # full day — no artificial cut
         conv.conversation_date = self._dubai_today()
-        conv.updated_at = __import__("datetime").datetime.now()
+        conv.updated_at = datetime.now()
         flag_modified(conv, "history")
         db.commit()
 
@@ -972,8 +971,12 @@ class AdminAgent:
                         seen.add(unit_key)
             except Exception:
                 pass
-            # Slow path only: enrich PDFs for price/view filters
-            needs_pdf_read = (price_min is not None or price_max is not None or bool(view))
+            # Slow path only: enrich PDFs when price/view filters OR price sorting needed
+            _price_sort = sort_by in (
+                "cheapest", "lowest_price", "ascending", "cheap",
+                "most_expensive", "highest_price", "descending", "expensive",
+            )
+            needs_pdf_read = (price_min is not None or price_max is not None or bool(view) or _price_sort)
             if needs_pdf_read:
                 enriched_units = []
                 for unit_num, unit_data, proj_name in all_units:
