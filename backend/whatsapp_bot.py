@@ -278,7 +278,8 @@ _ADD_GROUP_RE = re.compile(
 )
 _REALESTATE_TRIGGERS = re.compile(
     r"\b(unit|юнит|юнитов|юниты|"
-    r"brochur|брошюр|брошур|"  # catches brochure, brochur, брошюра, брошура
+    r"studio|студи|"
+    r"brochur|брошюр|брошур|"
     r"floor\s*plan|планировк|price\s*list|прайс|"
     r"bedroom|спальн|villa|вилла|available|наличи|"
     r"видео|video\s*tour|фото|render|renders|"
