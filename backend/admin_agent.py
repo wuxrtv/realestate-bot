@@ -1147,9 +1147,10 @@ class AdminAgent:
                 sent_count += 1
             return {"sent_to_admin": True, "units_sent": sent_count, "units": [u[0] for u in picks]}
 
+        from sqlalchemy import or_
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
-            WhatsAppGroup.agency_id == agency.id,
+            or_(WhatsAppGroup.agency_id == agency.id, WhatsAppGroup.agency_id.is_(None)),
         ).all()
         if not groups:
             return {"error": "No active WhatsApp groups registered"}

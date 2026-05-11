@@ -33,6 +33,7 @@ def _migrate():
         ("agencies",            "bot_character",       "TEXT DEFAULT ''"),
         ("admin_conversations", "conversation_date",   "TEXT"),
         ("group_conversations", "conversation_date",   "TEXT"),
+        ("whatsapp_groups",     "agency_id",           "INTEGER"),
     ]
     with engine.connect() as conn:
         for table, col, typedef in additions:
@@ -41,6 +42,17 @@ def _migrate():
                 conn.commit()
             except Exception:
                 pass  # column already exists
+
+        # Auto-assign agency_id to groups that have NULL (e.g. created before migration)
+        try:
+            conn.execute(text("""
+                UPDATE whatsapp_groups
+                SET agency_id = (SELECT id FROM agencies WHERE is_active = 1 LIMIT 1)
+                WHERE agency_id IS NULL
+            """))
+            conn.commit()
+        except Exception:
+            pass
 
 
 def get_db():

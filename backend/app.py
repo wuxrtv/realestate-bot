@@ -168,6 +168,13 @@ def _resolve_agency(data: dict, db) -> Agency | None:
         if group and group.agency_id:
             return db.query(Agency).filter(Agency.id == group.agency_id, Agency.is_active == True).first()
 
+    # Fallback: if only one active agency exists, use it for any unrecognised sender/group.
+    # Covers: unregistered groups, members whose phone isn't in client config.
+    active_agencies = db.query(Agency).filter(Agency.is_active == True).all()
+    if len(active_agencies) == 1:
+        logger.info(f"_resolve_agency: single-agency fallback for sender={sender_phone} chat={chat_id}")
+        return active_agencies[0]
+
     logger.warning(f"_resolve_agency: no client found for sender={sender_phone} chat={chat_id} — ignoring")
     return None
 

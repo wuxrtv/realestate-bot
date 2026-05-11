@@ -607,10 +607,7 @@ async def _send_offer_for_agency(
         caption = format_unit_card(unit_key, unit_data, proj_name)
 
     # 4. Send PDF FIRST, then caption to ALL groups
-    groups = db.query(WhatsAppGroup).filter(
-        WhatsAppGroup.active == True,
-        WhatsAppGroup.agency_id == agency.id,
-    ).all()
+    groups = _query_groups(db, agency)
 
     sent_count = 0
     for i, group in enumerate(groups):
@@ -1543,11 +1540,17 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
 
-async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> int:
-    groups = db.query(WhatsAppGroup).filter(
+def _query_groups(db: Session, agency: Agency):
+    """Return active groups for this agency. Falls back to NULL-agency groups (migration gap)."""
+    from sqlalchemy import or_
+    return db.query(WhatsAppGroup).filter(
         WhatsAppGroup.active == True,
-        WhatsAppGroup.agency_id == agency.id,
+        or_(WhatsAppGroup.agency_id == agency.id, WhatsAppGroup.agency_id.is_(None)),
     ).all()
+
+
+async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> int:
+    groups = _query_groups(db, agency)
     sent = 0
     for i, g in enumerate(groups):
         if is_cancelled(agency.id):
@@ -1563,10 +1566,7 @@ async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> in
 async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: str,
                                      caption: str, agency: Agency) -> int:
     """Send a file to all active WhatsApp groups."""
-    groups = db.query(WhatsAppGroup).filter(
-        WhatsAppGroup.active == True,
-        WhatsAppGroup.agency_id == agency.id,
-    ).all()
+    groups = _query_groups(db, agency)
     sent = 0
     for i, g in enumerate(groups):
         if is_cancelled(agency.id):
