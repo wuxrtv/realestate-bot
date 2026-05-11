@@ -15,11 +15,9 @@ import anthropic
 import httpx
 from sqlalchemy.orm import Session
 
-from sqlalchemy.orm.attributes import flag_modified
-
 from database import SessionLocal
 from excel_parser import format_unit_card
-from models import Agency, GroupConversation, ToniProject, WhatsAppGroup
+from models import Agency, ToniProject, WhatsAppGroup
 
 # ─── Daily admin state ────────────────────────────────────────────────────────
 
@@ -59,39 +57,22 @@ def mark_admin_active(agency_id: int):
     _day_state(agency_id)["morning_replied"] = True
 
 
-# ─── Group conversation history ───────────────────────────────────────────────
+# ─── Group conversation context (RAM only, max 3 exchanges, no DB) ────────────
+# Stores last 3 back-and-forth turns per group for follow-up understanding.
+# Intentionally cleared on restart — not critical data.
 
-def _dubai_today() -> str:
-    from datetime import datetime, timezone, timedelta
-    return datetime.now(timezone(timedelta(hours=4))).strftime("%Y-%m-%d")
-
-
-def _load_group_history(db, agency_id: int, chat_id: str):
-    from datetime import datetime as _dt
-    conv = db.query(GroupConversation).filter(
-        GroupConversation.agency_id == agency_id,
-        GroupConversation.chat_id == chat_id,
-    ).first()
-    today = _dubai_today()
-    if not conv:
-        conv = GroupConversation(agency_id=agency_id, chat_id=chat_id, history=[], conversation_date=today)
-        db.add(conv)
-        db.flush()
-    elif conv.conversation_date != today:
-        logger.info(f"GroupConv: new day ({today}), resetting history for chat {chat_id}")
-        conv.history = []
-        conv.conversation_date = today
-        db.commit()
-    return conv, list(conv.history or [])
+_group_context: dict[str, list] = {}  # key: "{agency_id}_{chat_id}"
 
 
-def _save_group_history(db, conv, history: list):
-    from datetime import datetime as _dt
-    conv.history = history
-    conv.conversation_date = _dubai_today()
-    conv.updated_at = _dt.now()
-    flag_modified(conv, "history")
-    db.commit()
+def _load_group_context(agency_id: int, chat_id: str) -> list:
+    key = f"{agency_id}_{chat_id}"
+    return list(_group_context.get(key, []))
+
+
+def _save_group_context(agency_id: int, chat_id: str, history: list):
+    key = f"{agency_id}_{chat_id}"
+    # Keep only last 6 entries = 3 user + 3 assistant turns
+    _group_context[key] = history[-6:]
 
 
 # ─── Scheduled message texts ──────────────────────────────────────────────────
@@ -1371,7 +1352,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     else:
         system = _SYSTEM_BASE + f"\n\nAdmin contact: {contact}\nNo projects loaded yet."
 
-    conv, history = _load_group_history(db, agency.id, f"wa_{chat_id}")
+    history = _load_group_context(agency.id, chat_id)
     history.append({"role": "user", "content": f"[{sender_name}]: {text}"})
 
     try:
@@ -1385,7 +1366,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         raw = resp.content[0].text.strip()
         match = re.search(r'\{.*\}', raw, re.DOTALL)
         if not match:
-            _save_group_history(db, conv, history)
+            _save_group_context(agency.id, chat_id, history)
             return
         parsed = json.loads(match.group())
     except Exception:
@@ -1479,7 +1460,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
             await _send_wa(chat_id, reply)
 
     history.append({"role": "assistant", "content": raw})
-    _save_group_history(db, conv, history)
+    _save_group_context(agency.id, chat_id, history)
 
 
 # ─── Send file via WhatsApp ───────────────────────────────────────────────────
