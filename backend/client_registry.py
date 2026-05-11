@@ -66,16 +66,10 @@ def sync_to_db():
             if agency:
                 agency.name = cfg.name
                 agency.wa_admin_numbers = cfg.admin_phones
+                agency.drive_root_id = cfg.drive_root_id
+                agency.umar_contact = cfg.umar_contact
+                agency.bot_character = cfg.bot_character
                 agency.is_active = True
-                # Only overwrite from Python config if config has a non-empty value.
-                # This lets the admin panel save drive_root_id / umar_contact /
-                # bot_character without them being reset on every redeploy.
-                if cfg.drive_root_id:
-                    agency.drive_root_id = cfg.drive_root_id
-                if cfg.umar_contact and cfg.umar_contact != "@support":
-                    agency.umar_contact = cfg.umar_contact
-                if cfg.bot_character:
-                    agency.bot_character = cfg.bot_character
             else:
                 db.add(Agency(
                     name=cfg.name,
