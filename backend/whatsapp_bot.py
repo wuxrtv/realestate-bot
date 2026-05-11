@@ -942,7 +942,7 @@ async def send_wa_daily_inventory():
 
             for i, group in enumerate(groups):
                 if i > 0:
-                    await asyncio.sleep(30)
+                    await asyncio.sleep(5)
 
                 picks = random.sample(all_units, min(3, len(all_units)))
                 intro = random.choice(_DAILY_INVENTORY_INTROS)
@@ -1895,7 +1895,7 @@ async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> in
             clear_cancel(agency.id)
             break
         if i > 0:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
         await _send_wa(g.chat_id, message)
         sent += 1
     return sent
@@ -1911,7 +1911,7 @@ async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: 
             clear_cancel(agency.id)
             break
         if i > 0:
-            await asyncio.sleep(30)
+            await asyncio.sleep(5)
         ok = await _send_wa_file(g.chat_id, file_bytes, file_name, caption)
         if ok:
             sent += 1
