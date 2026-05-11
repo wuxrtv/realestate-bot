@@ -647,6 +647,8 @@ async def _send_daily_offer_slot(unit_type: str, slot_label: str):
         for agency in agencies:
             if not os.getenv("WA_INSTANCE_ID"):
                 continue
+            # Scheduled jobs always run fresh — manual "stop" must not block next day
+            clear_cancel(agency.id)
             try:
                 await _send_offer_for_agency(agency, db, unit_type, slot_label, group_delay=20)
             except Exception:
@@ -756,7 +758,7 @@ async def run_test_schedule(chat_id: str, agency_id: int):
 # ─── WhatsApp scheduled jobs ──────────────────────────────────────────────────
 
 async def send_wa_morning_greeting():
-    """08:00 — morning greeting to WA admins."""
+    """08:00 — morning greeting to WA admins. Also resets cancel flags for new day."""
     from datetime import datetime as _dt
     is_friday = _dt.now().weekday() == 4  # 4 = Friday
     db = SessionLocal()
@@ -765,6 +767,7 @@ async def send_wa_morning_greeting():
         for agency in agencies:
             if not os.getenv("WA_INSTANCE_ID"):
                 continue
+            clear_cancel(agency.id)  # new day = fresh start, yesterday's "stop" is gone
             pool = _MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS
             greeting = random.choice(pool)
             for phone in (agency.wa_admin_numbers or []):
