@@ -29,6 +29,11 @@ _daily: dict[str, dict] = {}
 
 _cancel_flags: dict[int, bool] = {}
 
+# ─── Pending files awaiting admin instruction ─────────────────────────────────
+# agency_id → {chat_id, sender_phone, download_url, file_name, stored_at}
+
+_pending_files: dict[int, dict] = {}
+
 
 def set_cancel(agency_id: int):
     _cancel_flags[agency_id] = True
@@ -1111,15 +1116,23 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         _drive.clear_cache()
         return
 
-    # ── 5. Unknown PDF — ask clearly ─────────────────────────────────────────
+    # ── 5. Unknown PDF — ask clearly, remember file for next message ────────────
+    from datetime import datetime as _dt
     detected = _project_name_from_file(file_name)
+    _pending_files[agency.id] = {
+        "chat_id": chat_id,
+        "sender_phone": sender_phone,
+        "download_url": download_url,
+        "file_name": file_name,
+        "stored_at": _dt.now(),
+    }
     await _send_wa(chat_id,
                    f"Habibi, I see *{file_name}* 🤔\n"
                    f"Looks like it could be for *{detected}*.\n\n"
                    "What should I do?\n"
                    "• *save* — parse and save as inventory 📊\n"
                    "• *send to groups* — forward to all groups 📤\n"
-                   "• *brochure* — it's media, I'll note it for Drive 📁")
+                   "• *brochure* — it's a media file, I'll skip it 📁")
 
 
 # ─── Admin private message ────────────────────────────────────────────────────
@@ -1151,6 +1164,30 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
     if _TEST_SCHEDULE_RE.search(text.strip()):
         asyncio.create_task(run_test_schedule(chat_id, agency.id))
         return
+
+    # ── Pending file: admin replied with instruction ──────────────────────────
+    if agency.id in _pending_files:
+        from datetime import datetime as _dt
+        pending = _pending_files[agency.id]
+        age = (_dt.now() - pending["stored_at"]).total_seconds()
+        if age < 1800:  # 30-minute window
+            del _pending_files[agency.id]
+            _BROCHURE_RE = re.compile(r"\b(brochure|брошюр|media|медиа|skip|пропусти|ignore)\b", re.IGNORECASE)
+            if _BROCHURE_RE.search(text):
+                await _send_wa(chat_id,
+                               f"Got it habibi — *{pending['file_name']}* skipped 👍\n"
+                               "Upload it to Drive manually if needed 📁")
+            else:
+                # Re-run document handler with admin's reply as caption/instruction
+                await _handle_admin_document(
+                    pending["chat_id"], pending["sender_phone"],
+                    pending["download_url"], pending["file_name"],
+                    text,  # admin's text = the instruction
+                    db, agency,
+                )
+            return
+        else:
+            del _pending_files[agency.id]
 
     # New instruction — clear any stale cancel flag
     clear_cancel(agency.id)
