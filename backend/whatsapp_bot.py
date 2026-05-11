@@ -228,7 +228,13 @@ Not found example:
 LANGUAGE: Always reply in English only — no exceptions.
 You understand all languages (Russian, Uzbek, Arabic, any) but always respond in English.
 Arabic flavor words (habibi, wallah, yalla, khalas) are personality — not language switching.
-Never ask about language preference."""
+Never ask about language preference.
+
+━━━ GROUP IDENTITY ━━━
+You are ALREADY a member of this group. NEVER introduce yourself.
+NEVER say "Hi I'm Tony", "I'm Tony your assistant", "Allow me to introduce myself", etc.
+Just answer the question directly — like a trusted team member who is always here.
+The one-time welcome message is handled by code on the very first registration — never repeat it."""
 
 # Multilingual keywords that identify an inventory/price-list file
 _WA_INVENTORY_KEYWORDS = (
@@ -1348,13 +1354,12 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     elif not existing.active:
         return
 
-    # Welcome message when Tony is added to a group for the first time
+    # Welcome message when Tony is added to a group for the first time (one-time only)
     if is_new_group and _is_tony_mentioned(text):
         await _send_wa(chat_id,
                        "Yalla habibi! 👋 Tony here —\n"
                        "wallah happy to be part of this group 😎\n"
                        "Saved permanently — I'm ready to go! 🔥")
-        return
 
     projects = db.query(ToniProject).filter(
         ToniProject.is_active == True, ToniProject.agency_id == agency.id
@@ -1608,13 +1613,63 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
 
 # ─── Property search ──────────────────────────────────────────────────────────
 
+_PRICE_KEY_RE = re.compile(r"(price|cost|total|amount|aed|value|стоимость|цена)", re.I)
+_FLOOR_KEY_RE = re.compile(r"\b(floor|этаж|level|fl\.?)\b", re.I)
+
+_SORT_MAP = [
+    (re.compile(r"\b(cheapest|lowest[\s\-]price|min[\s\-]price|дешевл|дешевый)\b", re.I), "price", False),
+    (re.compile(r"\b(most[\s\-]expensive|highest[\s\-]price|max[\s\-]price|priciest|дорог)\b", re.I), "price", True),
+    (re.compile(r"\b(highest[\s\-]floor|top[\s\-]floor)\b", re.I), "floor", True),
+    (re.compile(r"\b(lowest[\s\-]floor|ground[\s\-]floor|bottom[\s\-]floor)\b", re.I), "floor", False),
+]
+_SORT_WORD_RE = re.compile(
+    r"\b(cheapest|most[\s\-]expensive|priciest|highest[\s\-]floor|lowest[\s\-]floor|"
+    r"lowest[\s\-]price|highest[\s\-]price|ground[\s\-]floor|top[\s\-]floor)\b", re.I)
+
+
+def _parse_sort_intent(keywords: list) -> tuple:
+    """Extract sort instruction from keywords. Returns (clean_kws, sort_field, reverse)."""
+    kw_str = " ".join(keywords)
+    for pat, field, reverse in _SORT_MAP:
+        if pat.search(kw_str):
+            clean = [k for k in keywords if not _SORT_WORD_RE.search(k)]
+            return clean, field, reverse
+    return keywords, None, False
+
+
+def _get_sort_value(unit_data: dict, field: str) -> float:
+    """Extract numeric sort key from unit data."""
+    if field == "price":
+        for k, v in unit_data.items():
+            if _PRICE_KEY_RE.search(str(k)):
+                try:
+                    return float(re.sub(r"[^\d.]", "", str(v).replace(",", "")))
+                except (ValueError, TypeError):
+                    pass
+    elif field == "floor":
+        for k, v in unit_data.items():
+            if _FLOOR_KEY_RE.search(str(k)):
+                try:
+                    return float(re.sub(r"[^\d.]", "", str(v)))
+                except (ValueError, TypeError):
+                    pass
+    return 0.0
+
+
 async def _respond_search(chat_id: str, keywords: list, projects: list, agency: Agency):
     contact = agency.umar_contact or "@support"
-    matched = []
+    root_id = getattr(agency, "drive_root_id", "") or ""
+
+    # Separate sort instruction from filter keywords
+    filter_kws, sort_field, sort_reverse = _parse_sort_intent(keywords)
+
+    matched: list = []
     for proj in projects:
         idx: dict = proj.unit_index or {}
-        proj_hit = any(kw.lower() in proj.project_name.lower() for kw in keywords)
-        other_kws = [kw for kw in keywords if kw.lower() not in proj.project_name.lower()]
+        if not idx:
+            continue
+        proj_hit = any(kw.lower() in proj.project_name.lower() for kw in filter_kws)
+        other_kws = [kw for kw in filter_kws if kw.lower() not in proj.project_name.lower()]
         for unit_num, data in idx.items():
             if proj_hit:
                 if other_kws:
@@ -1624,20 +1679,56 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
                 matched.append((unit_num, data, proj.project_name))
             else:
                 searchable = " ".join(str(v) for v in data.values()).lower()
-                if any(kw.lower() in searchable for kw in keywords):
+                if any(kw.lower() in searchable for kw in filter_kws):
                     matched.append((unit_num, data, proj.project_name))
-            if len(matched) >= 3:
-                break
-        if len(matched) >= 3:
+        if len(matched) >= 30:
             break
 
-    if matched:
-        for unit_num, data, proj_name in matched[:3]:
-            await _send_wa(chat_id,
-                           format_unit_card(unit_num, data, proj_name))
+    # Relaxed fallback 1 — if nothing matched but project is identifiable, list from that project
+    if not matched:
+        for proj in projects:
+            idx: dict = proj.unit_index or {}
+            if idx and any(kw.lower() in proj.project_name.lower() for kw in filter_kws):
+                matched = [(u, d, proj.project_name) for u, d in list(idx.items())[:15]]
+                break
+
+    # Relaxed fallback 2 — last resort: use first project that has units
+    if not matched:
+        for proj in projects:
+            idx: dict = proj.unit_index or {}
+            if idx:
+                matched = [(u, d, proj.project_name) for u, d in list(idx.items())[:5]]
+                break
+
+    if not matched:
+        await _send_wa(chat_id, f"No units in database yet habibi 😅 Contact {contact} 🙏")
+        return
+
+    # Apply sort if requested → return 1 best result; otherwise top 3
+    if sort_field:
+        matched.sort(key=lambda t: _get_sort_value(t[1], sort_field), reverse=sort_reverse)
+        limit = 1
     else:
-        await _send_wa(chat_id,
-                       f"No matches found habibi 😅 Specify project, floor or room count — or contact {contact} 🙏")
+        limit = 3
+
+    # Send results — try Drive PDF for first/best match
+    import drive_service as _drive
+    svc = _drive.get_service()
+
+    for i, (unit_num, data, proj_name) in enumerate(matched[:limit]):
+        card = format_unit_card(unit_num, data, proj_name)
+        sent_file = False
+        if i == 0 and svc:
+            drive_result = _drive.find_unit_file(svc, proj_name, unit_num, root_id)
+            if drive_result:
+                file_id, file_name = drive_result
+                file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+                if file_bytes:
+                    await _send_wa(chat_id, "Wallah here you go habibi! 👀")
+                    await _send_wa_file(chat_id, file_bytes, file_name, card)
+                    sent_file = True
+        if not sent_file:
+            await _send_wa(chat_id, card)
 
 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
