@@ -320,20 +320,22 @@ _DISCOUNT_ADMIN_NOTIFS = [
 _BUILDER_PHONE = "+971 58 536 90 77"
 
 _LEAD_SIGNAL_RE = re.compile(
-    r"who\s+are\s+you|what\s+are\s+you|"
-    r"are\s+you\s+(?:an?\s+)?(?:ai|bot|robot|chatbot|assistant)|"
-    r"i\s+want\s+(?:this|a|an)\s+(?:bot|assistant|ai)|"
-    r"want\s+(?:you|this)\s+for\s+(?:my|our)\s+(?:team|business|agency|company)|"
-    r"how\s+(?:do\s+i|can\s+i|to)\s+get\s+(?:this|you|an?\s+assistant|a\s+bot)|"
-    r"can\s+you\s+work\s+for\s+(?:me|us)|"
-    r"where\s+(?:did\s+you\s+come\s+from|can\s+i\s+get\s+(?:this|you))|"
-    r"who\s+(?:made|created|built|developed)\s+you|"
-    r"i\s+need\s+(?:this|a)\s+(?:bot|assistant)|"
-    r"where\s+can\s+i\s+(?:get|find|buy)\s+(?:this|you|a\s+bot)|"
-    r"how\s+much\s+(?:does\s+)?(?:this\s+bot|you)\s+cost|"
-    r"кто\s+ты|что\s+(?:это|ты\s+такой)|хочу\s+(?:такого|тебя|этого|такой)|"
-    r"как\s+получить\s+(?:такого|этого|тебя)|мне\s+нужен\s+такой\s+(?:бот|ассистент)|"
-    r"ты\s+(?:ии|бот|chatgpt|gpt|ai)",
+    # "who are you?" / "what are you?" — NOT "what are you looking for?" etc.
+    r"\b(?:who|what)\s+are\s+you\b(?!\s+(?:\w+ing|do|doing|did|to|for|about|with|here"
+    r"|looking|calling|working|talking|helping|trying|going|offering|selling|referring|saying))"
+    r"|are\s+you\s+(?:an?\s+)?(?:ai|bot|robot|chatbot|assistant)"
+    r"|i\s+want\s+(?:this|a|an)\s+(?:bot|assistant|ai)"
+    r"|want\s+(?:you|this)\s+for\s+(?:my|our)\s+(?:team|business|agency|company)"
+    r"|how\s+(?:do\s+i|can\s+i|to)\s+get\s+(?:this|you|an?\s+assistant|a\s+bot)"
+    r"|can\s+you\s+work\s+for\s+(?:me|us)"
+    r"|where\s+(?:did\s+you\s+come\s+from|can\s+i\s+get\s+(?:this|you))"
+    r"|who\s+(?:made|created|built|developed)\s+you"
+    r"|i\s+need\s+(?:this|a)\s+(?:bot|assistant)"
+    r"|where\s+can\s+i\s+(?:get|find|buy)\s+(?:this|you|a\s+bot)"
+    r"|how\s+much\s+(?:does\s+)?(?:this\s+bot|you)\s+cost"
+    r"|кто\s+ты|что\s+(?:это|ты\s+такой)|хочу\s+(?:такого|тебя|этого|такой)"
+    r"|как\s+получить\s+(?:такого|этого|тебя)|мне\s+нужен\s+такой\s+(?:бот|ассистент)"
+    r"|ты\s+(?:ии|бот|chatgpt|gpt|ai)",
     re.IGNORECASE,
 )
 
