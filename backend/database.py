@@ -55,6 +55,17 @@ def _migrate():
         except Exception:
             pass
 
+        # Same fix for projects — old rows created before agency_id column was added
+        try:
+            conn.execute(text("""
+                UPDATE toni_projects
+                SET agency_id = (SELECT id FROM agencies LIMIT 1)
+                WHERE agency_id IS NULL
+            """))
+            conn.commit()
+        except Exception:
+            pass
+
 
 def get_db():
     db = SessionLocal()

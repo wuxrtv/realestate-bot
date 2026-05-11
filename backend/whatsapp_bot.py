@@ -1342,8 +1342,10 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                        "wallah happy to be part of this group 😎\n"
                        "Saved permanently — I'm ready to go! 🔥")
 
+    from sqlalchemy import or_ as _or
     projects = db.query(ToniProject).filter(
-        ToniProject.is_active == True, ToniProject.agency_id == agency.id
+        ToniProject.is_active == True,
+        _or(ToniProject.agency_id == agency.id, ToniProject.agency_id.is_(None)),
     ).all()
     contact = agency.umar_contact or "@support"
     if projects:
