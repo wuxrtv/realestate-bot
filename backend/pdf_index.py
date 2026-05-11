@@ -131,8 +131,12 @@ def search_units(
     price_min: Optional[float] = None,
     price_max: Optional[float] = None,
     view: str = "",
+    sort_by: str = "",
 ) -> list:
-    """Filter index. Returns list of (unit_key, unit_data, project_name)."""
+    """Filter index. Returns list of (unit_key, unit_data, project_name).
+    sort_by: 'cheapest' | 'most_expensive' | 'highest_floor' | 'lowest_floor'
+    Sorting happens here so callers always get correctly ordered results.
+    """
     units = load_index(agency_id)
     results = []
     for unit_key, data in units.items():
@@ -178,6 +182,22 @@ def search_units(
             continue
 
         results.append((unit_key, data, proj_name))
+
+    # Sort before returning — units without price_raw go to the end for price sorts
+    if sort_by in ("cheapest", "lowest_price", "cheap"):
+        priced = [r for r in results if r[1].get("price_raw")]
+        unpriced = [r for r in results if not r[1].get("price_raw")]
+        priced.sort(key=lambda x: x[1]["price_raw"])
+        results = priced + unpriced
+    elif sort_by in ("most_expensive", "expensive", "highest_price"):
+        priced = [r for r in results if r[1].get("price_raw")]
+        unpriced = [r for r in results if not r[1].get("price_raw")]
+        priced.sort(key=lambda x: x[1]["price_raw"], reverse=True)
+        results = priced + unpriced
+    elif sort_by == "highest_floor":
+        results.sort(key=lambda x: x[1].get("floor") or 0, reverse=True)
+    elif sort_by == "lowest_floor":
+        results.sort(key=lambda x: x[1].get("floor") or 9999)
 
     return results
 

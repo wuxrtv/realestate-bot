@@ -548,6 +548,7 @@ ADMIN_TOOLS = [
                 "price_min": {"type": "number", "description": "Minimum price in AED"},
                 "price_max": {"type": "number", "description": "Maximum price in AED"},
                 "view": {"type": "string", "description": "View type: 'pool', 'burj khalifa', 'marina', 'sea' etc."},
+                "sort_by": {"type": "string", "description": "Sort order: 'cheapest' (lowest price first), 'most_expensive' (highest price first), 'highest_floor', 'lowest_floor'."},
             },
             "required": [],
         },
@@ -734,6 +735,7 @@ class AdminAgent:
                 inp.get("query", ""),
                 inp.get("limit", 5),
                 agency,
+                sort_by=inp.get("sort_by", ""),
                 floor=inp.get("floor"),
                 floor_min=inp.get("floor_min"),
                 floor_max=inp.get("floor_max"),
@@ -1279,6 +1281,7 @@ class AdminAgent:
 
     async def _search_units(
         self, db: Session, query: str, limit: int, agency,
+        sort_by: str = "",
         floor=None, floor_min=None, floor_max=None,
         unit_type: str = "", building: str = "",
         payment_plan: str = "", price_min=None, price_max=None, view: str = "",
@@ -1301,6 +1304,7 @@ class AdminAgent:
                 floor=floor, floor_min=floor_min, floor_max=floor_max,
                 unit_type=unit_type, building=building, payment_plan=payment_plan,
                 price_min=price_min, price_max=price_max, view=view,
+                sort_by=sort_by,
             )
             for unit_key, data, proj_name in matches[:limit]:
                 results.append({
