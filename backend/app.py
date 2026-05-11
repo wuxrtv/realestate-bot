@@ -87,15 +87,23 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     logger.info("Scheduler started")
 
-    # Build PDF index for all active agencies in background
-    db = SessionLocal()
-    try:
-        agencies = db.query(Agency).filter(Agency.is_active == True).all()
-        for agency in agencies:
-            asyncio.create_task(pdf_index.build_index(agency))
-            logger.info(f"Index build scheduled for agency {agency.slug}")
-    finally:
-        db.close()
+    # Build PDF index sequentially with delay to avoid concurrent SSL conflicts in httplib2
+    async def _build_indexes_sequential():
+        db2 = SessionLocal()
+        try:
+            agencies = db2.query(Agency).filter(Agency.is_active == True).all()
+            for i, agency in enumerate(agencies):
+                if i > 0:
+                    await asyncio.sleep(5)  # stagger to avoid concurrent SSL errors
+                try:
+                    count = await pdf_index.build_index(agency)
+                    logger.info(f"Index built: agency={agency.slug} units={count}")
+                except Exception:
+                    logger.exception(f"Index build failed for agency {agency.slug}")
+        finally:
+            db2.close()
+
+    asyncio.create_task(_build_indexes_sequential())
 
     yield
     scheduler.shutdown()
