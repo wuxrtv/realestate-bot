@@ -1009,7 +1009,65 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                        "Tony will find it automatically 🔥")
         return
 
-    # ── 3. PDF — admin says "send"/"отправь" → forward to groups ────────────
+    # ── 3. Availability / inventory PDF → auto broadcast ALL groups + save ──────
+    #    No questions. Admin sent it = broadcast it. Khalas.
+    if is_pdf and is_inventory:
+        await _send_wa(chat_id, "Got it habibi! Sending now 🔥")
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                file_bytes = (await client.get(download_url)).content
+        except Exception:
+            await _send_wa(chat_id, "❌ Download failed habibi 😅")
+            return
+
+        n = await announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
+        await _send_wa(chat_id,
+                       f"✅ Availability sent to {n} group(s) khalas!\n"
+                       "Saving to database now 📖")
+
+        # Save to DB (parse table data — silent if PDF has no parseable table)
+        try:
+            sheets_data = parse_pdf(file_bytes)
+        except Exception:
+            sheets_data = {}
+
+        if sheets_data:
+            unit_index = build_unit_index(sheets_data)
+            if unit_index:
+                name = _project_name_from_file(file_name)
+                existing = (db.query(ToniProject)
+                            .filter(ToniProject.project_name == name,
+                                    ToniProject.is_active == True,
+                                    ToniProject.agency_id == agency.id)
+                            .first())
+                if existing:
+                    diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
+                    report = format_diff_report(diff, name)
+                    new_ver = existing.version + 1
+                    existing.is_active = False
+                    db.flush()
+                    db.add(ToniProject(project_name=name, version=new_ver,
+                                       sheet_count=len(sheets_data), unit_count=len(unit_index),
+                                       sheets_data=sheets_data, unit_index=unit_index,
+                                       is_active=True, uploaded_at=_dt.now(),
+                                       uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
+                    db.commit()
+                    await _send_wa(chat_id,
+                                   f"📊 *{name}* updated → v{new_ver}\n"
+                                   f"Units: {len(unit_index)}\n\n{report}")
+                else:
+                    db.add(ToniProject(project_name=name, version=1,
+                                       sheet_count=len(sheets_data), unit_count=len(unit_index),
+                                       sheets_data=sheets_data, unit_index=unit_index,
+                                       is_active=True, uploaded_at=_dt.now(),
+                                       uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
+                    db.commit()
+                    await _send_wa(chat_id, f"📊 *{name}* saved! {len(unit_index)} units 🔥")
+                import drive_service as _drive
+                _drive.clear_cache()
+        return
+
+    # ── 4. PDF — admin says "send" → forward to groups ───────────────────────
     if is_pdf and has_send_intent:
         try:
             async with httpx.AsyncClient(timeout=60) as client:
@@ -1021,9 +1079,8 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         await _send_wa(chat_id, f"Khalas habibi! ✅ Forwarded to {n} groups 💪")
         return
 
-    # ── 4. Excel/CSV or inventory PDF → save to database ────────────────────
-    if is_excel or is_inventory or has_save_intent:
-        # Determine project name intelligently
+    # ── 5. Excel/CSV or admin explicitly said "save" → save to database ──────
+    if is_excel or has_save_intent:
         _CMD_RE = re.compile(
             r"\b(send|отправь|сохрани|скинь|forward|blast|это|this|вот|"
             r"availability|инвентарь|inventory)\b",
@@ -1031,10 +1088,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         )
         _GENERIC = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
 
-        # Caption that looks like a real project name (not a command)?
         caption_is_name = caption.strip() and not _CMD_RE.search(caption)
-
-        # Tell admin what we understood
         detected_name = (
             caption.strip() if caption_is_name
             else _project_name_from_file(file_name) if is_pdf
@@ -1116,7 +1170,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         _drive.clear_cache()
         return
 
-    # ── 5. Unknown PDF — ask clearly, remember file for next message ────────────
+    # ── 6. Unknown PDF — ask clearly, remember file for next message ────────────
     from datetime import datetime as _dt
     detected = _project_name_from_file(file_name)
     _pending_files[agency.id] = {
