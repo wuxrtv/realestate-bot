@@ -1808,10 +1808,13 @@ def _get_sort_value(unit_data: dict, field: str) -> float:
 
 # ─── Unit type detection & strict filtering ───────────────────────────────────
 
-_UNIT_TYPE_COL_RE = re.compile(r"\b(type|bedroom|br|unit.?type|тип|комн)\b", re.I)
+_UNIT_TYPE_COL_RE = re.compile(
+    r"\b(type|bedroom|bed|beds|br|unit.?type|тип|комн|layout|config|category|property.?type)\b",
+    re.I,
+)
 
 _TYPE_ALIASES: dict[str, re.Pattern] = {
-    "studio":     re.compile(r"\b(studio|студия|0\s*br|0\s*bed)\b", re.I),
+    "studio":     re.compile(r"\b(studio|студия|0\s*b(?:r|ed)?)\b", re.I),
     "1br":        re.compile(r"\b(1\s*br|1\s*bed|one\s*bed|однокомн|1\s*bedroom)\b", re.I),
     "2br":        re.compile(r"\b(2\s*br|2\s*bed|two\s*bed|двухкомн|2\s*bedroom)\b", re.I),
     "3br":        re.compile(r"\b(3\s*br|3\s*bed|three\s*bed|трёхкомн|3\s*bedroom)\b", re.I),
@@ -1835,11 +1838,14 @@ def _unit_type_matches(data: dict, requested_type: str) -> bool:
     pat = _TYPE_ALIASES.get(requested_type)
     if not pat:
         return True
+    found_type_col = False
     for k, v in data.items():
         if _UNIT_TYPE_COL_RE.search(str(k)):
+            found_type_col = True
             if pat.search(str(v)):
                 return True
-    return False
+    # No recognisable type column → cannot filter → include unit
+    return not found_type_col
 
 
 # ─── Clean group card format ──────────────────────────────────────────────────
