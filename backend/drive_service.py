@@ -441,7 +441,7 @@ def get_project_inventory(svc, project_name: str, agency_root_id: str = "") -> d
 
 
 _PDF_PRICE_RE = re.compile(
-    # Labeled price: "Final Price: AED 1,234,567" / "FULL PRICE 876543" / "Total Price: 999000"
+    # kept for _PDF_SIZE_RE / _PDF_VIEW_RE neighbours — price logic below no longer uses this
     r"(?:final\s+price|full\s+price|total\s+price|selling\s+price|unit\s+price|"
     r"price|total|amount|cost|value|стоимость|цена)"
     r"[^\d]{0,25}([\d][\d,\s\.]{4,14})"
@@ -470,29 +470,49 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages[:3])
 
-        # Diagnostic logging — helps diagnose why price_raw is None
         tl = text.lower()
         logger.info(
             f"extract_offer_data_from_pdf: text_len={len(text)} "
             f"has_AED={'aed' in tl} "
-            f"has_final_price={'final price' in tl} "
-            f"has_total_price={'total price' in tl} "
-            f"has_price={'price' in tl} "
+            f"has_price_after_discount={'price after discount' in tl} "
             f"first500={text[:500]!r}"
         )
 
-        # Try labeled price first (Final Price / Full Price / etc.)
-        m = _PDF_PRICE_RE.search(text)
-        if m:
-            raw = next((g for g in m.groups() if g), "").replace(",", "").replace(" ", "").strip()
-            raw = re.sub(r"\.0+$", "", raw)  # strip trailing .00
+        def _to_int(s: str) -> int | None:
             try:
-                num = int(float(raw))
-                if num >= 100_000:
-                    result["price_raw"] = num                          # exact integer
-                    result["price"] = f"AED {num:,}"                  # "AED 1,015,663"
-            except ValueError:
-                pass
+                n = int(float(s.replace(",", "").replace(" ", "")))
+                return n if n >= 100_000 else None
+            except (ValueError, OverflowError):
+                return None
+
+        price_num: int | None = None
+
+        # Step 1 — SAAS Hills / "Price After Discount AED 1,234,567"
+        m1 = re.search(r"Price\s+After\s+Discount\s+AED\s*([\d,\.]+)", text, re.IGNORECASE)
+        if m1:
+            price_num = _to_int(m1.group(1))
+            if price_num:
+                logger.info(f"extract_offer_data_from_pdf: step1 hit → {price_num}")
+
+        # Step 2 — "AED 1,234,567" anywhere; take the LARGEST (full price, not installment)
+        if not price_num:
+            aed_matches = re.findall(r"AED\s*([\d,\.]+)", text, re.IGNORECASE)
+            candidates = [n for raw in aed_matches for n in [_to_int(raw)] if n]
+            if candidates:
+                price_num = max(candidates)
+                logger.info(f"extract_offer_data_from_pdf: step2 hit → {price_num} (from {candidates})")
+
+        # Step 3 — bare numbers >= 100,000; take the largest
+        if not price_num:
+            bare = re.findall(r"\b(\d[\d,]{4,})\b", text)
+            candidates = [n for raw in bare for n in [_to_int(raw)] if n]
+            if candidates:
+                price_num = max(candidates)
+                logger.info(f"extract_offer_data_from_pdf: step3 hit → {price_num}")
+
+        if price_num:
+            result["price_raw"] = price_num
+            result["price"] = f"AED {price_num:,}"
 
         m = _PDF_SIZE_RE.search(text)
         if m:
