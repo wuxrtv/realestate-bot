@@ -1936,73 +1936,92 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
                           group_title: str = ""):
     contact = agency.umar_contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
+    admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
 
     filter_kws, sort_field, sort_reverse = _parse_sort_intent(keywords)
     requested_type = _detect_requested_type(filter_kws)
 
-    # Keywords that are not type words (used for secondary filtering)
-    _all_type_pats = [p for p in _TYPE_ALIASES.values()]
+    # Non-type keywords used as project/text query
+    _all_type_pats = list(_TYPE_ALIASES.values())
     non_type_kws = [k for k in filter_kws
                     if not any(p.search(k) for p in _all_type_pats)]
 
-    def _matches(unit_num: str, data: dict, proj_name: str, check_proj: bool) -> bool:
-        # STRICT: if type requested → unit must match it. Never mix types.
-        if requested_type and not _unit_type_matches(data, requested_type):
-            return False
-        if check_proj:
-            searchable = " ".join(str(v) for v in data.values()).lower()
-            return not non_type_kws or any(k.lower() in searchable for k in non_type_kws)
-        searchable = " ".join(str(v) for v in data.values()).lower()
-        return not non_type_kws or any(k.lower() in searchable for k in non_type_kws)
+    # Map sort_field/reverse → pdf_index sort_by string
+    _sort_map = {
+        ("price", False): "cheapest",
+        ("price", True):  "most_expensive",
+        ("floor", True):  "highest_floor",
+        ("floor", False): "lowest_floor",
+    }
+    sort_by = _sort_map.get((sort_field, sort_reverse), "") if sort_field else ""
 
     logger.info(
-        f"_respond_search: requested_type={requested_type!r} "
-        f"filter_kws={filter_kws} sort={sort_field}/{sort_reverse} "
-        f"projects={[p.project_name for p in projects]}"
+        f"_respond_search: type={requested_type!r} sort_by={sort_by!r} "
+        f"non_type_kws={non_type_kws} agency={agency.id}"
     )
+
+    import pdf_index as _idx
+    import drive_service as _drive
+    svc = _drive.get_service()
+
+    # ── PRIMARY: Drive PDF index ──────────────────────────────────────────
+    query_str = " ".join(non_type_kws)
+    idx_results = _idx.search_units(
+        agency.id,
+        query=query_str,
+        unit_type=requested_type or "",
+        sort_by=sort_by,
+    )
+    logger.info(f"_respond_search: pdf_index hits={len(idx_results)}")
+
+    if idx_results:
+        limit = 1 if sort_by else 3
+        for i, (unit_key, unit_data, proj_name) in enumerate(idx_results[:limit]):
+            card = _format_group_card(unit_key, unit_data, proj_name)
+            file_bytes, file_name = None, ""
+
+            # Direct download via file_id stored in index
+            fid = unit_data.get("file_id", "")
+            if svc and fid:
+                file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
+                if file_bytes:
+                    file_name = unit_data.get("filename") or f"{unit_key}.pdf"
+
+            # Fallback: search Drive by unit number
+            if not file_bytes and svc:
+                file_bytes, file_name = await _find_offer_pdf(svc, unit_key, proj_name, root_id)
+
+            if file_bytes:
+                await _send_wa_file(chat_id, file_bytes, file_name, "")
+                await _send_wa(chat_id, card)
+            else:
+                await _send_wa(chat_id, card)
+                if i == 0 and admin_numbers and group_title:
+                    await _send_wa(
+                        f"{admin_numbers[0]}@c.us",
+                        f"Habibi 🙏\nSomeone in *{group_title}* asked for "
+                        f"*{(requested_type or 'unit').upper()} {unit_key}* ({proj_name})\n"
+                        f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
+                    )
+        return
+
+    # ── FALLBACK: Excel DB index (proj.unit_index) ────────────────────────
+    def _matches(unit_num: str, data: dict) -> bool:
+        if requested_type and not _unit_type_matches(data, requested_type):
+            return False
+        if not non_type_kws:
+            return True
+        searchable = " ".join(str(v) for v in data.values()).lower()
+        return any(k.lower() in searchable for k in non_type_kws)
 
     matched: list = []
     for proj in projects:
         idx: dict = proj.unit_index or {}
-        if not idx:
-            logger.info(f"_respond_search: project '{proj.project_name}' has empty unit_index — skipped")
-            continue
-        # Log a sample of type column values to diagnose type matching
-        sample = list(idx.values())[:3]
-        type_cols = {k: v for d in sample for k, v in d.items() if _UNIT_TYPE_COL_RE.search(str(k))}
-        logger.info(
-            f"_respond_search: project '{proj.project_name}' "
-            f"units={len(idx)} type_cols_sample={type_cols}"
-        )
-        proj_hit = any(kw.lower() in proj.project_name.lower() for kw in filter_kws)
-        for unit_num, data in idx.items():
-            if _matches(unit_num, data, proj.project_name, proj_hit):
-                matched.append((unit_num, data, proj.project_name))
+        for u, d in idx.items():
+            if _matches(u, d):
+                matched.append((u, d, proj.project_name))
         if len(matched) >= 30:
             break
-
-    # Fallback 1 — project identified, still respect type filter
-    if not matched:
-        for proj in projects:
-            idx: dict = proj.unit_index or {}
-            if not idx:
-                continue
-            if any(kw.lower() in proj.project_name.lower() for kw in filter_kws):
-                for u, d in idx.items():
-                    if not requested_type or _unit_type_matches(d, requested_type):
-                        matched.append((u, d, proj.project_name))
-                if matched:
-                    break
-
-    # Fallback 2 — any project, still respect type filter
-    if not matched:
-        for proj in projects:
-            idx: dict = proj.unit_index or {}
-            for u, d in idx.items():
-                if not requested_type or _unit_type_matches(d, requested_type):
-                    matched.append((u, d, proj.project_name))
-            if matched:
-                break
 
     if not matched:
         type_hint = f" {requested_type.upper()}" if requested_type else ""
@@ -2016,10 +2035,6 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     else:
         limit = 3
 
-    import drive_service as _drive
-    svc = _drive.get_service()
-    admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
-
     for i, (unit_num, data, proj_name) in enumerate(matched[:limit]):
         card = _format_group_card(unit_num, data, proj_name)
         file_bytes, file_name = None, ""
@@ -2027,7 +2042,6 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
             file_bytes, file_name = await _find_offer_pdf(svc, unit_num, proj_name, root_id)
 
         if file_bytes:
-            # PDF first → formatted text second
             await _send_wa_file(chat_id, file_bytes, file_name, "")
             await _send_wa(chat_id, card)
         else:
@@ -2035,10 +2049,8 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
             if i == 0 and admin_numbers and group_title:
                 await _send_wa(
                     f"{admin_numbers[0]}@c.us",
-                    f"Habibi 🙏\n"
-                    f"Someone in *{group_title}* asked for *Unit {unit_num}* ({proj_name})\n"
-                    f"Sales offer PDF not found in Drive 📂\n"
-                    f"Can you upload it? I'll send it right away 🔥"
+                    f"Habibi 🙏\nSomeone in *{group_title}* asked for *Unit {unit_num}* ({proj_name})\n"
+                    f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
                 )
 
 
