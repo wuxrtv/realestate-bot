@@ -917,33 +917,37 @@ class AdminAgent:
             confirm += f"\n💰 {price}"
         if plan:
             confirm += f" | Payment {plan}"
-        confirm += "\nSending now 👇"
+        # Try to download PDF
+        pdf_bytes = None
+        if file_id:
+            try:
+                pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+            except Exception:
+                logger.exception(f"PDF download failed for {filename}")
 
-        # Send confirmation text first
+        if not pdf_bytes:
+            # No PDF — notify admin, skip unit (no text-only fallback)
+            msg = (
+                f"Habibi PDF not found for *{label}* — can you check Drive? 🙏\n"
+                f"File: {filename or 'no file associated'}"
+            )
+            if chat_id:
+                await whatsapp_bot._send_wa(chat_id, msg)
+            return {"error": "no_pdf", "unit": label}
+
+        # Send PDF FIRST
+        if send_to == "groups":
+            await whatsapp_bot.announce_file_to_wa_groups(db, pdf_bytes, filename, "", agency)
+        else:
+            await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, filename)
+
+        await asyncio.sleep(1)
+
+        # Send confirmation text SECOND
         if send_to == "groups":
             await whatsapp_bot.announce_to_wa_groups(db, confirm, agency)
         else:
             await whatsapp_bot._send_wa(chat_id, confirm)
-
-        # Send exactly ONE PDF
-        pdf_sent = False
-        if file_id:
-            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-            if pdf_bytes:
-                if send_to == "groups":
-                    await whatsapp_bot.announce_file_to_wa_groups(db, pdf_bytes, filename, "", agency)
-                else:
-                    await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, filename)
-                pdf_sent = True
-
-        if not pdf_sent:
-            # No PDF — send text card only
-            from excel_parser import format_unit_card
-            card = format_unit_card(u_num, unit_info, proj_name_found)
-            if send_to == "groups":
-                await whatsapp_bot.announce_to_wa_groups(db, card, agency)
-            else:
-                await whatsapp_bot._send_wa(chat_id, card)
 
         return {
             "sent": True,
@@ -951,7 +955,7 @@ class AdminAgent:
             "floor": floor_val,
             "type": u_type,
             "price": price,
-            "pdf_sent": pdf_sent,
+            "pdf_sent": True,
             "destination": send_to,
         }
 
@@ -1074,6 +1078,28 @@ class AdminAgent:
         else:
             picks = _random.sample(filtered, min(count or 3, len(filtered)))
 
+        # Scan sales offers once — fallback for units from DB/Excel that have no file_id
+        _offers_index: dict = {}
+        if svc:
+            try:
+                _offers_index = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
+            except Exception:
+                logger.exception("_send_inventory_to_groups: scan_sales_offers failed")
+
+        def _resolve_file_id(unit_num: str, unit_data: dict) -> tuple:
+            """Return (file_id, filename) — from unit_data first, then Drive offers scan."""
+            fid = unit_data.get("file_id", "")
+            fn = unit_data.get("filename", f"{unit_num}.pdf")
+            if fid:
+                return fid, fn
+            key_clean = unit_num.upper().replace("-", "").replace(" ", "")
+            for offer_key, offer_data in _offers_index.items():
+                b = offer_data.get("building", "")
+                u = offer_data.get("unit_number", "")
+                if (b + u).upper() == key_clean or u.upper() == key_clean or offer_key.upper() == key_clean:
+                    return offer_data.get("file_id", ""), offer_data.get("filename", fn)
+            return "", fn
+
         # Determine destinations
         chat_id = getattr(self, "_chat_id", "")
         if send_to == "admin":
@@ -1094,28 +1120,32 @@ class AdminAgent:
                 summary_lines.append(line)
             await whatsapp_bot._send_wa(chat_id, "\n".join(summary_lines))
             await asyncio.sleep(1)
+            sent_count = 0
             for unit_num, unit_data, proj_name in picks:
                 if whatsapp_bot.is_cancelled(agency.id):
                     whatsapp_bot.clear_cancel(agency.id)
                     break
-                file_id = unit_data.get("file_id", "")
-                fname = unit_data.get("filename", f"{unit_num}.pdf")
+                file_id, fname = _resolve_file_id(unit_num, unit_data)
+                pdf_bytes = None
                 if file_id and svc:
                     try:
                         pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                        if pdf_bytes:
-                            await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
-                            await asyncio.sleep(2)
-                            continue
-                        else:
-                            logger.warning(f"PDF download returned empty for {fname} (file_id={file_id})")
-                            await whatsapp_bot._send_wa(chat_id, f"Habibi, PDF for *{unit_num}* not downloading from Drive 😅\nFile: {fname}\nHere's the details instead 👇")
                     except Exception:
                         logger.exception(f"PDF download failed for {fname}")
-                        await whatsapp_bot._send_wa(chat_id, f"Habibi, couldn't grab PDF for *{unit_num}* 😅\nHere's the info:")
-                await whatsapp_bot._send_wa(chat_id, format_unit_card(unit_num, unit_data, proj_name))
+                if not pdf_bytes:
+                    await whatsapp_bot._send_wa(
+                        chat_id,
+                        f"Habibi PDF not found for *{unit_num}* — skipping 😅 Check Drive 🙏"
+                    )
+                    continue
+                # PDF FIRST
+                await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
                 await asyncio.sleep(1)
-            return {"sent_to_admin": True, "units_sent": len(picks), "units": [u[0] for u in picks]}
+                # Unit card SECOND
+                await whatsapp_bot._send_wa(chat_id, format_unit_card(unit_num, unit_data, proj_name))
+                await asyncio.sleep(2)
+                sent_count += 1
+            return {"sent_to_admin": True, "units_sent": sent_count, "units": [u[0] for u in picks]}
 
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
@@ -1123,6 +1153,33 @@ class AdminAgent:
         ).all()
         if not groups:
             return {"error": "No active WhatsApp groups registered"}
+
+        # Pre-download all PDFs once — skip units without a downloadable PDF
+        ready_units: list = []
+        skipped_units: list = []
+        for unit_num, unit_data, proj_name in picks:
+            file_id, fname = _resolve_file_id(unit_num, unit_data)
+            pdf_bytes = None
+            if file_id and svc:
+                try:
+                    pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+                except Exception:
+                    logger.exception(f"PDF download failed for {fname}")
+            if pdf_bytes:
+                ready_units.append((unit_num, unit_data, proj_name, pdf_bytes, fname))
+            else:
+                skipped_units.append(unit_num)
+                logger.warning(f"Skipping unit {unit_num} — PDF not found (file_id={file_id!r})")
+
+        if skipped_units and chat_id:
+            skipped_str = ", ".join(skipped_units)
+            await whatsapp_bot._send_wa(
+                chat_id,
+                f"Habibi PDF not found for: *{skipped_str}* — skipped 😅 Check Drive 🙏"
+            )
+
+        if not ready_units:
+            return {"error": "No units with downloadable PDFs found — check Drive"}
 
         whatsapp_bot.clear_cancel(agency.id)
         sent_groups = 0
@@ -1133,9 +1190,9 @@ class AdminAgent:
             if i > 0:
                 await asyncio.sleep(30)
 
-            # Text summary FIRST — confirm what's being sent
-            summary_lines = [f"🔥 {len(picks)} unit(s) incoming:"]
-            for unit_num, unit_data, proj_name in picks:
+            # Summary header
+            summary_lines = [f"🔥 {len(ready_units)} unit(s) incoming:"]
+            for unit_num, unit_data, proj_name, _, _ in ready_units:
                 bld = unit_data.get("building", "")
                 floor_val = unit_data.get("floor") or _get_floor(unit_num, unit_data)
                 u_type = unit_data.get("unit_type", "")
@@ -1152,33 +1209,20 @@ class AdminAgent:
             await whatsapp_bot._send_wa(group.chat_id, "\n".join(summary_lines))
             await asyncio.sleep(2)
 
-            # Send exactly N files — PDF if available, else text card
-            for unit_num, unit_data, proj_name in picks:
-                file_id = unit_data.get("file_id", "")
-                fname = unit_data.get("filename", f"{unit_num}.pdf")
-                pdf_sent = False
-                if file_id and svc:
-                    try:
-                        pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                        if pdf_bytes:
-                            await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
-                            await asyncio.sleep(3)
-                            pdf_sent = True
-                        else:
-                            logger.warning(f"PDF empty for {fname} in groups send")
-                    except Exception:
-                        logger.exception(f"PDF download failed for {fname} in groups send")
-                if not pdf_sent:
-                    card = format_unit_card(unit_num, unit_data, proj_name)
-                    await whatsapp_bot._send_wa(group.chat_id, card)
-                    await asyncio.sleep(2)
+            # Send PDF FIRST, unit card SECOND for each unit
+            for unit_num, unit_data, proj_name, pdf_bytes, fname in ready_units:
+                await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
+                await asyncio.sleep(1)
+                card = format_unit_card(unit_num, unit_data, proj_name)
+                await whatsapp_bot._send_wa(group.chat_id, card)
+                await asyncio.sleep(2)
 
             sent_groups += 1
 
         return {
             "sent_to_groups": sent_groups,
-            "units_sent": len(picks),
-            "units": [u[0] for u in picks],
+            "units_sent": len(ready_units),
+            "units": [u[0] for u in ready_units],
         }
 
     def _list_projects(self, db: Session, agency) -> dict:

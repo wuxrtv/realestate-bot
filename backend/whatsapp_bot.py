@@ -561,25 +561,47 @@ async def _send_offer_for_agency(
     else:
         pool = all_units
 
-    unit_key, unit_data, proj_name = random.choice(pool)
+    # 2. Find a unit with a downloadable PDF (try up to 5 candidates)
+    svc = _drive.get_service()
+    unit_key: Optional[str] = None
+    unit_data: Optional[dict] = None
+    proj_name: Optional[str] = None
+    pdf_bytes: Optional[bytes] = None
+    filename = ""
 
-    # 2. Generate caption ONCE (1 API call)
+    candidates = list(pool)
+    random.shuffle(candidates)
+    for c_key, c_data, c_proj in candidates[:5]:
+        c_file_id = c_data.get("file_id", "")
+        c_filename = c_data.get("filename", f"{c_key}.pdf")
+        if not c_file_id or not svc:
+            continue
+        try:
+            c_pdf = await asyncio.to_thread(_drive.download_file, svc, c_file_id)
+            if c_pdf:
+                unit_key, unit_data, proj_name = c_key, c_data, c_proj
+                pdf_bytes, filename = c_pdf, c_filename
+                break
+        except Exception:
+            logger.exception(f"PDF download failed for {c_filename}")
+
+    if pdf_bytes is None:
+        logger.warning(f"Daily offer [{slot_label}]: no downloadable PDF found in {len(candidates[:5])} candidates")
+        if notify_admin:
+            for phone in (agency.wa_admin_numbers or []):
+                await _send_wa(
+                    f"{phone}@c.us",
+                    f"Habibi no PDF found for {slot_label} 😅\n"
+                    "Check Drive — make sure sales offer PDFs are uploaded 🙏"
+                )
+        return {"error": "no_pdf"}
+
+    # 3. Generate caption ONCE (1 API call)
     caption = await _generate_offer_caption(unit_key, unit_data, proj_name)
     if not caption:
         caption = format_unit_card(unit_key, unit_data, proj_name)
 
-    # 3. Download PDF ONCE
-    svc = _drive.get_service()
-    file_id = unit_data.get("file_id", "")
-    pdf_bytes: Optional[bytes] = None
-    filename = unit_data.get("filename", f"{unit_key}.pdf")
-    if file_id and svc:
-        try:
-            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-        except Exception:
-            logger.exception(f"PDF download failed for {filename}")
-
-    # 4. Send SAME caption + PDF to ALL groups
+    # 4. Send PDF FIRST, then caption to ALL groups
     groups = db.query(WhatsAppGroup).filter(
         WhatsAppGroup.active == True,
         WhatsAppGroup.agency_id == agency.id,
@@ -592,10 +614,9 @@ async def _send_offer_for_agency(
             break
         if i > 0:
             await asyncio.sleep(group_delay)
+        await _send_wa_file(group.chat_id, pdf_bytes, filename, "")
+        await asyncio.sleep(1)
         await _send_wa(group.chat_id, caption)
-        if pdf_bytes:
-            await asyncio.sleep(1)
-            await _send_wa_file(group.chat_id, pdf_bytes, filename, "")
         sent_count += 1
 
     # 5. Notify admin
@@ -609,7 +630,7 @@ async def _send_offer_for_agency(
             f"📤 {slot_label} done habibi!\n"
             f"Unit {label} {u_type} — {price_str}\n"
             f"Sent to {sent_count} group(s) ✅\n"
-            f"Caption generated once — forwarded to all khalas 💪"
+            f"PDF + caption forwarded to all khalas 💪"
         )
         for phone in (agency.wa_admin_numbers or []):
             await _send_wa(f"{phone}@c.us", admin_msg)
@@ -881,6 +902,36 @@ _WA_SAVE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_DATE_NOISE_RE = re.compile(
+    r"\b("
+    r"(?:\d{1,2}(?:st|nd|rd|th)?\s+)?"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    r"(?:\s*\d{2,4})?|"
+    r"\d{1,2}(?:st|nd|rd|th)|"
+    r"\d{4}"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _project_name_from_file(filename: str) -> str:
+    """Strip ONLY dates — keep document type in name.
+    'SAAS Hills Availability 11th May 2026.pdf' → 'SAAS Hills Availability'
+    'SAAS Hills Price List May 2026.pdf'        → 'SAAS Hills Price List'
+    """
+    name = re.sub(r"\.[^.]+$", "", filename)   # strip extension
+    name = _DATE_NOISE_RE.sub(" ", name)        # strip dates only
+    name = re.sub(r"[\s_\-]+", " ", name).strip(" -_")
+    return name.strip() or re.sub(r"\.[^.]+$", "", filename)
+
+
+# "Send" intent — admin wants to broadcast the file to groups
+_WA_GROUPS_RE = re.compile(
+    r"\b(send|отправь|скинь|разошли|в\s*группы|to\s*groups?|blast|forward)\b",
+    re.IGNORECASE,
+)
+
 _FORWARDABLE_EXTS = (
     ".pdf", ".jpg", ".jpeg", ".png", ".webp", ".heic", ".gif",
     ".mp4", ".mov", ".avi", ".mkv", ".webm",
@@ -891,110 +942,139 @@ _INVENTORY_EXTS = (".xlsx", ".xls", ".csv")
 
 async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: str,
                                  file_name: str, caption: str, db: Session, agency: Agency):
+    """
+    Smart file handler. Decision tree:
+
+    Excel/CSV                    → save as inventory (always)
+    PDF — sales offer pattern    → tell admin to put in Drive
+    PDF — inventory name         → auto-save / diff+re-save
+    PDF — caption says "send"    → forward to groups
+    PDF — caption says "save"    → save as inventory
+    PDF — unclear                → ask with smart message
+    Photo / video / doc          → forward to groups instantly
+    """
     from datetime import datetime as _dt
     from excel_parser import (build_unit_index, diff_unit_indexes, format_diff_report,
                               normalize_project_name, parse_csv, parse_excel, parse_pdf)
 
     fname_lower = file_name.lower()
-    has_save_intent = bool(_WA_SAVE_RE.search(caption))
+    is_pdf       = fname_lower.endswith(".pdf")
+    is_excel     = fname_lower.endswith(_INVENTORY_EXTS)
+    is_media     = fname_lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".heic",
+                                         ".gif", ".mp4", ".mov", ".avi", ".mkv", ".webm"))
+    is_doc       = fname_lower.endswith((".doc", ".docx", ".ppt", ".pptx"))
 
-    # ── INSTANT FORWARD: any file without explicit save instruction ──────────
-    # Excel/CSV always go to inventory. Everything else (photo, video, PDF, doc)
-    # is forwarded to all groups unless admin says "save" / "brochure" etc.
-    is_inventory_ext = fname_lower.endswith(_INVENTORY_EXTS)
-    is_forwardable   = fname_lower.endswith(_FORWARDABLE_EXTS)
-
-    if not is_inventory_ext and not is_forwardable:
+    if not is_pdf and not is_excel and not is_media and not is_doc:
         await _send_wa(chat_id, "❓ Файл не распознан.")
         return
 
-    # Sales offer PDFs (SH_A311_40.60_1B.pdf) and inventory PDFs → never forward
-    is_sales_offer = _wa_is_sales_offer(file_name)
-    is_inventory_file = _wa_is_inventory(file_name, caption)
+    has_send_intent = bool(_WA_GROUPS_RE.search(caption))
+    has_save_intent = bool(_WA_SAVE_RE.search(caption))
+    is_sales_offer  = _wa_is_sales_offer(file_name)
+    is_inventory    = _wa_is_inventory(file_name, caption)
 
-    if not is_inventory_ext and not has_save_intent and not is_sales_offer and not is_inventory_file:
-        # Download and instantly forward to all groups
+    # ── 1. Photos / videos / docs → forward to groups instantly ─────────────
+    if is_media or is_doc:
         try:
             async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.get(download_url)
-                file_bytes = resp.content
+                file_bytes = (await client.get(download_url)).content
         except Exception:
-            logger.exception("WA instant forward download error")
             await _send_wa(chat_id, "❌ Не удалось скачать файл.")
             return
         n = await announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
-        await _send_wa(chat_id, f"Khalas habibi! ✅\nForwarded to {n} groups 💪")
+        await _send_wa(chat_id, f"Khalas habibi! ✅ Forwarded to {n} groups 💪")
         return
 
-    # Sales offer PDF detected — tell admin it's recognized, not forwarded
-    if is_sales_offer and not has_save_intent:
+    # ── 2. Sales offer PDF (SH_A311_40.60_1B.pdf) → Drive ───────────────────
+    if is_sales_offer:
         try:
             from drive_service import parse_offer_filename
-            parsed = parse_offer_filename(file_name) or {}
+            p = parse_offer_filename(file_name) or {}
         except Exception:
-            parsed = {}
-        unit_info = ""
-        if parsed:
-            unit_info = (f"\nProject: {parsed.get('project_name', parsed.get('project_code', '?'))} "
-                         f"| Building {parsed.get('building', '?')} | Unit {parsed.get('unit_number', '?')} "
-                         f"| Floor {parsed.get('floor', '?')} | {parsed.get('unit_type', '?')} "
-                         f"| {parsed.get('payment_plan', '?')}")
+            p = {}
+        info = (f"\n{p.get('project_name','?')} | Bldg {p.get('building','?')} "
+                f"| Unit {p.get('unit_number','?')} | Floor {p.get('floor','?')} "
+                f"| {p.get('unit_type','?')} | {p.get('payment_plan','?')}") if p else ""
         await _send_wa(chat_id,
-                       f"📋 Sales offer detected: *{file_name}*{unit_info}\n"
-                       "Upload to Drive → project's 'sales office' folder. "
-                       "Tony reads it automatically 🔥")
+                       f"📋 This is a sales offer: *{file_name}*{info}\n"
+                       "Upload it to Drive → project's *sales office* folder.\n"
+                       "Tony will find it automatically 🔥")
         return
 
-    # ── SAVE PATH: Excel/CSV, or forwardable file with explicit save intent ──
-    # PDFs with save intent but no unit data → brochure, tell admin to put in Drive
-    if fname_lower.endswith(".pdf") and has_save_intent and not is_inventory_file:
-        await _send_wa(chat_id,
-                       f"📄 PDF «{file_name}» — брошюра.\n"
-                       "Загрузи файл в Google Drive в папку проекта, чтобы агенты могли его получить.")
+    # ── 3. PDF — admin says "send"/"отправь" → forward to groups ────────────
+    if is_pdf and has_send_intent:
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                file_bytes = (await client.get(download_url)).content
+        except Exception:
+            await _send_wa(chat_id, "❌ Не удалось скачать файл.")
+            return
+        n = await announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
+        await _send_wa(chat_id, f"Khalas habibi! ✅ Forwarded to {n} groups 💪")
         return
 
-    await _send_wa(chat_id, f"📊 Читаю *{file_name}*...")
+    # ── 4. Excel/CSV or inventory PDF → save to database ────────────────────
+    if is_excel or is_inventory or has_save_intent:
+        # Determine project name intelligently
+        _CMD_RE = re.compile(
+            r"\b(send|отправь|сохрани|скинь|forward|blast|это|this|вот|"
+            r"availability|инвентарь|inventory)\b",
+            re.IGNORECASE,
+        )
+        _GENERIC = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
 
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.get(download_url)
-            file_bytes = resp.content
-    except Exception:
-        logger.exception("WA file download error")
-        await _send_wa(chat_id, "❌ Не удалось скачать файл.")
-        return
+        # Caption that looks like a real project name (not a command)?
+        caption_is_name = caption.strip() and not _CMD_RE.search(caption)
 
-    try:
-        if fname_lower.endswith(".csv"):
-            sheets_data = parse_csv(file_bytes)
-        elif fname_lower.endswith(".pdf"):
-            sheets_data = parse_pdf(file_bytes)
+        # Tell admin what we understood
+        detected_name = (
+            caption.strip() if caption_is_name
+            else _project_name_from_file(file_name) if is_pdf
+            else normalize_project_name(file_name)
+        )
+        await _send_wa(chat_id, f"📊 Got it — reading *{file_name}* for *{detected_name}*...")
+
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                file_bytes = (await client.get(download_url)).content
+        except Exception:
+            await _send_wa(chat_id, "❌ Не удалось скачать файл.")
+            return
+
+        try:
+            if fname_lower.endswith(".csv"):
+                sheets_data = parse_csv(file_bytes)
+            elif is_pdf:
+                sheets_data = parse_pdf(file_bytes)
+            else:
+                sheets_data = parse_excel(file_bytes)
+        except Exception as e:
+            await _send_wa(chat_id, f"❌ Ошибка чтения файла: {e}")
+            return
+
+        if not sheets_data:
+            await _send_wa(chat_id,
+                           f"❌ No unit data found in *{file_name}*.\n"
+                           "If this is a brochure/media → upload to Drive 📁")
+            return
+
+        non_generic = [s for s in sheets_data.keys() if not _GENERIC.match(s.strip())]
+        if caption_is_name:
+            name = caption.strip()
+        elif len(non_generic) == 1:
+            name = non_generic[0].strip()
+        elif is_pdf:
+            name = _project_name_from_file(file_name)
         else:
-            sheets_data = parse_excel(file_bytes)
-    except Exception as e:
-        await _send_wa(chat_id, f"❌ Ошибка чтения файла: {e}")
-        return
+            name = normalize_project_name(file_name)
 
-    if not sheets_data:
-        await _send_wa(chat_id, "❌ Файл пустой или без данных.")
-        return
-
-    # All sheets → ONE project (same logic as Telegram bot)
-    _GENERIC = re.compile(r"^(sheet\s*\d*|лист\s*\d*|data|данные|table)$", re.IGNORECASE)
-    non_generic = [s for s in sheets_data.keys() if not _GENERIC.match(s.strip())]
-    if caption.strip():
-        name = caption.strip()
-    elif len(non_generic) == 1:
-        name = non_generic[0].strip()
-    else:
-        name = normalize_project_name(file_name)
-
-    results = []
-    for name, sheets in [(name, sheets_data)]:
-        unit_index = build_unit_index(sheets)
+        unit_index = build_unit_index(sheets_data)
         if not unit_index:
-            results.append({"status": "skipped", "name": name})
-            continue
+            await _send_wa(chat_id,
+                           f"❌ No units found in *{file_name}*.\n"
+                           "Check the table format — need Unit No, Price columns 🙏")
+            return
+
         existing = (db.query(ToniProject)
                     .filter(ToniProject.project_name == name,
                             ToniProject.is_active == True,
@@ -1006,42 +1086,37 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
             new_ver = existing.version + 1
             existing.is_active = False
             db.flush()
-            db.add(ToniProject(project_name=name, version=new_ver, sheet_count=len(sheets),
-                               unit_count=len(unit_index), sheets_data=sheets, unit_index=unit_index,
+            db.add(ToniProject(project_name=name, version=new_ver,
+                               sheet_count=len(sheets_data), unit_count=len(unit_index),
+                               sheets_data=sheets_data, unit_index=unit_index,
                                is_active=True, uploaded_at=_dt.now(),
                                uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
             db.commit()
-            results.append({"status": "updated", "name": name, "units": len(unit_index),
-                            "version": new_ver, "diff_report": report})
+            await _send_wa(chat_id,
+                           f"🔄 *{name}* updated → v{new_ver}\n"
+                           f"Units: {len(unit_index)}\n\n{report}")
         else:
-            db.add(ToniProject(project_name=name, version=1, sheet_count=len(sheets),
-                               unit_count=len(unit_index), sheets_data=sheets, unit_index=unit_index,
+            db.add(ToniProject(project_name=name, version=1,
+                               sheet_count=len(sheets_data), unit_count=len(unit_index),
+                               sheets_data=sheets_data, unit_index=unit_index,
                                is_active=True, uploaded_at=_dt.now(),
                                uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
             db.commit()
-            results.append({"status": "created", "name": name, "units": len(unit_index), "version": 1})
+            await _send_wa(chat_id, f"✅ *{name}* saved! {len(unit_index)} units 🔥")
 
-    saved = [r for r in results if r["status"] != "skipped"]
-    if not saved:
-        await _send_wa(chat_id, "❌ Юниты не найдены в файле. Проверь формат таблицы.")
+        import drive_service as _drive
+        _drive.clear_cache()
         return
 
-    import drive_service as _drive
-    _drive.clear_cache()
-
-    if len(saved) == 1:
-        r = saved[0]
-        if r["status"] == "updated":
-            msg = f"✅ Проект *{r['name']}* обновлён → v{r['version']}\nЮнитов: {r['units']}\n\n{r['diff_report']}"
-        else:
-            msg = f"✅ Проект *{r['name']}* сохранён!\nЮнитов: {r['units']}"
-    else:
-        lines = [f"✅ Сохранено {len(saved)} проектов:"]
-        for r in saved:
-            lines.append(f"{'🔄' if r['status'] == 'updated' else '📁'} {r['name']} — {r['units']} юн.")
-        msg = "\n".join(lines)
-
-    await _send_wa(chat_id, msg)
+    # ── 5. Unknown PDF — ask clearly ─────────────────────────────────────────
+    detected = _project_name_from_file(file_name)
+    await _send_wa(chat_id,
+                   f"Habibi, I see *{file_name}* 🤔\n"
+                   f"Looks like it could be for *{detected}*.\n\n"
+                   "What should I do?\n"
+                   "• *save* — parse and save as inventory 📊\n"
+                   "• *send to groups* — forward to all groups 📤\n"
+                   "• *brochure* — it's media, I'll note it for Drive 📁")
 
 
 # ─── Admin private message ────────────────────────────────────────────────────
