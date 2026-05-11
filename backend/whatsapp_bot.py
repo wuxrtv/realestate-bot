@@ -135,11 +135,11 @@ You are in a group chat with real estate agents. Your name is Tony.
 
 Respond ONLY with valid JSON (no markdown, no code blocks):
 {
-  "intent": "unit_query" | "media_request" | "property_search" | "direct_question" | "discount_inquiry" | "off_topic",
+  "intent": "unit_query" | "media_request" | "property_search" | "inventory_query" | "direct_question" | "discount_inquiry" | "off_topic",
   "unit_numbers": ["1507", "1435"],
   "project_name": "project name or null",
   "keywords": ["2 rooms", "villa", "floor 20"],
-  "reply": "your reply (only for direct_question, empty string otherwise)"
+  "reply": "your reply (only for direct_question and inventory_query, empty string otherwise)"
 }
 
 ━━━ WHEN TO RESPOND ━━━
@@ -173,15 +173,32 @@ Examples:
   → intent = direct_question, reply lists available projects
 • "send me SAAS Hills brochure" → project_name = "SAAS Hills", intent = media_request ← immediate
 
+━━━ GOLDEN RULE — SALES OFFER vs INVENTORY ━━━
+Always ask yourself FIRST:
+→ Are they asking for SOMETHING SPECIFIC (one/few units)? → property_search or unit_query
+→ Are they asking WHAT EXISTS overall? → inventory_query
+
+"Send me A unit" / "show me something" / "cheapest studio" = property_search (specific PDF)
+"What units DO YOU HAVE" / "show availability" / "how many left?" = inventory_query (full list)
+NEVER confuse these two. Ever.
+
 ━━━ INTENT RULES ━━━
-• unit_query: asking for specific unit number ("unit 1507", "show 1435", "2301 bormi")
+• unit_query: specific unit number asked ("unit 1507", "show 1435", "2301 bormi")
+• property_search: request for SPECIFIC unit(s) by type/floor/price/sort
+  → "send me a studio" / "show me something" / "highest floor unit" / "cheapest apartment" / "send 1BR"
+  → ANY request for ONE or FEW specific units → Tony finds and sends the PDF
+  → keywords = type/floor/price filters extracted from message
+• inventory_query: question about WHAT EXISTS overall — full list, availability, count
+  → "what units do you have?" / "show me availability" / "what's available?" / "how many units left?"
+  → "what do we have in stock?" / "send inventory" / "show all units"
+  → Tony answers with a text summary from database — does NOT send individual PDFs
+  → Put the summary text in "reply" field
 • media_request: asking for ANY media — brochure, PDF, photos, renders, video, tour, presentation ("фото", "photo", "brochure", "видео", "video", "renders", "tour", "ролик", "брошюра", "брошура")
   → Tony sends ALL files from project's media folder in order: Brochure → Payment Plan → Photos → Video
   → NEVER send video before brochure — order is fixed
   → project_name MUST be set and non-null. If project unclear → use direct_question instead, NEVER media_request with empty project_name
   → "send brochure" (no project) → direct_question, ask which project
   → "send SAAS Hills brochure" → media_request, project_name="SAAS Hills"
-• property_search: searching by parameters or project ("Bugatti", "3-bedroom villa", "20th floor", "2M budget")
 • direct_question: any other work question — answer in "reply" using the project context below
 • discount_inquiry: ANY question about pricing flexibility — discounts, DLD waiver, "4%", payment plans
   ("50/50", "60/40", "40/60"), special offers, "best price", negotiation, "chegirma", "скидка"
@@ -1317,6 +1334,21 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         if project_name and project_name not in keywords:
             keywords = [project_name] + keywords
         await _respond_search(chat_id, keywords, projects, agency)
+    elif intent == "inventory_query":
+        # "what units do you have?" → text summary, NOT individual PDFs
+        reply = (parsed.get("reply") or "").strip()
+        if reply:
+            await _send_wa(chat_id, reply)
+        else:
+            # Build summary from DB
+            if not projects:
+                await _send_wa(chat_id, f"Habibi no inventory loaded yet 😅 Ask {contact} 🙏")
+            else:
+                lines = ["Here's what we have habibi 👇\n"]
+                for p in projects:
+                    unit_count = len(p.unit_index or {})
+                    lines.append(f"🏢 *{p.project_name}* — {unit_count} units available")
+                await _send_wa(chat_id, "\n".join(lines))
     elif intent == "media_request":
         import drive_service as _drive
         svc = _drive.get_service()
