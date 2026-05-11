@@ -1965,6 +1965,8 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
             if _matches(u, d):
                 matched.append((u, d, proj.project_name))
 
+    has_inventory = any(bool(p.unit_index) for p in projects)
+
     if matched:
         if sort_field:
             matched.sort(key=lambda t: _get_sort_value(t[1], sort_field), reverse=sort_reverse)
@@ -1992,55 +1994,53 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
                     )
         return
 
-    # ── FALLBACK: Drive PDF index (used only when no inventory is loaded) ────
-    # If inventory exists but nothing matched → unit is sold/unavailable (skip Drive).
-    has_inventory = any(bool(p.unit_index) for p in projects)
-    if not has_inventory:
-        import pdf_index as _idx
-        _sort_map = {
-            ("price", False): "cheapest",
-            ("price", True):  "most_expensive",
-            ("floor", True):  "highest_floor",
-            ("floor", False): "lowest_floor",
-        }
-        sort_by = _sort_map.get((sort_field, sort_reverse), "") if sort_field else ""
-        query_str = " ".join(non_type_kws)
-        idx_results = _idx.search_units(
-            agency.id,
-            query=query_str,
-            unit_type=requested_type or "",
-            sort_by=sort_by,
-        )
-        if idx_results:
-            limit = 1 if sort_by else 3
-            for i, (unit_key, unit_data, proj_name) in enumerate(idx_results[:limit]):
-                card = _format_group_card(unit_key, unit_data, proj_name)
-                file_bytes, file_name = None, ""
-                fid = unit_data.get("file_id", "")
-                if svc and fid:
-                    file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
-                    if file_bytes:
-                        file_name = unit_data.get("filename") or f"{unit_key}.pdf"
-                if not file_bytes and svc:
-                    file_bytes, file_name = await _find_offer_pdf(svc, unit_key, proj_name, root_id)
+    # ── SECONDARY: Drive PDF index ───────────────────────────────────────────
+    # Always check Drive when inventory has no match — inventory may not recognize
+    # all unit types (column naming), or Drive has units not yet in inventory.
+    import pdf_index as _idx
+    _sort_map = {
+        ("price", False): "cheapest",
+        ("price", True):  "most_expensive",
+        ("floor", True):  "highest_floor",
+        ("floor", False): "lowest_floor",
+    }
+    sort_by = _sort_map.get((sort_field, sort_reverse), "") if sort_field else ""
+    query_str = " ".join(non_type_kws)
+    idx_results = _idx.search_units(
+        agency.id,
+        query=query_str,
+        unit_type=requested_type or "",
+        sort_by=sort_by,
+    )
+    if idx_results:
+        limit = 1 if sort_by else 3
+        for i, (unit_key, unit_data, proj_name) in enumerate(idx_results[:limit]):
+            card = _format_group_card(unit_key, unit_data, proj_name)
+            file_bytes, file_name = None, ""
+            fid = unit_data.get("file_id", "")
+            if svc and fid:
+                file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
                 if file_bytes:
-                    await _send_wa_file(chat_id, file_bytes, file_name, "")
-                    await _send_wa(chat_id, card)
-                else:
-                    await _send_wa(chat_id, card)
-                    if i == 0 and admin_numbers and group_title:
-                        await _send_wa(
-                            f"{admin_numbers[0]}@c.us",
-                            f"Habibi 🙏\nSomeone in *{group_title}* asked for "
-                            f"*{(requested_type or 'unit').upper()} {unit_key}* ({proj_name})\n"
-                            f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
-                        )
-            return
+                    file_name = unit_data.get("filename") or f"{unit_key}.pdf"
+            if not file_bytes and svc:
+                file_bytes, file_name = await _find_offer_pdf(svc, unit_key, proj_name, root_id)
+            if file_bytes:
+                await _send_wa_file(chat_id, file_bytes, file_name, "")
+                await _send_wa(chat_id, card)
+            else:
+                await _send_wa(chat_id, card)
+                if i == 0 and admin_numbers and group_title:
+                    await _send_wa(
+                        f"{admin_numbers[0]}@c.us",
+                        f"Habibi 🙏\nSomeone in *{group_title}* asked for "
+                        f"*{(requested_type or 'unit').upper()} {unit_key}* ({proj_name})\n"
+                        f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
+                    )
+        return
 
-    # ── Nothing found ────────────────────────────────────────────────────────
+    # ── Nothing found in either source ────────────────────────────────────────
     type_hint = f" {requested_type.upper()}" if requested_type else ""
     if has_inventory:
-        # Inventory exists but no match → sold/reserved
         await _send_wa(chat_id,
                        f"Habibi — no{type_hint} units available right now 😅\n"
                        f"Looks like they're sold or reserved.\n"
