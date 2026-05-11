@@ -1955,11 +1955,25 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
         searchable = " ".join(str(v) for v in data.values()).lower()
         return not non_type_kws or any(k.lower() in searchable for k in non_type_kws)
 
+    logger.info(
+        f"_respond_search: requested_type={requested_type!r} "
+        f"filter_kws={filter_kws} sort={sort_field}/{sort_reverse} "
+        f"projects={[p.project_name for p in projects]}"
+    )
+
     matched: list = []
     for proj in projects:
         idx: dict = proj.unit_index or {}
         if not idx:
+            logger.info(f"_respond_search: project '{proj.project_name}' has empty unit_index — skipped")
             continue
+        # Log a sample of type column values to diagnose type matching
+        sample = list(idx.values())[:3]
+        type_cols = {k: v for d in sample for k, v in d.items() if _UNIT_TYPE_COL_RE.search(str(k))}
+        logger.info(
+            f"_respond_search: project '{proj.project_name}' "
+            f"units={len(idx)} type_cols_sample={type_cols}"
+        )
         proj_hit = any(kw.lower() in proj.project_name.lower() for kw in filter_kws)
         for unit_num, data in idx.items():
             if _matches(unit_num, data, proj.project_name, proj_hit):
