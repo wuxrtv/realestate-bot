@@ -470,6 +470,17 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages[:3])
 
+        # Diagnostic logging — helps diagnose why price_raw is None
+        tl = text.lower()
+        logger.info(
+            f"extract_offer_data_from_pdf: text_len={len(text)} "
+            f"has_AED={'aed' in tl} "
+            f"has_final_price={'final price' in tl} "
+            f"has_total_price={'total price' in tl} "
+            f"has_price={'price' in tl} "
+            f"first500={text[:500]!r}"
+        )
+
         # Try labeled price first (Final Price / Full Price / etc.)
         m = _PDF_PRICE_RE.search(text)
         if m:

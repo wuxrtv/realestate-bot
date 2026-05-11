@@ -1390,7 +1390,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
 
     if intent == "unit_query":
         if unit_numbers:
-            await _respond_unit(chat_id, unit_numbers, projects, agency, project_name, group_title)
+            await _respond_unit(chat_id, unit_numbers, projects, agency, project_name, group_title, keywords)
         else:
             await _send_wa(chat_id,
                            f"Ya habibi, which unit number? 😅 Contact {contact} 🙏")
@@ -1510,7 +1510,8 @@ async def _send_wa_file(chat_id: str,
 # ─── Unit lookup ──────────────────────────────────────────────────────────────
 
 async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency: Agency,
-                        hint_project: str = "", group_title: str = ""):
+                        hint_project: str = "", group_title: str = "",
+                        keywords: list | None = None):
     import drive_service as _drive
     svc = _drive.get_service()
     contact = agency.umar_contact or "@support"
@@ -1589,7 +1590,9 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                     if fid:
                         file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
                         if file_bytes:
-                            await _send_wa_file(chat_id, file_bytes, fid, "")
+                            # Use actual filename from offer data, never raw file_id
+                            fname = enriched.get("filename") or offer_data.get("filename") or f"{unit}.pdf"
+                            await _send_wa_file(chat_id, file_bytes, fname, "")
                             await _send_wa(chat_id, card)
                             pdf_sent = True
                     if not pdf_sent:
@@ -1598,21 +1601,38 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 logger.exception("_respond_unit: scan_sales_offers failed")
 
         if not found:
-            alts = []
+            # Smart alternatives: same type (from keywords) + similar floor (±3)
+            target_floor = _floor_from_unit_num(unit)
+            req_type = _detect_requested_type(keywords or [])
+
+            alt_candidates = []
             for proj in projects:
                 idx = proj.unit_index or {}
-                for u_num, u_data in list(idx.items())[:3]:
-                    if u_num != unit:
-                        alts.append((u_num, u_data, proj.project_name))
-                if alts:
-                    break
+                for u_num, u_data in idx.items():
+                    if u_num == unit:
+                        continue
+                    if req_type and not _unit_type_matches(u_data, req_type):
+                        continue
+                    alt_candidates.append((u_num, u_data, proj.project_name))
 
-            await _send_wa(chat_id,
-                           f"Ya habibi — Unit {unit} not available right now 😔\n"
-                           f"Sold or reserved wallah\n\nBut check these 👇" if alts else
-                           f"Ya habibi — Unit {unit} not found 😔 Contact {contact} 🙏")
-            for u_num, u_data, p_name in alts[:2]:
-                await _send_wa(chat_id, _format_group_card(u_num, u_data, p_name))
+            if target_floor is not None:
+                alt_candidates.sort(
+                    key=lambda x: abs((_floor_from_unit_num(x[0]) or 999) - target_floor)
+                )
+
+            alts = alt_candidates[:2]
+
+            if alts:
+                type_note = f" {req_type.upper()}" if req_type else ""
+                await _send_wa(chat_id,
+                               f"Habibi — Unit {unit} not in my current data 😅\n"
+                               f"Here are similar{type_note} options nearby 👇")
+                for u_num, u_data, p_name in alts:
+                    await _send_wa(chat_id, _format_group_card(u_num, u_data, p_name))
+            else:
+                await _send_wa(chat_id,
+                               f"Habibi — Unit {unit} not in current inventory 😅\n"
+                               f"Contact {contact} for latest availability 🙏")
 
 
 # ─── Property search ──────────────────────────────────────────────────────────
@@ -1639,6 +1659,20 @@ def _parse_sort_intent(keywords: list) -> tuple:
             clean = [k for k in keywords if not _SORT_WORD_RE.search(k)]
             return clean, field, reverse
     return keywords, None, False
+
+
+def _floor_from_unit_num(u: str) -> int | None:
+    """Extract floor number from unit identifier.
+    B-1212 → 12, A315 → 3, 1507 → 15, 2301 → 23.
+    Convention: last 2 digits = unit within floor, rest = floor number.
+    """
+    digits = re.sub(r"[^\d]", "", u)
+    if len(digits) >= 3:
+        try:
+            return int(digits[:-2])
+        except ValueError:
+            pass
+    return None
 
 
 def _get_sort_value(unit_data: dict, field: str) -> float:
