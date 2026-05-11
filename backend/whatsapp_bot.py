@@ -1946,58 +1946,9 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     non_type_kws = [k for k in filter_kws if not any(p.search(k) for p in _all_type_pats)]
 
     import drive_service as _drive
+    import pdf_index as _idx
     svc = _drive.get_service()
 
-    # ── PRIMARY: Inventory (proj.unit_index) — source of truth for availability ─
-    # Only units present here are available; sold/reserved units are removed by Admin.
-    def _matches(unit_num: str, data: dict) -> bool:
-        if requested_type and not _unit_type_matches(data, requested_type):
-            return False
-        if not non_type_kws:
-            return True
-        searchable = " ".join(str(v) for v in data.values()).lower()
-        return any(k.lower() in searchable for k in non_type_kws)
-
-    matched: list = []
-    for proj in projects:
-        idx: dict = proj.unit_index or {}
-        for u, d in idx.items():
-            if _matches(u, d):
-                matched.append((u, d, proj.project_name))
-
-    has_inventory = any(bool(p.unit_index) for p in projects)
-
-    if matched:
-        if sort_field:
-            matched.sort(key=lambda t: _get_sort_value(t[1], sort_field), reverse=sort_reverse)
-            limit = 1
-        else:
-            limit = 3
-
-        for i, (unit_num, data, proj_name) in enumerate(matched[:limit]):
-            card = _format_group_card(unit_num, data, proj_name)
-            file_bytes, file_name = None, ""
-            if svc:
-                file_bytes, file_name = await _find_offer_pdf(svc, unit_num, proj_name, root_id)
-
-            if file_bytes:
-                await _send_wa_file(chat_id, file_bytes, file_name, "")
-                await _send_wa(chat_id, card)
-            else:
-                await _send_wa(chat_id, card)
-                if i == 0 and admin_numbers and group_title:
-                    await _send_wa(
-                        f"{admin_numbers[0]}@c.us",
-                        f"Habibi 🙏\nSomeone in *{group_title}* asked for "
-                        f"*{(requested_type or 'unit').upper()} {unit_num}* ({proj_name})\n"
-                        f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
-                    )
-        return
-
-    # ── SECONDARY: Drive PDF index ───────────────────────────────────────────
-    # Always check Drive when inventory has no match — inventory may not recognize
-    # all unit types (column naming), or Drive has units not yet in inventory.
-    import pdf_index as _idx
     _sort_map = {
         ("price", False): "cheapest",
         ("price", True):  "most_expensive",
@@ -2006,15 +1957,11 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     }
     sort_by = _sort_map.get((sort_field, sort_reverse), "") if sort_field else ""
     query_str = " ".join(non_type_kws)
-    idx_results = _idx.search_units(
-        agency.id,
-        query=query_str,
-        unit_type=requested_type or "",
-        sort_by=sort_by,
-    )
-    if idx_results:
+
+    async def _send_units(units: list):
+        """Send up to limit units: PDF + card. Notify admin if PDF missing."""
         limit = 1 if sort_by else 3
-        for i, (unit_key, unit_data, proj_name) in enumerate(idx_results[:limit]):
+        for i, (unit_key, unit_data, proj_name) in enumerate(units[:limit]):
             card = _format_group_card(unit_key, unit_data, proj_name)
             file_bytes, file_name = None, ""
             fid = unit_data.get("file_id", "")
@@ -2036,18 +1983,62 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
                         f"*{(requested_type or 'unit').upper()} {unit_key}* ({proj_name})\n"
                         f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
                     )
+
+    # ── PRIMARY: Drive PDF index (same as admin — fast, pre-built) ──────────
+    idx_results = _idx.search_units(
+        agency.id,
+        query=query_str,
+        unit_type=requested_type or "",
+        sort_by=sort_by,
+    )
+    if idx_results:
+        await _send_units(idx_results)
         return
 
-    # ── Nothing found in either source ────────────────────────────────────────
+    # ── FALLBACK: Direct Drive scan (when index not yet built after deploy) ──
+    if svc:
+        try:
+            offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
+            all_units = [
+                (key, data, data.get("project_name", "Unknown"))
+                for key, data in offers.items()
+            ]
+            # Type filter: check type columns first, then search all values
+            if requested_type and all_units:
+                from admin_agent import _normalize_type as _norm
+                t = _norm(requested_type)
+                filtered = []
+                for uk, ud, pn in all_units:
+                    hit = False
+                    for k, v in ud.items():
+                        if any(kw in k.lower() for kw in ("type", "unit_type", "bed", "layout")):
+                            if t in _norm(str(v)):
+                                hit = True
+                                break
+                    if not hit:
+                        hit = t in _norm(" ".join(str(v) for v in ud.values()))
+                    if hit:
+                        filtered.append((uk, ud, pn))
+                all_units = filtered
+            # Text query filter
+            if non_type_kws and all_units:
+                all_units = [
+                    (uk, ud, pn) for uk, ud, pn in all_units
+                    if any(k.lower() in uk.lower() or
+                           k.lower() in " ".join(str(v) for v in ud.values()).lower()
+                           for k in non_type_kws)
+                ]
+            if all_units:
+                from admin_agent import _sort_units
+                all_units = _sort_units(all_units, sort_by)
+                await _send_units(all_units)
+                return
+        except Exception:
+            logger.exception("_respond_search: Drive scan fallback failed")
+
+    # ── Nothing found ────────────────────────────────────────────────────────
     type_hint = f" {requested_type.upper()}" if requested_type else ""
-    if has_inventory:
-        await _send_wa(chat_id,
-                       f"Habibi — no{type_hint} units available right now 😅\n"
-                       f"Looks like they're sold or reserved.\n"
-                       f"Contact {contact} for latest updates 🙏")
-    else:
-        await _send_wa(chat_id,
-                       f"Habibi no{type_hint} units found 😅 Contact {contact} 🙏")
+    await _send_wa(chat_id, f"Habibi no{type_hint} units found 😅 Contact {contact} 🙏")
 
 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
