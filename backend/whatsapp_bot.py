@@ -315,6 +315,108 @@ _DISCOUNT_ADMIN_NOTIFS = [
 ]
 
 
+# ─── Lead generation — Tony sells himself ────────────────────────────────────
+
+_BUILDER_PHONE = "+971 58 536 90 77"
+
+_LEAD_SIGNAL_RE = re.compile(
+    r"who\s+are\s+you|what\s+are\s+you|"
+    r"are\s+you\s+(?:an?\s+)?(?:ai|bot|robot|chatbot|assistant)|"
+    r"i\s+want\s+(?:this|a|an)\s+(?:bot|assistant|ai)|"
+    r"want\s+(?:you|this)\s+for\s+(?:my|our)\s+(?:team|business|agency|company)|"
+    r"how\s+(?:do\s+i|can\s+i|to)\s+get\s+(?:this|you|an?\s+assistant|a\s+bot)|"
+    r"can\s+you\s+work\s+for\s+(?:me|us)|"
+    r"where\s+(?:did\s+you\s+come\s+from|can\s+i\s+get\s+(?:this|you))|"
+    r"who\s+(?:made|created|built|developed)\s+you|"
+    r"i\s+need\s+(?:this|a)\s+(?:bot|assistant)|"
+    r"where\s+can\s+i\s+(?:get|find|buy)\s+(?:this|you|a\s+bot)|"
+    r"how\s+much\s+(?:does\s+)?(?:this\s+bot|you)\s+cost|"
+    r"кто\s+ты|что\s+(?:это|ты\s+такой)|хочу\s+(?:такого|тебя|этого|такой)|"
+    r"как\s+получить\s+(?:такого|этого|тебя)|мне\s+нужен\s+такой\s+(?:бот|ассистент)|"
+    r"ты\s+(?:ии|бот|chatgpt|gpt|ai)",
+    re.IGNORECASE,
+)
+
+_TONY_PITCHES = [
+    (
+        "Wallah habibi, glad you asked 😎\n\n"
+        "I'm Tony — an AI Sales Assistant built\n"
+        "specifically for real estate teams in Dubai.\n\n"
+        "Here's what I do 24/7 🔥\n"
+        "→ Broadcast inventory & sales offers to groups\n"
+        "→ Answer client questions instantly — any time\n"
+        "→ Send brochures, floor plans, videos automatically\n"
+        "→ Find cheapest/most expensive units in seconds\n"
+        "→ Never sleeps, never misses a message khalas ✅\n\n"
+        "If you want an assistant like me for YOUR team —\n"
+        "speak to the guy who built me 👇\n\n"
+        f"📞 Umar : {_BUILDER_PHONE}\n\n"
+        "Inshallah he'll set you up habibi 🤲"
+    ),
+    (
+        "Haha habibi you noticed me 👀\n\n"
+        "I'm Tony — real estate AI, built for Dubai teams 🏙️\n\n"
+        "What I bring to your team 24/7:\n"
+        "✅ Instant unit info on demand\n"
+        "✅ Sales offers & PDFs sent automatically\n"
+        "✅ Cheapest / most expensive — sorted in seconds\n"
+        "✅ Works nights, weekends, holidays — no breaks\n"
+        "✅ Brochures, videos, floor plans — all automatic\n\n"
+        "To get me for YOUR team → call the guy who made me:\n\n"
+        f"📞 Umar : {_BUILDER_PHONE}\n\n"
+        "He'll get you sorted habibi 🔥"
+    ),
+    (
+        "That's me habibi — Tony 👋\n\n"
+        "AI Sales Assistant, built exclusively for\n"
+        "Dubai real estate teams.\n\n"
+        "I work 24/7 for the team:\n"
+        "🔥 Send inventory & offers to groups\n"
+        "🔥 Find units by price, floor, type — instantly\n"
+        "🔥 Brochures, plans, videos — one request away\n"
+        "🔥 Never offline, never tired, never misses a message\n\n"
+        "Want me working for YOUR team?\n"
+        "One call away 👇\n\n"
+        f"📞 Umar : {_BUILDER_PHONE}\n\n"
+        "Yalla — tell him Tony sent you 😎🤲"
+    ),
+    (
+        "Habibi ya salam, love the question 😄\n\n"
+        "I'm Tony — your Dubai real estate AI.\n"
+        "Not ChatGPT, not some generic bot —\n"
+        "built from scratch for property sales teams 🏢\n\n"
+        "Every day I:\n"
+        "→ Push inventory updates to WhatsApp groups\n"
+        "→ Pull up any unit — price, floor, size — instantly\n"
+        "→ Send the sales offer PDF automatically\n"
+        "→ Handle client questions round the clock\n"
+        "→ Never take a day off, wallah never 😂✅\n\n"
+        "If your team needs this —\n"
+        "call the man who built me:\n\n"
+        f"📞 Umar : {_BUILDER_PHONE}\n\n"
+        "Inshallah he'll sort you out 🙏"
+    ),
+    (
+        "Bismillah, you want to know me? 😎\n\n"
+        "Tony here — AI Assistant for Dubai property teams.\n\n"
+        "My job in your team:\n"
+        "💪 Unit info on demand — any time, any unit\n"
+        "💪 Broadcast offers & PDFs to all groups automatically\n"
+        "💪 Sort by price, floor, type in seconds\n"
+        "💪 Brochures, videos, floor plans — instant\n"
+        "💪 24/7, khalas — no excuses, no breaks\n\n"
+        "Ready to have me on YOUR team?\n"
+        "Speak to my creator:\n\n"
+        f"📞 Umar : {_BUILDER_PHONE}\n\n"
+        "He'll set everything up for you habibi 🤲🔥"
+    ),
+]
+
+
+def _tony_pitch() -> str:
+    return random.choice(_TONY_PITCHES)
+
+
 # ─── Low-level Green API helpers ─────────────────────────────────────────────
 
 def _wa_url(instance_id: str, token: str, method: str) -> str:
@@ -500,7 +602,7 @@ async def handle_update(data: dict, agency: Agency):
                 group_title = sender_data.get("chatName", chat_id)
                 await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
             elif not is_group and not admin_check:
-                await _handle_stranger_message(chat_id, agency)
+                await _handle_stranger_message(chat_id, agency, text)
             else:
                 logger.info(f"WA message not handled: is_group={is_group} is_admin={admin_check} tony_mentioned={_is_tony_mentioned(text)}")
     except Exception:
@@ -557,7 +659,10 @@ _STRANGER_MSGS = [
 ]
 
 
-async def _handle_stranger_message(chat_id: str, agency: Agency):
+async def _handle_stranger_message(chat_id: str, agency: Agency, text: str = ""):
+    if text and _LEAD_SIGNAL_RE.search(text):
+        await _send_wa(chat_id, _tony_pitch())
+        return
     msg = random.choice(_STRANGER_MSGS).format(contact=agency.umar_contact or "@support")
     await _send_wa(chat_id, msg)
 
@@ -1347,6 +1452,11 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                        "Yalla habibi! 👋 Tony here —\n"
                        "wallah happy to be part of this group 😎\n"
                        "Saved permanently — I'm ready to go! 🔥")
+
+    # Lead generation — someone asking about Tony or wants him for their team
+    if _LEAD_SIGNAL_RE.search(text):
+        await _send_wa(chat_id, _tony_pitch())
+        return
 
     from sqlalchemy import or_ as _or
     projects = db.query(ToniProject).filter(
