@@ -45,7 +45,6 @@ def _migrate():
                 pass  # column already exists
 
         # Auto-assign agency_id to groups/projects with NULL (created before migration).
-        # Use bare LIMIT 1 — avoids is_active = 1 vs true PostgreSQL/SQLite difference.
         for tbl in ("whatsapp_groups", "toni_projects"):
             try:
                 conn.execute(text(f"""
@@ -56,6 +55,13 @@ def _migrate():
                 conn.commit()
             except Exception:
                 pass
+
+        # Ensure active=true for all groups where active is NULL (column added without default)
+        try:
+            conn.execute(text("UPDATE whatsapp_groups SET active = true WHERE active IS NULL"))
+            conn.commit()
+        except Exception:
+            pass
 
 
 def get_db():

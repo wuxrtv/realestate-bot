@@ -1322,8 +1322,12 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                                 text: str, db: Session, agency: Agency):
     import group_registry
 
-    # Auto-register group in BOTH groups.json (persistent) and DB
-    is_new_group = group_registry.register(chat_id, group_title, agency.id)
+    # Auto-register group — non-fatal: if file write fails, still respond
+    try:
+        is_new_group = group_registry.register(chat_id, group_title, agency.id)
+    except Exception:
+        logger.exception(f"group_registry.register failed for {chat_id}")
+        is_new_group = False
 
     existing = db.query(WhatsAppGroup).filter(
         WhatsAppGroup.chat_id == chat_id,
@@ -1332,7 +1336,9 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     if not existing:
         db.add(WhatsAppGroup(chat_id=chat_id, title=group_title, active=True, agency_id=agency.id))
         db.commit()
-    elif not existing.active:
+    elif existing.active is False:
+        # Only skip if EXPLICITLY deactivated — NULL means unknown, treat as active
+        logger.info(f"Group {chat_id} is deactivated — skipping")
         return
 
     # Welcome message when Tony is added to a group for the first time (one-time only)
