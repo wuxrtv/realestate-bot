@@ -53,6 +53,21 @@ async def lifespan(app: FastAPI):
     client_registry.load_all()
     client_registry.sync_to_db()
 
+    # Restore groups from persistent groups.json → DB (survives redeployments)
+    import group_registry
+    db = SessionLocal()
+    try:
+        restored = group_registry.sync_to_db(db)
+        if restored:
+            logger.info(f"Restored {restored} groups from groups.json")
+        else:
+            # First run: migrate existing DB groups → groups.json
+            migrated = group_registry.sync_from_db(db)
+            if migrated:
+                logger.info(f"Migrated {migrated} existing groups to groups.json")
+    finally:
+        db.close()
+
     # Set ONE global WhatsApp webhook
     public_domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("PUBLIC_URL")
     wa_instance = os.getenv("WA_INSTANCE_ID", "")

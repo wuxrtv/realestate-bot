@@ -277,6 +277,18 @@ _TEST_SCHEDULE_RE = re.compile(
     r"\b(test\s+schedule|test\s+mode|тест\s+расписание|тест\s+режим|test\s+scheduler)\b",
     re.IGNORECASE,
 )
+_SHOW_GROUPS_RE = re.compile(
+    r"\b(show\s+groups?|list\s+groups?|my\s+groups?|покажи\s+группы|список\s+групп)\b",
+    re.IGNORECASE,
+)
+_REMOVE_GROUP_RE = re.compile(
+    r"\b(remove\s+this\s+group|убери\s+эту\s+группу|exclude\s+this\s+group|delete\s+this\s+group)\b",
+    re.IGNORECASE,
+)
+_ADD_GROUP_RE = re.compile(
+    r"\b(add\s+this\s+group|добавь\s+эту\s+группу|register\s+this\s+group)\b",
+    re.IGNORECASE,
+)
 _REALESTATE_TRIGGERS = re.compile(
     r"\b(unit|юнит|юнитов|юниты|"
     r"brochur|брошюр|брошур|"  # catches brochure, brochur, брошюра, брошура
@@ -488,7 +500,15 @@ async def handle_update(data: dict, agency: Agency):
                 return
             if not is_group and admin_check:
                 mark_admin_active(agency.id)
-                await _handle_admin_message(chat_id, sender_phone, text, db, agency)
+                # "show groups" — handled here, not in AdminAgent
+                if _SHOW_GROUPS_RE.search(text):
+                    import group_registry
+                    await _send_wa(chat_id, group_registry.list_groups(agency.id))
+                else:
+                    await _handle_admin_message(chat_id, sender_phone, text, db, agency)
+            elif is_group and admin_check and (_REMOVE_GROUP_RE.search(text) or _ADD_GROUP_RE.search(text)):
+                group_title = sender_data.get("chatName", chat_id)
+                await _handle_group_admin_command(chat_id, group_title, text, db, agency)
             elif is_group and (_is_tony_mentioned(text) or _is_realestate_query(text)):
                 group_title = sender_data.get("chatName", chat_id)
                 await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
@@ -500,6 +520,44 @@ async def handle_update(data: dict, agency: Agency):
         logger.exception("WA handle_update error")
     finally:
         db.close()
+
+
+# ─── Group admin commands (remove/add group from inside group chat) ──────────
+
+async def _handle_group_admin_command(chat_id: str, group_title: str, text: str,
+                                      db: Session, agency: Agency):
+    import group_registry
+    if _REMOVE_GROUP_RE.search(text):
+        group_registry.remove(chat_id, agency.id)
+        existing = db.query(WhatsAppGroup).filter(
+            WhatsAppGroup.chat_id == chat_id,
+            WhatsAppGroup.agency_id == agency.id,
+        ).first()
+        if existing:
+            existing.active = False
+            db.commit()
+        await _send_wa(chat_id,
+                       "Khalas habibi — removed from my list ✅\n"
+                       "I won't broadcast here anymore 🔕")
+    elif _ADD_GROUP_RE.search(text):
+        is_new = group_registry.register(chat_id, group_title, agency.id)
+        existing = db.query(WhatsAppGroup).filter(
+            WhatsAppGroup.chat_id == chat_id,
+            WhatsAppGroup.agency_id == agency.id,
+        ).first()
+        if not existing:
+            db.add(WhatsAppGroup(chat_id=chat_id, title=group_title, active=True, agency_id=agency.id))
+            db.commit()
+        elif not existing.active:
+            existing.active = True
+            db.commit()
+        if is_new:
+            await _send_wa(chat_id,
+                           "Yalla habibi! 👋 Tony here —\n"
+                           "wallah happy to be part of this group 😎\n"
+                           "Saved permanently — I'm ready to go! 🔥")
+        else:
+            await _send_wa(chat_id, "Habibi already in the list wallah! ✅🔥")
 
 
 # ─── Stranger private message ────────────────────────────────────────────────
@@ -1275,7 +1333,11 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
 
 async def _handle_group_message(chat_id: str, group_title: str, sender_name: str,
                                 text: str, db: Session, agency: Agency):
-    # Auto-register group
+    import group_registry
+
+    # Auto-register group in BOTH groups.json (persistent) and DB
+    is_new_group = group_registry.register(chat_id, group_title, agency.id)
+
     existing = db.query(WhatsAppGroup).filter(
         WhatsAppGroup.chat_id == chat_id,
         WhatsAppGroup.agency_id == agency.id,
@@ -1284,6 +1346,14 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         db.add(WhatsAppGroup(chat_id=chat_id, title=group_title, active=True, agency_id=agency.id))
         db.commit()
     elif not existing.active:
+        return
+
+    # Welcome message when Tony is added to a group for the first time
+    if is_new_group and _is_tony_mentioned(text):
+        await _send_wa(chat_id,
+                       "Yalla habibi! 👋 Tony here —\n"
+                       "wallah happy to be part of this group 😎\n"
+                       "Saved permanently — I'm ready to go! 🔥")
         return
 
     projects = db.query(ToniProject).filter(
