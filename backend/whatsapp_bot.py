@@ -1384,14 +1384,14 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
 
     if intent == "unit_query":
         if unit_numbers:
-            await _respond_unit(chat_id, unit_numbers, projects, agency, project_name)
+            await _respond_unit(chat_id, unit_numbers, projects, agency, project_name, group_title)
         else:
             await _send_wa(chat_id,
                            f"Ya habibi, which unit number? 😅 Contact {contact} 🙏")
     elif intent == "property_search":
         if project_name and project_name not in keywords:
             keywords = [project_name] + keywords
-        await _respond_search(chat_id, keywords, projects, agency)
+        await _respond_search(chat_id, keywords, projects, agency, group_title)
     elif intent == "inventory_query":
         # "what units do you have?" → text summary, NOT individual PDFs
         reply = (parsed.get("reply") or "").strip()
@@ -1504,14 +1504,16 @@ async def _send_wa_file(chat_id: str,
 # ─── Unit lookup ──────────────────────────────────────────────────────────────
 
 async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency: Agency,
-                        hint_project: str = ""):
+                        hint_project: str = "", group_title: str = ""):
     import drive_service as _drive
     svc = _drive.get_service()
     contact = agency.umar_contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
+    admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
 
     for unit in unit_numbers[:3]:
         found = False
+        pdf_sent = False
 
         # 1. Search DB inventory
         for proj in projects:
@@ -1519,20 +1521,22 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
             if unit in idx:
                 found = True
                 card = format_unit_card(unit, idx[unit], proj.project_name)
-
-                # Try to send unit PDF from Drive if available
+                file_bytes, file_name = (None, "")
                 if svc:
-                    drive_result = _drive.find_unit_file(svc, proj.project_name, unit, root_id)
-                    if drive_result:
-                        file_id, file_name = drive_result
-                        file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                        if file_bytes:
-                            await _send_wa(chat_id,
-                                           f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
-                            await _send_wa_file(chat_id, file_bytes, file_name, card)
-                            break
-
-                await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                    file_bytes, file_name = await _find_offer_pdf(svc, unit, proj.project_name, root_id)
+                if file_bytes:
+                    await _send_wa(chat_id,
+                                   f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
+                    await _send_wa_file(chat_id, file_bytes, file_name, card)
+                    pdf_sent = True
+                else:
+                    await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                    if admin_numbers and group_title:
+                        await _send_wa(
+                            f"{admin_numbers[0]}@c.us",
+                            f"Habibi 🙏\nSomeone in *{group_title}* asked for *Unit {unit}* ({proj.project_name})\n"
+                            f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
+                        )
                 break
 
         # 2. Fallback: read inventory Excel from Drive
@@ -1545,17 +1549,29 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 if unit in drive_idx:
                     found = True
                     card = format_unit_card(unit, drive_idx[unit], p_name)
-                    await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                    file_bytes, file_name = await _find_offer_pdf(svc, unit, p_name, root_id)
+                    if file_bytes:
+                        await _send_wa(chat_id,
+                                       f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
+                        await _send_wa_file(chat_id, file_bytes, file_name, card)
+                        pdf_sent = True
+                    else:
+                        await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                        if admin_numbers and group_title:
+                            await _send_wa(
+                                f"{admin_numbers[0]}@c.us",
+                                f"Habibi 🙏\nSomeone in *{group_title}* asked for *Unit {unit}* ({p_name})\n"
+                                f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
+                            )
                     break
 
         # 3. Fallback: scan sales offer PDFs (SH_A311_40.60_1B.pdf)
         if not found and svc:
             try:
-                offers = _drive.scan_sales_offers(svc, root_id)
-                # Try exact match and "BUILDING+UNIT" match (e.g. "A311" for unit "311")
+                offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
                 offer_data = offers.get(unit)
                 if not offer_data:
-                    for key, val in offers.items():
+                    for val in offers.values():
                         if val.get("unit_number") == unit:
                             offer_data = val
                             break
@@ -1564,14 +1580,14 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                     proj_name = enriched.get("project_name", "Project")
                     card = format_unit_card(unit, enriched, proj_name)
                     found = True
-                    # Also try to send the PDF file
-                    file_id = enriched.get("file_id", "")
-                    if file_id:
-                        file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+                    fid = enriched.get("file_id", "")
+                    if fid:
+                        file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
                         if file_bytes:
                             await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
                             await _send_wa_file(chat_id, file_bytes, enriched.get("filename", "offer.pdf"), "")
-                    else:
+                            pdf_sent = True
+                    if not pdf_sent:
                         await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
             except Exception:
                 logger.exception("_respond_unit: scan_sales_offers failed")
@@ -1639,7 +1655,47 @@ def _get_sort_value(unit_data: dict, field: str) -> float:
     return 0.0
 
 
-async def _respond_search(chat_id: str, keywords: list, projects: list, agency: Agency):
+async def _find_offer_pdf(svc, unit_num: str, proj_name: str, root_id: str) -> tuple:
+    """Two-strategy Drive search for a unit's sales offer PDF.
+    Strategy 1: find_unit_file  — filename contains unit_number
+    Strategy 2: scan_sales_offers — SH_A311_40.60_1B.pdf pattern
+    Returns (file_bytes, file_name) or (None, '').
+    """
+    import drive_service as _drive
+
+    # Strategy 1 — direct filename match
+    drive_result = _drive.find_unit_file(svc, proj_name, unit_num, root_id)
+    if drive_result:
+        file_id, file_name = drive_result
+        file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+        if file_bytes:
+            return file_bytes, file_name
+
+    # Strategy 2 — sales offers scan (SH_A311_40.60_1B.pdf)
+    try:
+        offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
+        unit_norm   = re.sub(r"[-\s]", "", unit_num.upper())   # "A-315" → "A315"
+        unit_digits = re.sub(r"[^\d]",  "", unit_num)          # "A-315" → "315"
+        offer_data  = offers.get(unit_norm)
+        if not offer_data:
+            for val in offers.values():
+                if val.get("unit_number") == unit_digits:
+                    offer_data = val
+                    break
+        if offer_data:
+            fid = offer_data.get("file_id", "")
+            if fid:
+                file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
+                if file_bytes:
+                    return file_bytes, offer_data.get("filename", "offer.pdf")
+    except Exception:
+        logger.exception(f"_find_offer_pdf: scan_sales_offers failed for {unit_num}")
+
+    return None, ""
+
+
+async def _respond_search(chat_id: str, keywords: list, projects: list, agency: Agency,
+                          group_title: str = ""):
     contact = agency.umar_contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
 
@@ -1694,24 +1750,30 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     else:
         limit = 3
 
-    # Send results — try Drive PDF for first/best match
     import drive_service as _drive
     svc = _drive.get_service()
+    admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
 
     for i, (unit_num, data, proj_name) in enumerate(matched[:limit]):
         card = format_unit_card(unit_num, data, proj_name)
-        sent_file = False
-        if i == 0 and svc:
-            drive_result = _drive.find_unit_file(svc, proj_name, unit_num, root_id)
-            if drive_result:
-                file_id, file_name = drive_result
-                file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
-                if file_bytes:
-                    await _send_wa(chat_id, "Wallah here you go habibi! 👀")
-                    await _send_wa_file(chat_id, file_bytes, file_name, card)
-                    sent_file = True
-        if not sent_file:
+        file_bytes, file_name = None, ""
+        if svc:
+            file_bytes, file_name = await _find_offer_pdf(svc, unit_num, proj_name, root_id)
+
+        if file_bytes:
+            await _send_wa(chat_id, "Wallah here you go habibi! 👀")
+            await _send_wa_file(chat_id, file_bytes, file_name, card)
+        else:
             await _send_wa(chat_id, card)
+            # Notify admin when best result has no PDF in Drive
+            if i == 0 and admin_numbers and group_title:
+                await _send_wa(
+                    f"{admin_numbers[0]}@c.us",
+                    f"Habibi 🙏\n"
+                    f"Someone in *{group_title}* asked for *Unit {unit_num}* ({proj_name})\n"
+                    f"Sales offer PDF not found in Drive 📂\n"
+                    f"Can you upload it? I'll send it right away 🔥"
+                )
 
 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
