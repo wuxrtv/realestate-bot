@@ -1520,17 +1520,17 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
             idx: dict = proj.unit_index or {}
             if unit in idx:
                 found = True
-                card = format_unit_card(unit, idx[unit], proj.project_name)
+                card = _format_group_card(unit, idx[unit], proj.project_name)
                 file_bytes, file_name = (None, "")
                 if svc:
                     file_bytes, file_name = await _find_offer_pdf(svc, unit, proj.project_name, root_id)
                 if file_bytes:
-                    await _send_wa(chat_id,
-                                   f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
-                    await _send_wa_file(chat_id, file_bytes, file_name, card)
+                    # PDF first → formatted text second
+                    await _send_wa_file(chat_id, file_bytes, file_name, "")
+                    await _send_wa(chat_id, card)
                     pdf_sent = True
                 else:
-                    await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                    await _send_wa(chat_id, card)
                     if admin_numbers and group_title:
                         await _send_wa(
                             f"{admin_numbers[0]}@c.us",
@@ -1548,15 +1548,14 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 drive_idx = _drive.get_project_inventory(svc, p_name, root_id)
                 if unit in drive_idx:
                     found = True
-                    card = format_unit_card(unit, drive_idx[unit], p_name)
+                    card = _format_group_card(unit, drive_idx[unit], p_name)
                     file_bytes, file_name = await _find_offer_pdf(svc, unit, p_name, root_id)
                     if file_bytes:
-                        await _send_wa(chat_id,
-                                       f"Wallah good choice habibi! 👀\nHere's everything about Unit {unit} 👇")
-                        await _send_wa_file(chat_id, file_bytes, file_name, card)
+                        await _send_wa_file(chat_id, file_bytes, file_name, "")
+                        await _send_wa(chat_id, card)
                         pdf_sent = True
                     else:
-                        await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                        await _send_wa(chat_id, card)
                         if admin_numbers and group_title:
                             await _send_wa(
                                 f"{admin_numbers[0]}@c.us",
@@ -1578,17 +1577,17 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 if offer_data:
                     enriched = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, offer_data)
                     proj_name = enriched.get("project_name", "Project")
-                    card = format_unit_card(unit, enriched, proj_name)
+                    card = _format_group_card(unit, enriched, proj_name)
                     found = True
                     fid = enriched.get("file_id", "")
                     if fid:
                         file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
                         if file_bytes:
-                            await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
-                            await _send_wa_file(chat_id, file_bytes, enriched.get("filename", "offer.pdf"), "")
+                            await _send_wa_file(chat_id, file_bytes, fid, "")
+                            await _send_wa(chat_id, card)
                             pdf_sent = True
                     if not pdf_sent:
-                        await _send_wa(chat_id, f"Wallah good choice habibi! 👀\n{card}")
+                        await _send_wa(chat_id, card)
             except Exception:
                 logger.exception("_respond_unit: scan_sales_offers failed")
 
@@ -1607,7 +1606,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                            f"Sold or reserved wallah\n\nBut check these 👇" if alts else
                            f"Ya habibi — Unit {unit} not found 😔 Contact {contact} 🙏")
             for u_num, u_data, p_name in alts[:2]:
-                await _send_wa(chat_id, format_unit_card(u_num, u_data, p_name))
+                await _send_wa(chat_id, _format_group_card(u_num, u_data, p_name))
 
 
 # ─── Property search ──────────────────────────────────────────────────────────
@@ -1655,6 +1654,87 @@ def _get_sort_value(unit_data: dict, field: str) -> float:
     return 0.0
 
 
+# ─── Unit type detection & strict filtering ───────────────────────────────────
+
+_UNIT_TYPE_COL_RE = re.compile(r"\b(type|bedroom|br|unit.?type|тип|комн)\b", re.I)
+
+_TYPE_ALIASES: dict[str, re.Pattern] = {
+    "studio":     re.compile(r"\b(studio|студия|0\s*br|0\s*bed)\b", re.I),
+    "1br":        re.compile(r"\b(1\s*br|1\s*bed|one\s*bed|однокомн|1\s*bedroom)\b", re.I),
+    "2br":        re.compile(r"\b(2\s*br|2\s*bed|two\s*bed|двухкомн|2\s*bedroom)\b", re.I),
+    "3br":        re.compile(r"\b(3\s*br|3\s*bed|three\s*bed|трёхкомн|3\s*bedroom)\b", re.I),
+    "4br":        re.compile(r"\b(4\s*br|4\s*bed|four\s*bed|4\s*bedroom)\b", re.I),
+    "penthouse":  re.compile(r"\b(penthouse|ph)\b", re.I),
+    "villa":      re.compile(r"\bvilla\b", re.I),
+    "townhouse":  re.compile(r"\btownhouse\b", re.I),
+    "duplex":     re.compile(r"\bduplex\b", re.I),
+}
+
+
+def _detect_requested_type(keywords: list) -> str | None:
+    kw_str = " ".join(keywords)
+    for type_name, pat in _TYPE_ALIASES.items():
+        if pat.search(kw_str):
+            return type_name
+    return None
+
+
+def _unit_type_matches(data: dict, requested_type: str) -> bool:
+    pat = _TYPE_ALIASES.get(requested_type)
+    if not pat:
+        return True
+    for k, v in data.items():
+        if _UNIT_TYPE_COL_RE.search(str(k)):
+            if pat.search(str(v)):
+                return True
+    return False
+
+
+# ─── Clean group card format ──────────────────────────────────────────────────
+
+def _format_group_card(unit_num: str, data: dict, proj_name: str) -> str:
+    """Structured, clean card for WhatsApp group output. No raw data dump."""
+    def _pick(col_re: re.Pattern) -> str:
+        for k, v in data.items():
+            if col_re.search(str(k)):
+                val = str(v).strip()
+                if val and val not in ("None", "nan", ""):
+                    return val
+        return ""
+
+    utype   = _pick(re.compile(r"\b(type|unit.?type|bedroom|br|тип)\b", re.I))
+    floor   = _pick(re.compile(r"\b(floor|этаж|level)\b", re.I))
+    view    = _pick(re.compile(r"\b(view|вид|orientation|facing)\b", re.I))
+    size    = _pick(re.compile(r"\b(area|size|sqft|sq\.?ft|sqm|bua|gfa|площадь)\b", re.I))
+    price   = _pick(re.compile(r"\b(price|cost|total|amount|aed|стоимость|цена)\b", re.I))
+    payment = _pick(re.compile(r"\b(payment.?plan|payment|plan|pp|schedule)\b", re.I))
+
+    # Format price with commas
+    if price:
+        try:
+            price = f"AED {float(re.sub(r'[^\d.]', '', price.replace(',', ''))):,.0f}"
+        except (ValueError, TypeError):
+            pass
+
+    header = f"🏙️ *{proj_name}*"
+    if utype:
+        header += f" — {utype}"
+    loc = f"📍 Unit {unit_num}"
+    if floor:
+        loc += f" | Floor {floor}"
+
+    lines = [header, loc]
+    if view:
+        lines.append(f"👁️ View: {view}")
+    if size:
+        lines.append(f"📐 Size: {size} sqft")
+    if price:
+        lines.append(f"💰 {price}")
+    if payment:
+        lines.append(f"📋 Payment: {payment}")
+    return "\n".join(lines)
+
+
 async def _find_offer_pdf(svc, unit_num: str, proj_name: str, root_id: str) -> tuple:
     """Two-strategy Drive search for a unit's sales offer PDF.
     Strategy 1: find_unit_file  — filename contains unit_number
@@ -1699,8 +1779,23 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     contact = agency.umar_contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
 
-    # Separate sort instruction from filter keywords
     filter_kws, sort_field, sort_reverse = _parse_sort_intent(keywords)
+    requested_type = _detect_requested_type(filter_kws)
+
+    # Keywords that are not type words (used for secondary filtering)
+    _all_type_pats = [p for p in _TYPE_ALIASES.values()]
+    non_type_kws = [k for k in filter_kws
+                    if not any(p.search(k) for p in _all_type_pats)]
+
+    def _matches(unit_num: str, data: dict, proj_name: str, check_proj: bool) -> bool:
+        # STRICT: if type requested → unit must match it. Never mix types.
+        if requested_type and not _unit_type_matches(data, requested_type):
+            return False
+        if check_proj:
+            searchable = " ".join(str(v) for v in data.values()).lower()
+            return not non_type_kws or any(k.lower() in searchable for k in non_type_kws)
+        searchable = " ".join(str(v) for v in data.values()).lower()
+        return not non_type_kws or any(k.lower() in searchable for k in non_type_kws)
 
     matched: list = []
     for proj in projects:
@@ -1708,42 +1803,41 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
         if not idx:
             continue
         proj_hit = any(kw.lower() in proj.project_name.lower() for kw in filter_kws)
-        other_kws = [kw for kw in filter_kws if kw.lower() not in proj.project_name.lower()]
         for unit_num, data in idx.items():
-            if proj_hit:
-                if other_kws:
-                    searchable = " ".join(str(v) for v in data.values()).lower()
-                    if not any(kw.lower() in searchable for kw in other_kws):
-                        continue
+            if _matches(unit_num, data, proj.project_name, proj_hit):
                 matched.append((unit_num, data, proj.project_name))
-            else:
-                searchable = " ".join(str(v) for v in data.values()).lower()
-                if any(kw.lower() in searchable for kw in filter_kws):
-                    matched.append((unit_num, data, proj.project_name))
         if len(matched) >= 30:
             break
 
-    # Relaxed fallback 1 — if nothing matched but project is identifiable, list from that project
+    # Fallback 1 — project identified, still respect type filter
     if not matched:
         for proj in projects:
             idx: dict = proj.unit_index or {}
-            if idx and any(kw.lower() in proj.project_name.lower() for kw in filter_kws):
-                matched = [(u, d, proj.project_name) for u, d in list(idx.items())[:15]]
-                break
+            if not idx:
+                continue
+            if any(kw.lower() in proj.project_name.lower() for kw in filter_kws):
+                for u, d in idx.items():
+                    if not requested_type or _unit_type_matches(d, requested_type):
+                        matched.append((u, d, proj.project_name))
+                if matched:
+                    break
 
-    # Relaxed fallback 2 — last resort: use first project that has units
+    # Fallback 2 — any project, still respect type filter
     if not matched:
         for proj in projects:
             idx: dict = proj.unit_index or {}
-            if idx:
-                matched = [(u, d, proj.project_name) for u, d in list(idx.items())[:5]]
+            for u, d in idx.items():
+                if not requested_type or _unit_type_matches(d, requested_type):
+                    matched.append((u, d, proj.project_name))
+            if matched:
                 break
 
     if not matched:
-        await _send_wa(chat_id, f"No units in database yet habibi 😅 Contact {contact} 🙏")
+        type_hint = f" {requested_type.upper()}" if requested_type else ""
+        await _send_wa(chat_id,
+                       f"Habibi no{type_hint} units found 😅 Contact {contact} 🙏")
         return
 
-    # Apply sort if requested → return 1 best result; otherwise top 3
     if sort_field:
         matched.sort(key=lambda t: _get_sort_value(t[1], sort_field), reverse=sort_reverse)
         limit = 1
@@ -1755,17 +1849,17 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
 
     for i, (unit_num, data, proj_name) in enumerate(matched[:limit]):
-        card = format_unit_card(unit_num, data, proj_name)
+        card = _format_group_card(unit_num, data, proj_name)
         file_bytes, file_name = None, ""
         if svc:
             file_bytes, file_name = await _find_offer_pdf(svc, unit_num, proj_name, root_id)
 
         if file_bytes:
-            await _send_wa(chat_id, "Wallah here you go habibi! 👀")
-            await _send_wa_file(chat_id, file_bytes, file_name, card)
+            # PDF first → formatted text second
+            await _send_wa_file(chat_id, file_bytes, file_name, "")
+            await _send_wa(chat_id, card)
         else:
             await _send_wa(chat_id, card)
-            # Notify admin when best result has no PDF in Drive
             if i == 0 and admin_numbers and group_title:
                 await _send_wa(
                     f"{admin_numbers[0]}@c.us",
