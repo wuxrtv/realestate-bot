@@ -17,7 +17,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+_DATA_DIR = os.getenv("DATA_DIR") or os.path.join(os.path.dirname(__file__), "data")
 _GROUPS_FILE = os.path.join(_DATA_DIR, "groups.json")
 
 _cache: dict | None = None
