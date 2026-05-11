@@ -44,27 +44,18 @@ def _migrate():
             except Exception:
                 pass  # column already exists
 
-        # Auto-assign agency_id to groups that have NULL (e.g. created before migration)
-        try:
-            conn.execute(text("""
-                UPDATE whatsapp_groups
-                SET agency_id = (SELECT id FROM agencies WHERE is_active = 1 LIMIT 1)
-                WHERE agency_id IS NULL
-            """))
-            conn.commit()
-        except Exception:
-            pass
-
-        # Same fix for projects — old rows created before agency_id column was added
-        try:
-            conn.execute(text("""
-                UPDATE toni_projects
-                SET agency_id = (SELECT id FROM agencies LIMIT 1)
-                WHERE agency_id IS NULL
-            """))
-            conn.commit()
-        except Exception:
-            pass
+        # Auto-assign agency_id to groups/projects with NULL (created before migration).
+        # Use bare LIMIT 1 — avoids is_active = 1 vs true PostgreSQL/SQLite difference.
+        for tbl in ("whatsapp_groups", "toni_projects"):
+            try:
+                conn.execute(text(f"""
+                    UPDATE {tbl}
+                    SET agency_id = (SELECT id FROM agencies ORDER BY id LIMIT 1)
+                    WHERE agency_id IS NULL
+                """))
+                conn.commit()
+            except Exception:
+                pass
 
 
 def get_db():

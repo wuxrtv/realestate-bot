@@ -183,14 +183,15 @@ def _resolve_agency(data: dict, db) -> Agency | None:
         if group and group.agency_id:
             return db.query(Agency).filter(Agency.id == group.agency_id, Agency.is_active == True).first()
 
-    # Fallback: if only one active agency exists, use it for any unrecognised sender/group.
-    # Covers: unregistered groups, members whose phone isn't in client config.
-    active_agencies = db.query(Agency).filter(Agency.is_active == True).all()
-    if len(active_agencies) == 1:
-        logger.info(f"_resolve_agency: single-agency fallback for sender={sender_phone} chat={chat_id}")
-        return active_agencies[0]
+    # Fallback: use first active agency ordered by id.
+    # Covers unregistered groups and members whose phone isn't in client config.
+    # Safe when all agencies share the same WhatsApp instance (single-instance setup).
+    first = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.id).first()
+    if first:
+        logger.info(f"_resolve_agency: fallback agency={first.slug} for sender={sender_phone} chat={chat_id}")
+        return first
 
-    logger.warning(f"_resolve_agency: no client found for sender={sender_phone} chat={chat_id} — ignoring")
+    logger.warning(f"_resolve_agency: no active agency found — ignoring sender={sender_phone} chat={chat_id}")
     return None
 
 

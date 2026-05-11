@@ -155,11 +155,20 @@ def sync_to_db(db) -> int:
 
 
 def sync_from_db(db) -> int:
-    """One-time migration: pull existing WhatsAppGroup rows → groups.json."""
-    from models import WhatsAppGroup
+    """One-time migration: pull existing WhatsAppGroup rows → groups.json.
+    Groups with NULL agency_id get assigned to the first active agency.
+    """
+    from models import Agency, WhatsAppGroup
     groups = db.query(WhatsAppGroup).filter(WhatsAppGroup.active == True).all()
+    fallback_agency_id: int | None = None
     added = 0
     for g in groups:
-        if g.agency_id and register(g.chat_id, g.title or g.chat_id, g.agency_id):
+        agency_id = g.agency_id
+        if not agency_id:
+            if fallback_agency_id is None:
+                first = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.id).first()
+                fallback_agency_id = first.id if first else 0
+            agency_id = fallback_agency_id
+        if agency_id and register(g.chat_id, g.title or g.chat_id, agency_id):
             added += 1
     return added
