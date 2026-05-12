@@ -358,10 +358,65 @@ def find_all_media(svc, project_name: str, limit: int = 15, agency_root_id: str 
 
 _location_text_cache: dict[str, tuple[str, float]] = {}  # project_name → (text, timestamp)
 
+_GOOGLE_DOC_MIME  = "application/vnd.google-apps.document"
+_GOOGLE_SLIDE_MIME = "application/vnd.google-apps.presentation"
+
+
+def _is_location_file(name: str, mime: str) -> bool:
+    """Match any file that looks like a location/info text document."""
+    nl = name.lower()
+    return (
+        "location" in nl
+        or "локац" in nl
+        or "text_location" in nl
+        or nl == "location.txt"
+    ) and (
+        mime in (_GOOGLE_DOC_MIME, _GOOGLE_SLIDE_MIME)
+        or nl.endswith(".txt")
+        or nl.endswith(".doc")
+        or nl.endswith(".docx")
+    )
+
+
+def _collect_all_files_flat(svc, folder_id: str, depth: int = 3) -> list:
+    """Recursively list ALL files up to `depth` levels deep (no filtering)."""
+    if depth <= 0:
+        return []
+    items = _list_folder(svc, folder_id)
+    result = []
+    for item in items:
+        if item["mimeType"] == "application/vnd.google-apps.folder":
+            result.extend(_collect_all_files_flat(svc, item["id"], depth - 1))
+        else:
+            result.append(item)
+    return result
+
+
+def _download_as_text(svc, file_id: str, mime: str) -> str:
+    """Download a Drive file as plain text. Exports Google Docs as text/plain."""
+    try:
+        from googleapiclient.http import MediaIoBaseDownload
+        buf = io.BytesIO()
+        if mime in (_GOOGLE_DOC_MIME, _GOOGLE_SLIDE_MIME):
+            req = svc.files().export_media(fileId=file_id, mimeType="text/plain")
+        else:
+            req = svc.files().get_media(fileId=file_id)
+        dl = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue().decode("utf-8", errors="replace").strip()
+    except Exception:
+        logger.exception(f"Drive: _download_as_text failed for {file_id}")
+        return ""
+
 
 def get_location_text(svc, project_name: str, root_id: str = "") -> str:
-    """Read text_location.txt from Drive project folder. Returns '' if not found.
-    Cache: 24 hours (text is stable, avoids redundant Drive API calls).
+    """Find and read location/info text from Drive project folder.
+
+    Searches recursively — matches any file with 'location' or 'локац' in name.
+    Accepts .txt files and Google Docs (exported as plain text).
+    Cache: 24 hours.
     """
     now = time.time()
     cached = _location_text_cache.get(project_name)
@@ -371,20 +426,24 @@ def get_location_text(svc, project_name: str, root_id: str = "") -> str:
     try:
         proj_id = _find_project_folder(svc, project_name, root_id)
         if not proj_id:
+            _location_text_cache[project_name] = ("", now)
             return ""
-        items = _list_folder(svc, proj_id)
-        for item in items:
-            if item["name"].lower() == "text_location.txt":
-                raw = download_file(svc, item["id"])
-                text = raw.decode("utf-8", errors="replace").strip() if raw else ""
+
+        all_files = _collect_all_files_flat(svc, proj_id, depth=3)
+        for item in all_files:
+            if _is_location_file(item["name"], item["mimeType"]):
+                text = _download_as_text(svc, item["id"], item["mimeType"])
                 _location_text_cache[project_name] = (text, now)
-                logger.info(f"Drive: text_location.txt loaded for '{project_name}' ({len(text)} chars)")
+                logger.info(
+                    f"Drive: location text loaded — '{item['name']}' "
+                    f"for '{project_name}' ({len(text)} chars)"
+                )
                 return text
     except Exception:
         logger.exception(f"Drive: get_location_text failed for '{project_name}'")
 
     _location_text_cache[project_name] = ("", now)
-    logger.info(f"Drive: text_location.txt not found for '{project_name}'")
+    logger.info(f"Drive: no location file found for '{project_name}'")
     return ""
 
 
