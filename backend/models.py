@@ -15,7 +15,7 @@ class Agency(Base):
     id           = Column(Integer, primary_key=True, index=True)
     name         = Column(String, nullable=False)
     slug         = Column(String, unique=True, index=True)
-    umar_contact = Column(String, default="@support")
+    contact      = Column("umar_contact", String, default="@support")
     wa_admin_numbers = Column(_json_type, default=list)  # admin phone numbers
     drive_root_id    = Column(String, default="")        # Google Drive root folder ID
     bot_character    = Column(Text, default="")          # custom Tony personality

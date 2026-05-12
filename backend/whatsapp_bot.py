@@ -667,7 +667,7 @@ async def _handle_stranger_message(chat_id: str, agency: Agency, text: str = "")
     if text and _LEAD_SIGNAL_RE.search(text):
         await _send_wa(chat_id, _tony_pitch())
         return
-    msg = random.choice(_STRANGER_MSGS).format(contact=agency.umar_contact or "@support")
+    msg = random.choice(_STRANGER_MSGS).format(contact=agency.contact or "@support")
     await _send_wa(chat_id, msg)
 
 
@@ -1467,7 +1467,7 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         ToniProject.is_active == True,
         _or(ToniProject.agency_id == agency.id, ToniProject.agency_id.is_(None)),
     ).all()
-    contact = agency.umar_contact or "@support"
+    contact = agency.contact or "@support"
     if projects:
         proj_lines = "\n".join(f"  • {p.project_name} — {p.unit_count} units" for p in projects)
         system = _SYSTEM_BASE + f"\n\nAdmin contact: {contact}\nAvailable projects:\n{proj_lines}"
@@ -1628,7 +1628,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                         keywords: list | None = None):
     import drive_service as _drive
     svc = _drive.get_service()
-    contact = agency.umar_contact or "@support"
+    contact = agency.contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
     admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
 
@@ -1936,7 +1936,7 @@ async def _find_offer_pdf(svc, unit_num: str, proj_name: str, root_id: str) -> t
 
 async def _respond_search(chat_id: str, keywords: list, projects: list, agency: Agency,
                           group_title: str = ""):
-    contact = agency.umar_contact or "@support"
+    contact = agency.contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
     admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
 

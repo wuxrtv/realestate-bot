@@ -7,5 +7,5 @@ class ClientConfig:
     name: str                       # название агентства
     admin_phones: list              # номера adminов БЕЗ +, например ["971585369077"]
     drive_root_id: str = ""         # ID папки Google Drive
-    umar_contact: str = "@support"  # контакт когда юнит не найден
+    contact: str = "@support"       # контакт когда юнит не найден
     bot_character: str = ""         # характер Tony (пустой = стандартный)

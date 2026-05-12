@@ -67,14 +67,14 @@ def sync_to_db():
                 agency.name = cfg.name
                 agency.wa_admin_numbers = cfg.admin_phones
                 agency.drive_root_id = cfg.drive_root_id
-                agency.umar_contact = cfg.umar_contact
+                agency.contact = cfg.contact
                 agency.bot_character = cfg.bot_character
                 agency.is_active = True
             else:
                 db.add(Agency(
                     name=cfg.name,
                     slug=cfg.slug,
-                    umar_contact=cfg.umar_contact,
+                    contact=cfg.contact,
                     wa_admin_numbers=cfg.admin_phones,
                     drive_root_id=cfg.drive_root_id,
                     bot_character=cfg.bot_character,
