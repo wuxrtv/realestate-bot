@@ -206,13 +206,14 @@ def _resolve_agency(data: dict, db) -> Agency | None:
             if cfg:
                 return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
 
-    # Fallback: use first active agency (single-instance setup with one agency).
-    first = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.id).first()
-    if first:
-        logger.info(f"_resolve_agency: fallback agency={first.slug} for sender={sender_phone} chat={chat_id}")
-        return first
+    # Fallback: only safe when exactly ONE agency is active (single-instance setup).
+    # With multiple agencies the fallback silently misroutes strangers to the wrong admin.
+    active_agencies = db.query(Agency).filter(Agency.is_active == True).all()
+    if len(active_agencies) == 1:
+        logger.info(f"_resolve_agency: single-agency fallback={active_agencies[0].slug} sender={sender_phone} chat={chat_id}")
+        return active_agencies[0]
 
-    logger.warning(f"_resolve_agency: no active agency found — ignoring sender={sender_phone} chat={chat_id}")
+    logger.warning(f"_resolve_agency: unrecognised sender={sender_phone} chat={chat_id} — ignoring (multi-agency setup)")
     return None
 
 
