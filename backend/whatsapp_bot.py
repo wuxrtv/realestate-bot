@@ -833,9 +833,10 @@ async def _send_offer_for_agency(
     if pdf_bytes is None:
         logger.warning(f"Daily offer [{slot_label}]: no downloadable PDF found in {len(candidates[:5])} candidates")
         if notify_admin:
-            for phone in (agency.wa_admin_numbers or []):
+            _primary = (agency.wa_admin_numbers or [None])[0]
+            if _primary:
                 await _send_wa(
-                    f"{phone}@c.us",
+                    f"{_primary}@c.us",
                     f"Habibi no PDF found for {slot_label} 😅\n"
                     "Check Drive — make sure sales offer PDFs are uploaded 🙏"
                 )
@@ -877,8 +878,9 @@ async def _send_offer_for_agency(
             f"Sent to {sent_count} group(s) ✅\n"
             f"PDF + caption forwarded to all khalas 💪"
         )
-        for phone in (agency.wa_admin_numbers or []):
-            await _send_wa(f"{phone}@c.us", admin_msg)
+        _primary = (agency.wa_admin_numbers or [None])[0]
+        if _primary:
+            await _send_wa(f"{_primary}@c.us", admin_msg)
 
     logger.info(f"Daily offer [{slot_label}]: unit={unit_key} sent to {sent_count} groups")
     return {"unit": unit_key, "caption": caption, "sent": sent_count}
@@ -1006,8 +1008,9 @@ async def _friday_broadcast_for_agency(agency: Agency, db: Session):
 
     if groups_sent:
         msg = f"✅ Friday package sent to {groups_sent} groups habibi! Khalas 🤲"
-        for phone in (getattr(agency, "wa_admin_numbers", []) or []):
-            await _send_wa(f"{phone}@c.us", msg)
+        _nums = getattr(agency, "wa_admin_numbers", []) or []
+        if _nums:
+            await _send_wa(f"{_nums[0]}@c.us", msg)
         logger.info(f"Friday broadcast: agency={agency.slug} groups={groups_sent}")
 
 
@@ -2368,12 +2371,24 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
 
 def _query_groups(db: Session, agency: Agency):
-    """Return active groups for this agency. Falls back to NULL-agency groups (migration gap)."""
+    """Return active groups for this agency, deduplicated by chat_id.
+
+    A group can be registered under multiple agencies when two admins from
+    different agencies are in the same group. Dedup ensures broadcast never
+    hits the same chat_id twice in a single run.
+    """
     from sqlalchemy import or_
-    return db.query(WhatsAppGroup).filter(
+    rows = db.query(WhatsAppGroup).filter(
         WhatsAppGroup.active == True,
         or_(WhatsAppGroup.agency_id == agency.id, WhatsAppGroup.agency_id.is_(None)),
     ).all()
+    seen: set = set()
+    unique = []
+    for g in rows:
+        if g.chat_id not in seen:
+            seen.add(g.chat_id)
+            unique.append(g)
+    return unique
 
 
 async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> int:
