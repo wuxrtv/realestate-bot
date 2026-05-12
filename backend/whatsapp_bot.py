@@ -265,7 +265,8 @@ _TEST_SCHEDULE_RE = re.compile(
     re.IGNORECASE,
 )
 _SHOW_GROUPS_RE = re.compile(
-    r"\b(show\s+groups?|list\s+groups?|my\s+groups?|покажи\s+группы|список\s+групп)\b",
+    r"\b(show\s+groups?|list\s+groups?|my\s+groups?|check\s+groups?|test\s+groups?|"
+    r"покажи\s+группы|список\s+групп|проверь\s+группы|какие\s+группы)\b",
     re.IGNORECASE,
 )
 _REMOVE_GROUP_RE = re.compile(
