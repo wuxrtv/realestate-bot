@@ -2,7 +2,7 @@ from ._base import ClientConfig
 
 config = ClientConfig(
     slug="Hamidulloh",
-    name="hamid",
+    name="Khamid",
     admin_phones=[
         "971585816776",
     ],
