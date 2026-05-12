@@ -308,7 +308,17 @@ _REALESTATE_TRIGGERS = re.compile(
     r"apartment|апартамент|availability|pdf|"
     r"discount|скидк|chegirm|DLD|payment\s*plan|рассрочк|"
     r"special\s*offer|best\s*price|negotiat|50/50|60/40|40/60|"
-    r"дешев|дорог|дорош|самый|cheapest|expensive|floor)\b",
+    r"дешев|дорог|дорош|самый|cheapest|expensive|floor|"
+    r"location|локация|адрес|address|where\s+is|где\s+нах|"
+    r"facilit|amenit|инфраструктур|"
+    r"invest|инвест|roi|yield|доход|"
+    r"handover|completion|сдача|сдает|готов|"
+    r"buy|купить|purchase|приобрест|"
+    r"project|проект|"
+    r"1\s*br|2\s*br|3\s*br|"
+    r"how\s+much|сколько\s+стоит|"
+    r"tell\s+me|расскажи|send\s+me|пришли|скинь|отправь|покажи|"
+    r"materials|материал|documents|документ)\b",
     re.IGNORECASE,
 )
 _AUDIO_TYPES = frozenset({"audioMessage", "pttMessage"})
