@@ -717,16 +717,20 @@ async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: 
         view      = (unit_data.get("View") or unit_data.get("view", "")).strip()
         payment   = unit_data.get("payment_plan", "")
         location  = (unit_data.get("location") or unit_data.get("district") or "").strip()
-        size      = (unit_data.get("area") or unit_data.get("size") or
-                     unit_data.get("sqft") or "").strip()
+        size      = (unit_data.get("size") or unit_data.get("Size") or
+                     unit_data.get("sqft") or unit_data.get("Net Area") or
+                     unit_data.get("area") or "").strip()
 
         admin_name  = getattr(agency, "name", "") if agency else ""
         admin_nums  = getattr(agency, "wa_admin_numbers", []) if agency else []
         admin_phone = f"+{str(admin_nums[0]).lstrip('+')}" if admin_nums else ""
 
         loc_str  = f" | {location}" if location else ""
-        size_str = f"{size} sq.ft" if size else "see brochure"
         pay_str  = payment or "Flexible — ask for details"
+
+        size_line    = f"📐 Size: {size} sq.ft\n" if size else ""
+        floor_line   = f"🏢 Floor: {floor_val}\n" if floor_val else ""
+        view_line    = f"👁️ View: {view}\n" if view else ""
 
         prompt = (
             "Write a WhatsApp sales caption. Follow this EXACT structure — plain text, NO asterisks, NO markdown:\n\n"
@@ -735,9 +739,9 @@ async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: 
             "[One unique punchy line about why this unit is special — view/floor/type/value]\n"
             "\n"
             f"📍 Unit: {label}\n"
-            f"🏢 Floor: {floor_val or 'ask us'}\n"
-            f"👁️ View: {view or 'City view'}\n"
-            f"📐 Size: {size_str}\n"
+            f"{floor_line}"
+            f"{view_line}"
+            f"{size_line}"
             f"💰 Price: {price_str}\n"
             "\n"
             "📊 Payment Plan:\n"
@@ -755,6 +759,8 @@ async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: 
             "- Replace [One short urgency line...] with a real urgency sentence.\n"
             "- Keep all emojis and admin contact exactly as shown.\n"
             "- Dubai energy: max 1 Arabic word (habibi OR wallah OR yalla).\n"
+            "- If a field value is empty or unknown — skip that line completely.\n"
+            "- Never write 'see brochure', 'TBD', 'ask us', or 'N/A'.\n"
             "- Output ONLY the caption — nothing else, no explanation."
         )
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
