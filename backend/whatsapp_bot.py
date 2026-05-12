@@ -833,10 +833,9 @@ async def _send_offer_for_agency(
     if pdf_bytes is None:
         logger.warning(f"Daily offer [{slot_label}]: no downloadable PDF found in {len(candidates[:5])} candidates")
         if notify_admin:
-            _primary = (agency.wa_admin_numbers or [None])[0]
-            if _primary:
+            for phone in (agency.wa_admin_numbers or []):
                 await _send_wa(
-                    f"{_primary}@c.us",
+                    f"{phone}@c.us",
                     f"Habibi no PDF found for {slot_label} 😅\n"
                     "Check Drive — make sure sales offer PDFs are uploaded 🙏"
                 )
@@ -878,9 +877,9 @@ async def _send_offer_for_agency(
             f"Sent to {sent_count} group(s) ✅\n"
             f"PDF + caption forwarded to all khalas 💪"
         )
-        _primary = (agency.wa_admin_numbers or [None])[0]
-        if _primary:
-            await _send_wa(f"{_primary}@c.us", admin_msg)
+        if sent_count > 0:
+            for phone in (agency.wa_admin_numbers or []):
+                await _send_wa(f"{phone}@c.us", admin_msg)
 
     logger.info(f"Daily offer [{slot_label}]: unit={unit_key} sent to {sent_count} groups")
     return {"unit": unit_key, "caption": caption, "sent": sent_count}
@@ -1008,9 +1007,8 @@ async def _friday_broadcast_for_agency(agency: Agency, db: Session):
 
     if groups_sent:
         msg = f"✅ Friday package sent to {groups_sent} groups habibi! Khalas 🤲"
-        _nums = getattr(agency, "wa_admin_numbers", []) or []
-        if _nums:
-            await _send_wa(f"{_nums[0]}@c.us", msg)
+        for phone in (getattr(agency, "wa_admin_numbers", []) or []):
+            await _send_wa(f"{phone}@c.us", msg)
         logger.info(f"Friday broadcast: agency={agency.slug} groups={groups_sent}")
 
 
