@@ -173,27 +173,39 @@ tr:last-child td{{border:none}}
 # ─── WhatsApp webhook ─────────────────────────────────────────────────────────
 
 def _resolve_agency(data: dict, db) -> Agency | None:
-    """Find the right agency for an incoming message by sender phone or group."""
+    """Find the right agency for an incoming message.
+
+    Groups  → always resolved by the group's registered agency (stable, not sender-dependent).
+    Private → resolved by the sender's phone number.
+    Fallback → first active agency (single-instance setups).
+    """
     import client_registry
+    from models import WhatsAppGroup
     sender_data = data.get("senderData", {})
     sender_wid  = sender_data.get("sender", "")
     sender_phone = sender_wid.split("@")[0]
-
-    if sender_phone:
-        cfg = client_registry.find_by_phone(sender_phone)
-        if cfg:
-            return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
-
     chat_id = sender_data.get("chatId", "")
+
+    # ── Group chat: agency comes from the group, NOT the sender ───────────────
+    # This prevents two admins from different agencies in the same group from
+    # flipping the agency on every message.
     if chat_id.endswith("@g.us"):
-        from models import WhatsAppGroup
         group = db.query(WhatsAppGroup).filter(WhatsAppGroup.chat_id == chat_id).first()
         if group and group.agency_id:
             return db.query(Agency).filter(Agency.id == group.agency_id, Agency.is_active == True).first()
+        # Group not registered yet — resolve by sender phone so first message works
+        if sender_phone:
+            cfg = client_registry.find_by_phone(sender_phone)
+            if cfg:
+                return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
+    else:
+        # ── Private chat: agency comes from the sender's phone ─────────────────
+        if sender_phone:
+            cfg = client_registry.find_by_phone(sender_phone)
+            if cfg:
+                return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
 
-    # Fallback: use first active agency ordered by id.
-    # Covers unregistered groups and members whose phone isn't in client config.
-    # Safe when all agencies share the same WhatsApp instance (single-instance setup).
+    # Fallback: use first active agency (single-instance setup with one agency).
     first = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.id).first()
     if first:
         logger.info(f"_resolve_agency: fallback agency={first.slug} for sender={sender_phone} chat={chat_id}")
