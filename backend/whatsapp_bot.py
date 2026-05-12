@@ -861,9 +861,7 @@ async def _send_offer_for_agency(
             break
         if i > 0:
             await asyncio.sleep(group_delay)
-        await _send_wa_file(group.chat_id, pdf_bytes, filename, "")
-        await asyncio.sleep(1)
-        await _send_wa(group.chat_id, caption)
+        await _send_wa_file(group.chat_id, pdf_bytes, filename, caption)
         sent_count += 1
 
     # 5. Notify admin
@@ -1903,9 +1901,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 if svc:
                     file_bytes, file_name = await _find_offer_pdf(svc, unit, proj.project_name, root_id)
                 if file_bytes:
-                    # PDF first → formatted text second
-                    await _send_wa_file(chat_id, file_bytes, file_name, "")
-                    await _send_wa(chat_id, card)
+                    await _send_wa_file(chat_id, file_bytes, file_name, card)
                     pdf_sent = True
                 else:
                     await _send_wa(chat_id, card)
@@ -1930,8 +1926,7 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                                               admin_name=_adm_name, admin_phone=_adm_phone)
                     file_bytes, file_name = await _find_offer_pdf(svc, unit, p_name, root_id)
                     if file_bytes:
-                        await _send_wa_file(chat_id, file_bytes, file_name, "")
-                        await _send_wa(chat_id, card)
+                        await _send_wa_file(chat_id, file_bytes, file_name, card)
                         pdf_sent = True
                     else:
                         await _send_wa(chat_id, card)
@@ -1963,10 +1958,8 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                     if fid:
                         file_bytes = await asyncio.to_thread(_drive.download_file, svc, fid)
                         if file_bytes:
-                            # Use actual filename from offer data, never raw file_id
                             fname = enriched.get("filename") or offer_data.get("filename") or f"{unit}.pdf"
-                            await _send_wa_file(chat_id, file_bytes, fname, "")
-                            await _send_wa(chat_id, card)
+                            await _send_wa_file(chat_id, file_bytes, fname, card)
                             pdf_sent = True
                     if not pdf_sent:
                         await _send_wa(chat_id, card)
@@ -2304,8 +2297,7 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
             if not file_bytes and svc:
                 file_bytes, file_name = await _find_offer_pdf(svc, unit_key, proj_name, root_id)
             if file_bytes:
-                await _send_wa_file(chat_id, file_bytes, file_name, "")
-                await _send_wa(chat_id, card)
+                await _send_wa_file(chat_id, file_bytes, file_name, card)
             else:
                 await _send_wa(chat_id, card)
                 if i == 0 and admin_numbers and group_title:
