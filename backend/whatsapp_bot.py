@@ -688,31 +688,64 @@ async def _handle_stranger_message(chat_id: str, agency: Agency, text: str = "")
 
 # ─── Daily broadcast — optimized (1 API call per slot, N groups free) ─────────
 
-async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: str) -> str:
+async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: str,
+                                   agency=None) -> str:
     """Generate a WhatsApp sales caption via Claude Haiku — 1 call per broadcast slot."""
     try:
         from admin_agent import _parse_price, _get_floor
-        building = unit_data.get("building", "")
-        label = f"{building}-{unit_key}" if building else unit_key
-        u_type = unit_data.get("unit_type", "Unit")
+        building  = unit_data.get("building", "")
+        label     = f"{building}-{unit_key}" if building else unit_key
+        u_type    = unit_data.get("unit_type", "Unit")
         floor_val = unit_data.get("floor") or _get_floor(unit_key, unit_data)
         price_raw = _parse_price(unit_data)
-        price_str = f"AED {int(price_raw):,}".replace(",", " ") if price_raw else "price on request"
-        view = (unit_data.get("View") or unit_data.get("view", "")).strip()
-        payment = unit_data.get("payment_plan", "")
+        price_str = f"AED {int(price_raw):,.0f}" if price_raw else "price on request"
+        view      = (unit_data.get("View") or unit_data.get("view", "")).strip()
+        payment   = unit_data.get("payment_plan", "")
+        location  = (unit_data.get("location") or unit_data.get("district") or "").strip()
+        size      = (unit_data.get("area") or unit_data.get("size") or
+                     unit_data.get("sqft") or "").strip()
+
+        admin_name  = getattr(agency, "name", "") if agency else ""
+        admin_nums  = getattr(agency, "wa_admin_numbers", []) if agency else []
+        admin_phone = f"+{str(admin_nums[0]).lstrip('+')}" if admin_nums else ""
+
+        loc_str  = f" | {location}" if location else ""
+        size_str = f"{size} sq.ft" if size else "see brochure"
+        pay_str  = payment or "Flexible — ask for details"
 
         prompt = (
-            "You are TONY — Dubai real estate AI. Write a short WhatsApp group caption for this sales offer.\n"
-            "Rules: max 5 lines, plain text only (no markdown, no asterisks, no bullet symbols), "
-            "Dubai energy, 1-2 Arabic words (habibi/wallah/yalla/khalas), fire/home emojis ok.\n\n"
-            f"Unit: {label}\nProject: {project_name}\nType: {u_type}\n"
-            f"Floor: {floor_val or 'unknown'}\nPrice: {price_str}\n"
-            f"View: {view or 'city view'}\nPayment: {payment or 'flexible'}"
+            "Write a WhatsApp sales caption. Follow this EXACT structure — plain text, NO asterisks, NO markdown:\n\n"
+            f"🏙️ {project_name}{loc_str}\n"
+            "\n"
+            "[One unique punchy line about why this unit is special — view/floor/type/value]\n"
+            "\n"
+            f"📍 Unit: {label}\n"
+            f"🏢 Floor: {floor_val or 'ask us'}\n"
+            f"👁️ View: {view or 'City view'}\n"
+            f"📐 Size: {size_str}\n"
+            f"💰 Price: {price_str}\n"
+            "\n"
+            "📊 Payment Plan:\n"
+            f"▪️ {pay_str}\n"
+            "\n"
+            "[One short urgency line — vary it every time]\n"
+            "\n"
+            f"📞 {admin_name + ': ' if admin_name else ''}{admin_phone}\n"
+            "💬 DM for details & floor plan!\n"
+            "\n"
+            "STRICT RULES:\n"
+            "- Plain text only. Zero asterisks. Zero bold. Zero markdown.\n"
+            "- Blank line between every section.\n"
+            "- Replace [One unique punchy line...] with a real punchy sentence.\n"
+            "- Replace [One short urgency line...] with a real urgency sentence.\n"
+            "- Keep all emojis and admin contact exactly as shown.\n"
+            "- Dubai energy: max 1 Arabic word (habibi OR wallah OR yalla).\n"
+            "- Output ONLY the caption — nothing else, no explanation."
         )
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = await ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=200,
+            max_tokens=400,
             system=[{"type": "text", "text": "You are Tony, Dubai real estate AI. Reply ONLY with the caption text — nothing else.", "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": prompt}],
         )
@@ -788,9 +821,14 @@ async def _send_offer_for_agency(
         return {"error": "no_pdf"}
 
     # 3. Generate caption ONCE (1 API call)
-    caption = await _generate_offer_caption(unit_key, unit_data, proj_name)
+    caption = await _generate_offer_caption(unit_key, unit_data, proj_name, agency=agency)
     if not caption:
-        caption = format_unit_card(unit_key, unit_data, proj_name)
+        admin_nums  = getattr(agency, "wa_admin_numbers", []) or []
+        caption = _format_group_card(
+            unit_key, unit_data, proj_name,
+            admin_name=getattr(agency, "name", ""),
+            admin_phone=admin_nums[0] if admin_nums else "",
+        )
 
     # 4. Send PDF FIRST, then caption to ALL groups
     groups = _query_groups(db, agency)
@@ -1696,6 +1734,8 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
     contact = agency.contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
     admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
+    _adm_name  = getattr(agency, "name", "")
+    _adm_phone = admin_numbers[0] if admin_numbers else ""
 
     for unit in unit_numbers[:3]:
         found = False
@@ -1706,7 +1746,8 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
             idx: dict = proj.unit_index or {}
             if unit in idx:
                 found = True
-                card = _format_group_card(unit, idx[unit], proj.project_name)
+                card = _format_group_card(unit, idx[unit], proj.project_name,
+                                          admin_name=_adm_name, admin_phone=_adm_phone)
                 file_bytes, file_name = (None, "")
                 if svc:
                     file_bytes, file_name = await _find_offer_pdf(svc, unit, proj.project_name, root_id)
@@ -1734,7 +1775,8 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 drive_idx = _drive.get_project_inventory(svc, p_name, root_id)
                 if unit in drive_idx:
                     found = True
-                    card = _format_group_card(unit, drive_idx[unit], p_name)
+                    card = _format_group_card(unit, drive_idx[unit], p_name,
+                                              admin_name=_adm_name, admin_phone=_adm_phone)
                     file_bytes, file_name = await _find_offer_pdf(svc, unit, p_name, root_id)
                     if file_bytes:
                         await _send_wa_file(chat_id, file_bytes, file_name, "")
@@ -1763,7 +1805,8 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 if offer_data:
                     enriched = await asyncio.to_thread(_drive.enrich_offer_from_pdf, svc, offer_data)
                     proj_name = enriched.get("project_name", "Project")
-                    card = _format_group_card(unit, enriched, proj_name)
+                    card = _format_group_card(unit, enriched, proj_name,
+                                              admin_name=_adm_name, admin_phone=_adm_phone)
                     found = True
                     fid = enriched.get("file_id", "")
                     if fid:
@@ -1807,7 +1850,8 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                                f"Habibi — Unit {unit} not in my current data 😅\n"
                                f"Here are similar{type_note} options nearby 👇")
                 for u_num, u_data, p_name in alts:
-                    await _send_wa(chat_id, _format_group_card(u_num, u_data, p_name))
+                    await _send_wa(chat_id, _format_group_card(u_num, u_data, p_name,
+                                                               admin_name=_adm_name, admin_phone=_adm_phone))
             else:
                 await _send_wa(chat_id,
                                f"Habibi — Unit {unit} not in current inventory 😅\n"
@@ -1917,46 +1961,114 @@ def _unit_type_matches(data: dict, requested_type: str) -> bool:
 
 # ─── Clean group card format ──────────────────────────────────────────────────
 
-def _format_group_card(unit_num: str, data: dict, proj_name: str) -> str:
-    """Structured, clean card for WhatsApp group output. No raw data dump."""
+_PUNCHY_POOL = [
+    "One of the best layouts in this tower — worth every dirham",
+    "Views that sell themselves — serious buyers only",
+    "This floor, this view, this price — rare combo habibi",
+    "High ROI zone — investor favourite right now",
+    "Move-in ready. No waiting, no delays.",
+    "Limited supply. High demand. You know what to do.",
+    "This unit checks every box — type, floor, price, view",
+    "Clean layout, prime floor — built for this market",
+    "Wallah one of the last units at this price point",
+    "Strong rental yield area — buy to live or to earn",
+    "Priced to move — won't last long habibi",
+    "One of the standout units in this building",
+    "Premium specs, smart price — this is the one",
+    "Quiet floor, great layout — solid long-term pick",
+    "Every detail right — floor, view, price, layout",
+]
+
+_URGENCY_POOL = [
+    "Limited units available — first come, first served",
+    "Book before it's gone habibi",
+    "Units at this price are moving fast",
+    "Reserve now — flexible payment plan available",
+    "Last few at this rate — act fast",
+    "Book your unit today — no hidden fees",
+    "High interest, limited supply — move quick",
+    "Don't sleep on this one — yalla",
+    "Strong interest this week — enquire now",
+    "Units flying — this one is still available today",
+]
+
+
+def _punchy_line_for(utype: str, floor: str, view: str) -> str:
+    u, v = utype.lower(), view.lower()
+    fn = None
+    try:
+        fn = int(re.sub(r"[^\d]", "", floor.split()[0]))
+    except Exception:
+        pass
+    if any(w in v for w in ("sea", "marina", "ocean", "water", "creek", "canal")):
+        return "Wake up to waterfront views every morning"
+    if "burj" in v:
+        return "Burj Khalifa view — Dubai doesn't get better than this"
+    if fn and fn >= 35:
+        return "Sky-high floor — panoramic views and premium feel"
+    if fn and fn >= 25:
+        return "High floor unit — wide views, great natural light"
+    if "studio" in u:
+        return "Compact and smart — perfect Dubai investment pick"
+    if "1" in u and "bed" in u:
+        return "Perfect for young professionals or savvy investors"
+    if "2" in u and "bed" in u:
+        return "Spacious family layout — high demand, strong ROI"
+    if "3" in u and "bed" in u:
+        return "Rare 3BR at this rate — family dream unit habibi"
+    return random.choice(_PUNCHY_POOL)
+
+
+def _format_group_card(unit_num: str, data: dict, proj_name: str,
+                        admin_name: str = "", admin_phone: str = "") -> str:
     def _pick(col_re: re.Pattern) -> str:
         for k, v in data.items():
             if col_re.search(str(k)):
                 val = str(v).strip()
-                if val and val not in ("None", "nan", ""):
+                if val and val not in ("None", "nan", "", "0"):
                     return val
         return ""
 
-    utype   = _pick(re.compile(r"\b(type|unit.?type|bedroom|br|тип)\b", re.I))
-    floor   = _pick(re.compile(r"\b(floor|этаж|level)\b", re.I))
-    view    = _pick(re.compile(r"\b(view|вид|orientation|facing)\b", re.I))
-    size    = _pick(re.compile(r"\b(area|size|sqft|sq\.?ft|sqm|bua|gfa|площадь)\b", re.I))
-    price   = _pick(re.compile(r"\b(price|cost|total|amount|aed|стоимость|цена)\b", re.I))
-    payment = _pick(re.compile(r"\b(payment.?plan|payment|plan|pp|schedule)\b", re.I))
+    utype    = _pick(re.compile(r"\b(type|unit.?type|bedroom|br|тип)\b", re.I))
+    floor    = _pick(re.compile(r"\b(floor|этаж|level)\b", re.I))
+    view     = _pick(re.compile(r"\b(view|вид|orientation|facing)\b", re.I))
+    size     = _pick(re.compile(r"\b(area|size|sqft|sq\.?ft|sqm|bua|gfa|площадь)\b", re.I))
+    price    = _pick(re.compile(r"\b(price|cost|total|amount|aed|стоимость|цена)\b", re.I))
+    payment  = _pick(re.compile(r"\b(payment.?plan|payment|plan|pp|schedule)\b", re.I))
+    location = _pick(re.compile(r"\b(location|district|area|community|zone)\b", re.I))
 
-    # Format price with commas
     if price:
         try:
-            price = f"AED {float(re.sub(r'[^\d.]', '', price.replace(',', ''))):,.0f}"
+            price = f"{float(re.sub(r'[^\d.]', '', price.replace(',', ''))):,.0f}"
         except (ValueError, TypeError):
             pass
 
-    header = f"🏙️ *{proj_name}*"
-    if utype:
-        header += f" — {utype}"
-    loc = f"📍 Unit {unit_num}"
-    if floor:
-        loc += f" | Floor {floor}"
+    header = f"🏙️ {proj_name}"
+    if location:
+        header += f" | {location}"
 
-    lines = [header, loc]
+    punchy  = _punchy_line_for(utype, floor, view)
+    urgency = random.choice(_URGENCY_POOL)
+
+    lines = [header, "", punchy, "", f"📍 Unit: {unit_num}"]
+    if floor:
+        lines.append(f"🏢 Floor: {floor}")
     if view:
         lines.append(f"👁️ View: {view}")
     if size:
-        lines.append(f"📐 Size: {size} sqft")
+        lines.append(f"📐 Size: {size} sq.ft")
     if price:
-        lines.append(f"💰 {price}")
+        lines.append(f"💰 Price: AED {price}")
     if payment:
-        lines.append(f"📋 Payment: {payment}")
+        lines += ["", "📊 Payment Plan:", f"▪️ {payment}"]
+
+    lines += ["", f"⏳ {urgency}"]
+
+    if admin_name or admin_phone:
+        ph = f"+{admin_phone.lstrip('+')}" if admin_phone else ""
+        contact_line = f"📞 {admin_name}: {ph}" if admin_name and ph else f"📞 {admin_name or ph}"
+        lines += ["", contact_line, "💬 DM for details & floor plan!"]
+
     return "\n".join(lines)
 
 
@@ -2004,6 +2116,8 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     contact = agency.contact or "@support"
     root_id = getattr(agency, "drive_root_id", "") or ""
     admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
+    _adm_name  = getattr(agency, "name", "")
+    _adm_phone = admin_numbers[0] if admin_numbers else ""
 
     filter_kws, sort_field, sort_reverse = _parse_sort_intent(keywords)
     requested_type = _detect_requested_type(filter_kws)
@@ -2028,7 +2142,8 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
         """Send up to limit units: PDF + card. Notify admin if PDF missing."""
         limit = 1 if sort_by else 3
         for i, (unit_key, unit_data, proj_name) in enumerate(units[:limit]):
-            card = _format_group_card(unit_key, unit_data, proj_name)
+            card = _format_group_card(unit_key, unit_data, proj_name,
+                                      admin_name=_adm_name, admin_phone=_adm_phone)
             file_bytes, file_name = None, ""
             fid = unit_data.get("file_id", "")
             if svc and fid:
