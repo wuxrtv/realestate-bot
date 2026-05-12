@@ -176,9 +176,10 @@ tr:last-child td{{border:none}}
 def _resolve_agency(data: dict, db) -> Agency | None:
     """Find the right agency for an incoming message.
 
-    Groups  → always resolved by the group's registered agency (stable, not sender-dependent).
-    Private → resolved by the sender's phone number.
-    Fallback → first active agency (single-instance setups).
+    Groups  → group_registry (file-backed, per-agency) → DB (active only, latest entry)
+              → sender phone (first ever message in new group).
+    Private → sender phone only.
+    Fallback → only when exactly one agency is active.
     """
     import client_registry
     from models import WhatsAppGroup
@@ -187,27 +188,41 @@ def _resolve_agency(data: dict, db) -> Agency | None:
     sender_phone = sender_wid.split("@")[0]
     chat_id = sender_data.get("chatId", "")
 
-    # ── Group chat: agency comes from the group, NOT the sender ───────────────
-    # This prevents two admins from different agencies in the same group from
-    # flipping the agency on every message.
     if chat_id.endswith("@g.us"):
-        group = db.query(WhatsAppGroup).filter(WhatsAppGroup.chat_id == chat_id).first()
+        # ── Group: group_registry is the authoritative source ─────────────────
+        # It is per-agency and file-backed — survives restarts and avoids DB
+        # race conditions where the same chat_id may appear under two agencies.
+        import group_registry as _gr
+        for ag in db.query(Agency).filter(Agency.is_active == True).all():
+            if any(g["id"] == chat_id for g in _gr.get_groups(ag.id)):
+                return ag
+
+        # Not in registry yet — fall back to DB (active rows, newest first)
+        group = (
+            db.query(WhatsAppGroup)
+            .filter(WhatsAppGroup.chat_id == chat_id, WhatsAppGroup.active == True)
+            .order_by(WhatsAppGroup.id.desc())
+            .first()
+        )
         if group and group.agency_id:
             return db.query(Agency).filter(Agency.id == group.agency_id, Agency.is_active == True).first()
-        # Group not registered yet — resolve by sender phone so first message works
-        if sender_phone:
-            cfg = client_registry.find_by_phone(sender_phone)
-            if cfg:
-                return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
-    else:
-        # ── Private chat: agency comes from the sender's phone ─────────────────
+
+        # Brand-new group — resolve by sender phone (first message from a known admin)
         if sender_phone:
             cfg = client_registry.find_by_phone(sender_phone)
             if cfg:
                 return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
 
-    # Fallback: only safe when exactly ONE agency is active (single-instance setup).
-    # With multiple agencies the fallback silently misroutes strangers to the wrong admin.
+        logger.warning(f"_resolve_agency: unregistered group {chat_id} from unknown sender {sender_phone} — ignoring")
+        return None
+    else:
+        # ── Private chat: agency from sender's phone ───────────────────────────
+        if sender_phone:
+            cfg = client_registry.find_by_phone(sender_phone)
+            if cfg:
+                return db.query(Agency).filter(Agency.slug == cfg.slug, Agency.is_active == True).first()
+
+    # Fallback: only safe with exactly one active agency (single-instance setup).
     active_agencies = db.query(Agency).filter(Agency.is_active == True).all()
     if len(active_agencies) == 1:
         logger.info(f"_resolve_agency: single-agency fallback={active_agencies[0].slug} sender={sender_phone} chat={chat_id}")

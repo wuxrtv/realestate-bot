@@ -536,7 +536,7 @@ async def _transcribe_audio(audio_bytes: bytes) -> str:
 def _is_admin(sender_phone: str, agency: Agency) -> bool:
     for num in (agency.wa_admin_numbers or []):
         clean = num.lstrip("+").strip()
-        if clean in sender_phone or sender_phone in clean:
+        if clean == sender_phone:
             return True
     return False
 
@@ -1640,12 +1640,12 @@ async def _send_group_brochure(chat_id: str, project_name: str, agency: Agency):
                 await _send_wa_file(chat_id, file_bytes, file_name)
     else:
         await _send_wa(chat_id, f"Habibi media for {project_name} not found 😅 Contact {contact} 🙏")
-        if admin_numbers:
-            await _send_wa(
-                f"{admin_numbers[0]}@c.us",
-                f"Habibi 🙏 Someone asked for *{project_name}* brochure in a group — "
-                f"media not found in Drive 📂 Can you upload it? 🔥",
-            )
+        notif = (
+            f"Habibi 🙏 Someone asked for *{project_name}* brochure in a group — "
+            f"media not found in Drive 📂 Can you upload it? 🔥"
+        )
+        for phone in admin_numbers:
+            await _send_wa(f"{phone}@c.us", notif)
 
 
 # ─── Group message ────────────────────────────────────────────────────────────
@@ -1660,6 +1660,19 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     except Exception:
         logger.exception(f"group_registry.register failed for {chat_id}")
         is_new_group = False
+
+    # Guard: if this group is already active under a DIFFERENT agency, don't override it.
+    # This prevents a wrong-agency message from silently re-registering the group.
+    conflict = db.query(WhatsAppGroup).filter(
+        WhatsAppGroup.chat_id == chat_id,
+        WhatsAppGroup.active == True,
+    ).first()
+    if conflict and conflict.agency_id and conflict.agency_id != agency.id:
+        logger.warning(
+            f"Group {chat_id} belongs to agency {conflict.agency_id}, "
+            f"not {agency.id} — skipping to avoid cross-agency contamination"
+        )
+        return
 
     existing = db.query(WhatsAppGroup).filter(
         WhatsAppGroup.chat_id == chat_id,
@@ -1797,16 +1810,15 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                         await _send_wa_file(chat_id, file_bytes, file_name)
                 sent = True
             if not sent:
-                # Media not found in Drive — notify admin
+                # Media not found in Drive — notify all admins
                 await _send_wa(chat_id, "Give me a sec habibi 🙏")
                 admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
-                if admin_numbers:
-                    admin_chat_id = f"{admin_numbers[0]}@c.us"
-                    await _send_wa(
-                        admin_chat_id,
-                        f"Habibi, media for *{search_name}* not found in Drive 🙏\n"
-                        f"Can you send it? I'll forward to the groups khalas 🔥"
-                    )
+                notif = (
+                    f"Habibi, media for *{search_name}* not found in Drive 🙏\n"
+                    f"Can you send it? I'll forward to the groups khalas 🔥"
+                )
+                for phone in admin_numbers:
+                    await _send_wa(f"{phone}@c.us", notif)
     elif intent == "discount_inquiry":
         # ACTION 1 — redirect in group
         group_reply = random.choice(_DISCOUNT_GROUP_REPLIES).format(
@@ -1907,11 +1919,12 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                 else:
                     await _send_wa(chat_id, card)
                     if admin_numbers and group_title:
-                        await _send_wa(
-                            f"{admin_numbers[0]}@c.us",
+                        notif = (
                             f"Habibi 🙏\nSomeone in *{group_title}* asked for *Unit {unit}* ({proj.project_name})\n"
                             f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
                         )
+                        for phone in admin_numbers:
+                            await _send_wa(f"{phone}@c.us", notif)
                 break
 
         # 2. Fallback: read inventory Excel from Drive
@@ -1932,11 +1945,12 @@ async def _respond_unit(chat_id: str, unit_numbers: list, projects: list, agency
                     else:
                         await _send_wa(chat_id, card)
                         if admin_numbers and group_title:
-                            await _send_wa(
-                                f"{admin_numbers[0]}@c.us",
+                            notif = (
                                 f"Habibi 🙏\nSomeone in *{group_title}* asked for *Unit {unit}* ({p_name})\n"
                                 f"Sales offer PDF not found in Drive 📂\nCan you upload it? 🔥"
                             )
+                            for phone in admin_numbers:
+                                await _send_wa(f"{phone}@c.us", notif)
                     break
 
         # 3. Fallback: scan sales offer PDFs (SH_A311_40.60_1B.pdf)
