@@ -131,7 +131,7 @@ You are in a group chat with real estate agents. Your name is Tony.
 
 Respond ONLY with valid JSON (no markdown, no code blocks):
 {
-  "intent": "unit_query" | "media_request" | "property_search" | "inventory_query" | "direct_question" | "discount_inquiry" | "off_topic",
+  "intent": "unit_query" | "location_request" | "media_request" | "property_search" | "inventory_query" | "direct_question" | "discount_inquiry" | "off_topic",
   "unit_numbers": ["1507", "1435"],
   "project_name": "project name or null",
   "keywords": ["2 rooms", "villa", "floor 20"],
@@ -189,12 +189,17 @@ NEVER confuse these two. Ever.
   → "what do we have in stock?" / "send inventory" / "show all units"
   → Tony answers with a text summary from database — does NOT send individual PDFs
   → Put the summary text in "reply" field
-• media_request: asking for ANY media — brochure, PDF, photos, renders, video, tour, presentation ("фото", "photo", "brochure", "видео", "video", "renders", "tour", "ролик", "брошюра", "брошура")
-  → Tony sends ALL files from project's media folder in order: Brochure → Payment Plan → Photos → Video
-  → NEVER send video before brochure — order is fixed
-  → project_name MUST be set and non-null. If project unclear → use direct_question instead, NEVER media_request with empty project_name
+• location_request: request for project info, brochure, materials, location, address, amenities, facilities
+  ("brochure", "брошюра", "брошура", "location", "локация", "where", "адрес", "address",
+   "facilities", "amenities", "tell me about", "materials", "презентация", "send everything", "send all")
+  → Tony sends: location text → Brochure → Payment Plan → Videos (full package)
+  → project_name MUST be set. If project unclear → use direct_question instead
   → "send brochure" (no project) → direct_question, ask which project
-  → "send SAAS Hills brochure" → media_request, project_name="SAAS Hills"
+  → "send SAAS Hills brochure" → location_request, project_name="SAAS Hills"
+• media_request: asking specifically for PHOTOS, RENDERS, VIDEO only — NOT brochure, NOT full package
+  ("фото", "photo", "photos", "renders", "рендеры", "видео", "video", "tour", "ролик", "gallery")
+  → Tony sends photos and videos only
+  → project_name MUST be set and non-null. If project unclear → use direct_question instead
 • direct_question: any other work question — answer in "reply" using the project context below
 • discount_inquiry: ANY question about pricing flexibility — discounts, DLD waiver, "4%", payment plans
   ("50/50", "60/40", "40/60"), special offers, "best price", negotiation, "chegirma", "скидка"
@@ -888,6 +893,127 @@ async def _send_daily_offer_slot(unit_type: str, slot_label: str):
 async def send_daily_offer_11am():
     """11:00 — Studio offer to all groups."""
     await _send_daily_offer_slot("Studio", "11AM 🌅")
+
+
+# ─── Location / full package helper ───────────────────────────────────────────
+
+async def _respond_location_request(chat_id: str, project_name: str,
+                                     projects: list, agency: Agency, group_title: str = ""):
+    """Send text_location.txt (plain text) + full media package for a project."""
+    import drive_service as _drive
+    svc = _drive.get_service()
+    root_id = getattr(agency, "drive_root_id", "") or ""
+    contact  = agency.contact or "@support"
+
+    if not project_name and projects:
+        project_name = projects[0].project_name
+
+    if not project_name:
+        await _send_wa(chat_id, f"Habibi which project? 😊 Contact {contact} 🙏")
+        return
+
+    sent_something = False
+
+    if svc:
+        # 1. text_location.txt — plain text, never as file
+        loc_text = await asyncio.to_thread(_drive.get_location_text, svc, project_name, root_id)
+        if loc_text:
+            await _send_wa(chat_id, loc_text)
+            await asyncio.sleep(1)
+            sent_something = True
+
+        # 2-4. Brochure PDF → Payment plan PDF → Videos
+        media_files = await asyncio.to_thread(_drive.find_all_media, svc, project_name, 20, root_id)
+        for file_id, file_name, export_mime in media_files:
+            file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
+            if file_bytes:
+                await _send_wa_file(chat_id, file_bytes, file_name)
+                await asyncio.sleep(1)
+                sent_something = True
+
+    if not sent_something:
+        await _send_wa(chat_id,
+                       f"Habibi no materials found for {project_name} 😅 Contact {contact} 🙏")
+
+
+# ─── Friday broadcast ─────────────────────────────────────────────────────────
+
+async def _friday_broadcast_for_agency(agency: Agency, db: Session):
+    import drive_service as _drive
+    svc = _drive.get_service()
+    root_id = getattr(agency, "drive_root_id", "") or ""
+    groups = _query_groups(db, agency)
+    if not groups or not svc:
+        return
+
+    from sqlalchemy import or_ as _or
+    projects = db.query(ToniProject).filter(
+        ToniProject.is_active == True,
+        _or(ToniProject.agency_id == agency.id, ToniProject.agency_id.is_(None)),
+    ).all()
+    if not projects:
+        return
+
+    # Pre-fetch all packages before sending (avoids Drive calls during group loop)
+    packages = []
+    for proj in projects:
+        proj_name = proj.project_name
+        loc_text   = await asyncio.to_thread(_drive.get_location_text, svc, proj_name, root_id)
+        media_files = await asyncio.to_thread(_drive.find_all_media, svc, proj_name, 20, root_id)
+        packages.append((proj_name, loc_text, media_files))
+
+    groups_sent = 0
+    for i, group in enumerate(groups):
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            break
+        if i > 0:
+            await asyncio.sleep(20)  # 20-sec interval between groups
+
+        for proj_name, loc_text, media_files in packages:
+            greeting = (
+                f"🕌 Happy Friday habibi!\n"
+                f"Here's everything you need about {proj_name} 👇\n"
+                f"Khalas — save it, share it, use it! 🔥"
+            )
+            await _send_wa(group.chat_id, greeting)
+
+            if loc_text:
+                await asyncio.sleep(1)
+                await _send_wa(group.chat_id, loc_text)
+
+            for file_id, file_name, export_mime in media_files:
+                file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
+                if file_bytes:
+                    await _send_wa_file(group.chat_id, file_bytes, file_name)
+                    await asyncio.sleep(1)
+
+        groups_sent += 1
+
+    if groups_sent:
+        msg = f"✅ Friday package sent to {groups_sent} groups habibi! Khalas 🤲"
+        for phone in (getattr(agency, "wa_admin_numbers", []) or []):
+            await _send_wa(f"{phone}@c.us", msg)
+        logger.info(f"Friday broadcast: agency={agency.slug} groups={groups_sent}")
+
+
+async def send_friday_broadcast():
+    """Friday 13:00 Dubai time — full project package to all groups."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not os.getenv("WA_INSTANCE_ID"):
+                continue
+            clear_cancel(agency.id)
+            try:
+                await _friday_broadcast_for_agency(agency, db)
+            except Exception:
+                logger.exception(f"Friday broadcast failed for agency {agency.id}")
+    except Exception:
+        logger.exception("send_friday_broadcast error")
+    finally:
+        db.close()
 
 
 async def send_daily_offer_14pm():
@@ -1598,7 +1724,16 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     project_name: str = parsed.get("project_name") or ""
     keywords: list = parsed.get("keywords") or []
 
-    if intent == "unit_query":
+    if intent == "location_request":
+        if not project_name:
+            proj_list = "\n".join(f"• {p.project_name}" for p in projects)
+            msg = "Habibi which project? 😊"
+            if proj_list:
+                msg += f"\nWe have:\n{proj_list}"
+            await _send_wa(chat_id, msg)
+        else:
+            await _respond_location_request(chat_id, project_name, projects, agency, group_title)
+    elif intent == "unit_query":
         if unit_numbers:
             await _respond_unit(chat_id, unit_numbers, projects, agency, project_name, group_title, keywords)
         else:

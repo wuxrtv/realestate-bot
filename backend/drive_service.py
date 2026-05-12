@@ -356,6 +356,38 @@ def find_all_media(svc, project_name: str, limit: int = 15, agency_root_id: str 
 
 
 
+_location_text_cache: dict[str, tuple[str, float]] = {}  # project_name → (text, timestamp)
+
+
+def get_location_text(svc, project_name: str, root_id: str = "") -> str:
+    """Read text_location.txt from Drive project folder. Returns '' if not found.
+    Cache: 24 hours (text is stable, avoids redundant Drive API calls).
+    """
+    now = time.time()
+    cached = _location_text_cache.get(project_name)
+    if cached and now - cached[1] < 86400:
+        return cached[0]
+
+    try:
+        proj_id = _find_project_folder(svc, project_name, root_id)
+        if not proj_id:
+            return ""
+        items = _list_folder(svc, proj_id)
+        for item in items:
+            if item["name"].lower() == "text_location.txt":
+                raw = download_file(svc, item["id"])
+                text = raw.decode("utf-8", errors="replace").strip() if raw else ""
+                _location_text_cache[project_name] = (text, now)
+                logger.info(f"Drive: text_location.txt loaded for '{project_name}' ({len(text)} chars)")
+                return text
+    except Exception:
+        logger.exception(f"Drive: get_location_text failed for '{project_name}'")
+
+    _location_text_cache[project_name] = ("", now)
+    logger.info(f"Drive: text_location.txt not found for '{project_name}'")
+    return ""
+
+
 def find_unit_file(svc, project_name: str, unit_number: str, agency_root_id: str = "") -> Optional[tuple]:
     """Find any file for a unit (e.g. '1507.pdf').
     Looks in 'sales office' subfolder first, then falls back to whole project.
