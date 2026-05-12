@@ -9,6 +9,7 @@ import logging
 import os
 import random
 import re
+import time as _time
 from typing import Optional
 
 import anthropic
@@ -31,6 +32,20 @@ _cancel_flags: dict[int, bool] = {}
 # agency_id → {chat_id, sender_phone, download_url, file_name, stored_at}
 
 _pending_files: dict[int, dict] = {}
+
+# ─── Pending brochure confirmations in groups ─────────────────────────────────
+# chat_id → {project_name, stored_at}; expires in 10 minutes
+
+_pending_group_brochure: dict[str, dict] = {}
+_YES_RE = re.compile(
+    r"\b(yes|yeah|yep|sure|ok|okay|yalla|send|go|go ahead|do it|send it|please"
+    r"|да|ок|окей|ладно|давай|отправь)\b",
+    re.IGNORECASE,
+)
+_BROCHURE_OFFER_RE = re.compile(
+    r"\b(brochure|брошюр|presentation|send.*brochure|brochure.*send)\b",
+    re.IGNORECASE,
+)
 
 
 def set_cancel(agency_id: int):
@@ -1425,6 +1440,35 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
                        "Something went wrong, please try again.")
 
 
+async def _send_group_brochure(chat_id: str, project_name: str, agency: Agency):
+    """Send all media files for a project to a group (brochure confirmation flow)."""
+    import drive_service as _drive
+    svc = _drive.get_service()
+    root_id = getattr(agency, "drive_root_id", "") or ""
+    contact = agency.contact or "@support"
+    admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
+
+    if not svc:
+        await _send_wa(chat_id, f"Habibi something went wrong 😅 Contact {contact} 🙏")
+        return
+
+    media_files = _drive.find_all_media(svc, project_name, limit=15, agency_root_id=root_id)
+    if media_files:
+        await _send_wa(chat_id, f"Yalla habibi — {project_name} media incoming 📸🎬👇")
+        for file_id, file_name, export_mime in media_files:
+            file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
+            if file_bytes:
+                await _send_wa_file(chat_id, file_bytes, file_name)
+    else:
+        await _send_wa(chat_id, f"Habibi media for {project_name} not found 😅 Contact {contact} 🙏")
+        if admin_numbers:
+            await _send_wa(
+                f"{admin_numbers[0]}@c.us",
+                f"Habibi 🙏 Someone asked for *{project_name}* brochure in a group — "
+                f"media not found in Drive 📂 Can you upload it? 🔥",
+            )
+
+
 # ─── Group message ────────────────────────────────────────────────────────────
 
 async def _handle_group_message(chat_id: str, group_title: str, sender_name: str,
@@ -1461,6 +1505,20 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     if _LEAD_SIGNAL_RE.search(text):
         await _send_wa(chat_id, _tony_pitch())
         return
+
+    # ── Pending brochure confirmation ─────────────────────────────────────────
+    _pending = _pending_group_brochure.get(chat_id)
+    if _pending:
+        if _time.time() - _pending["stored_at"] > 600:
+            _pending_group_brochure.pop(chat_id, None)
+        elif _YES_RE.search(text):
+            _proj = _pending["project_name"]
+            _pending_group_brochure.pop(chat_id, None)
+            await _send_group_brochure(chat_id, _proj, agency)
+            return
+        else:
+            # User said something else — clear pending, continue normal flow
+            _pending_group_brochure.pop(chat_id, None)
 
     from sqlalchemy import or_ as _or
     projects = db.query(ToniProject).filter(
@@ -1580,6 +1638,13 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         reply = (parsed.get("reply") or "").strip()
         if reply:
             await _send_wa(chat_id, reply)
+            # If Tony offered to send a brochure, remember which project for next "yes"
+            if _BROCHURE_OFFER_RE.search(reply) and project_name:
+                _pending_group_brochure[chat_id] = {
+                    "project_name": project_name,
+                    "stored_at": _time.time(),
+                }
+                logger.info(f"Pending brochure set: chat={chat_id} project={project_name}")
 
     history.append({"role": "assistant", "content": raw})
     _save_group_context(agency.id, chat_id, history)
