@@ -282,6 +282,8 @@ Groups = WhatsApp groups. That's it.
 • "send 3 units", "скинь юниты", "отправь 5 юнитов в группы" → send_inventory_to_groups (count=N, send_to="groups")
 • "send 3 units on floor 5", "скинь 3 юнита на 5 этаже" → send_inventory_to_groups (count=3, floor=5, send_to="groups")
 • "send 2 studio units to groups", "скинь 2 юнита 1b в группы" → send_inventory_to_groups (count=2, unit_type="studio"/"1b", send_to="groups")
+• "random 2 bed to groups", "send 2 bedroom to groups", "2BR в группы" → send_inventory_to_groups(unit_type="2b", count=1, send_to="groups")
+• "send 3 bedroom to groups", "3BR в группы" → send_inventory_to_groups(unit_type="3b", count=1, send_to="groups")
 • "send building A units", "юниты здания B в группы" → send_inventory_to_groups (building="A", send_to="groups")
 • "what's in Drive", "Drive projects", "what files" → list_drive_projects
 • "update database" / "обнови базу" / "refresh prices" / "rescan" → rebuild_index
@@ -320,6 +322,10 @@ send_inventory_to_groups = finds and sends UNIT PDFs (sales offers) from the ind
 → "send all studio offers to groups" → send_inventory_to_groups(unit_type="studio", send_all=True, send_to="groups")
 → "cheapest unit above floor 15" → send_inventory_to_groups(sort_by="cheapest", floor_min=15, count=1, send_to="admin")
 → "give me/find me/show me [unit type/price/floor]" = ALWAYS send_inventory_to_groups
+→ "random 2 bed to groups" → send_inventory_to_groups(unit_type="2b", count=1, send_to="groups")
+→ "send 2 bedroom sales offer to groups" → send_inventory_to_groups(unit_type="2b", count=1, send_to="groups")
+→ "random 1 bed" → send_inventory_to_groups(unit_type="1b", count=1, send_to="groups")
+→ "send 3 bedroom to groups" → send_inventory_to_groups(unit_type="3b", count=1, send_to="groups")
 
 search_units / list_projects = text summary of what exists (NO PDFs sent)
 → Use for: "what units do you have?" / "how many studios?" / "what's available?" / "show me the list"
@@ -380,6 +386,14 @@ DESTINATION RULE — MOST IMPORTANT:
 → "send 3 units to groups" → send_to="groups"
 → DEFAULT when unclear → send_to="groups"
 
+UNIT TYPE MAPPING — CRITICAL, NEVER CONFUSE:
+"studio" / "студия" / "0BR"            → unit_type="studio"
+"1 bed" / "1BR" / "1 bedroom" / "one bedroom" / "однокомнатная" → unit_type="1b"
+"2 bed" / "2BR" / "2 bedroom" / "two bedroom" / "двухкомнатная" → unit_type="2b"
+"3 bed" / "3BR" / "3 bedroom" / "three bedroom" / "трёхкомнатная" → unit_type="3b"
+"4 bed" / "4BR" / "4 bedroom" / "four bedroom" → unit_type="4b"
+The NUMBER before "bed/BR/bedroom" is the key — never default to "1b" when "2", "3", "4" is said.
+
 SORTING ROUTING:
 → "cheapest studio" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
 → "cheapest studio sales offer" → send_inventory_to_groups(unit_type="studio", sort_by="cheapest", count=1, send_to="admin")
@@ -389,6 +403,11 @@ SORTING ROUTING:
 → "top 3 cheapest to groups" → send_inventory_to_groups(sort_by="cheapest", count=3, send_to="groups")
 → "most expensive 1BR" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=1, send_to="admin")
 → "most expensive 1BR sales offer" → send_inventory_to_groups(unit_type="1b", sort_by="most_expensive", count=1, send_to="admin")
+→ "random 2 bed to groups" → send_inventory_to_groups(unit_type="2b", count=1, send_to="groups")
+→ "send 2 bedroom to groups" → send_inventory_to_groups(unit_type="2b", count=1, send_to="groups")
+→ "cheapest 2BR" → send_inventory_to_groups(unit_type="2b", sort_by="cheapest", count=1, send_to="admin")
+→ "send 3 bedroom to groups" → send_inventory_to_groups(unit_type="3b", count=1, send_to="groups")
+→ "most expensive 3BR" → send_inventory_to_groups(unit_type="3b", sort_by="most_expensive", count=1, send_to="admin")
 → "highest floor unit" → send_inventory_to_groups(sort_by="highest_floor", count=1, send_to="admin")
 → "above 1M studios" → send_inventory_to_groups(unit_type="studio", price_min=1000000, send_to="admin")
 → "under 1.5M" → send_inventory_to_groups(price_max=1500000, send_to="admin")
@@ -437,7 +456,12 @@ INVENTORY FILE DETECTION:
 FILTER RULES:
 → "floor 5" / "5 этаж" / "на 5 этаже" → floor=5
 → "floor 15-20" / "между 15 и 20 этажом" → floor_min=15, floor_max=20
-→ "1b" / "1br" / "1 bedroom" / "studio" → unit_type=
+→ "studio" / "студия" → unit_type="studio"
+→ "1b" / "1br" / "1 bed" / "1 bedroom" / "one bedroom" → unit_type="1b"
+→ "2b" / "2br" / "2 bed" / "2 bedroom" / "two bedroom" → unit_type="2b"
+→ "3b" / "3br" / "3 bed" / "3 bedroom" / "three bedroom" → unit_type="3b"
+→ "4b" / "4br" / "4 bed" / "4 bedroom" → unit_type="4b"
+→ unit_type=
 → "building A" / "здание A" / "Tower B" → building=
 → "40/60" / "40.60" / "40 60" → payment_plan="40/60"
 → "budget 1M+" / "от 1М" / "under 2M" → price_min/price_max (in AED: 1M = 1000000)
