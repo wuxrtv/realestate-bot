@@ -92,6 +92,9 @@ async def build_index(agency) -> int:
 
     logger.info(f"Index build started for agency {agency_id}")
 
+    # Always clear Drive cache before rebuilding so new/replaced files are picked up
+    _drive.clear_cache()
+
     # Step 1: scan filenames (fast — no PDF reads)
     offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
     logger.info(f"Index: found {len(offers)} offer files for agency {agency_id}")
