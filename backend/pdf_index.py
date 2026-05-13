@@ -114,6 +114,34 @@ async def build_index(agency) -> int:
         except Exception:
             units[unit_key] = offer_data
 
+    # Re-key non-standard entries using unit data extracted from PDF content
+    final_units: dict = {}
+    for unit_key, data in units.items():
+        unit_id = data.pop("_unit_id_from_pdf", "")
+        proj_pdf = data.pop("_project_from_pdf", "")
+        type_pdf = data.pop("_unit_type_from_pdf", "")
+        code_pdf = data.pop("_unit_type_code_from_pdf", "")
+        if unit_key.startswith("_raw_") and unit_id:
+            import re as _re
+            m = _re.match(r"([A-Za-z]+)-?(\d+)", unit_id)
+            if m:
+                bld = m.group(1).upper()
+                num = m.group(2)
+                new_key = f"{bld}{num}"
+                data["building"] = bld
+                data["unit_number"] = num
+                data["floor"] = _drive.get_floor_from_unit(num)
+                if proj_pdf:
+                    data["project_name"] = proj_pdf
+                if type_pdf:
+                    data["unit_type"] = type_pdf
+                    data["unit_type_code"] = code_pdf
+                final_units[new_key] = data
+                logger.info(f"Index: non-standard PDF re-keyed → {new_key}")
+                continue
+        final_units[unit_key] = data
+    units = final_units
+
     logger.info(f"Index build done: {len(units)} units for agency {agency_id}")
     _save_index(agency_id, units)
     return len(units)

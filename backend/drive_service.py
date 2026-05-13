@@ -631,6 +631,38 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
         if m:
             result["view"] = m.group(1).strip().title()
 
+        # Extract unit metadata from PDF content (for non-standard filenames)
+        # Pattern: "Project Name  Unit Number  ...\nSAAS HILLS  A-411  ..."
+        m_row = re.search(
+            r"Project\s+Name\s+Unit\s+Number[^\n]*\n([A-Z][A-Z\s]+?)\s{2,}([A-Z]-?\d+)",
+            text, re.IGNORECASE,
+        )
+        if m_row:
+            result["_project_from_pdf"] = m_row.group(1).strip().title()
+            result["_unit_id_from_pdf"] = m_row.group(2).strip()  # e.g. "A-411"
+        else:
+            # Fallback: "Reference No: A-411"
+            m_ref = re.search(r"Reference\s+No[:\s]+([A-Z]-?\d+)", text, re.IGNORECASE)
+            if m_ref:
+                result["_unit_id_from_pdf"] = m_ref.group(1).strip()
+
+        # Unit type: "Apartment Studio" / "Apartment 1" / "Townhouse 4"
+        m_type = re.search(
+            r"(?:Apartment|Townhouse|Villa|Penthouse)\s+(Studio|\d+)",
+            text, re.IGNORECASE,
+        )
+        if m_type:
+            t = m_type.group(1)
+            if t.lower() == "studio":
+                result["_unit_type_from_pdf"] = "Studio"
+                result["_unit_type_code_from_pdf"] = "ST"
+            else:
+                n = int(t)
+                _names = {1: "1 Bedroom", 2: "2 Bedroom", 3: "3 Bedroom", 4: "4 Bedroom", 5: "5 Bedroom"}
+                _codes = {1: "1B", 2: "2B", 3: "3B", 4: "4B", 5: "5B"}
+                result["_unit_type_from_pdf"] = _names.get(n, f"{n} Bedroom")
+                result["_unit_type_code_from_pdf"] = _codes.get(n, f"{n}B")
+
     except Exception:
         logger.debug("extract_offer_data_from_pdf: pdfplumber not available or parse error")
 
@@ -709,13 +741,29 @@ def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
                 for f in files:
                     if not f["name"].lower().endswith(".pdf"):
                         continue
-                    parsed = parse_offer_filename(f["name"])
-                    if not parsed:
-                        logger.info(f"Drive: scan_sales_offers — PDF skipped (no pattern match): {f['name']!r}")
+                    if is_inventory_filename(f["name"]):
                         continue
-                    unit_key = f"{parsed['building']}{parsed['unit_number']}"
-                    idx[unit_key] = {**parsed, "file_id": f["id"], "filename": f["name"]}
-                    logger.info(f"Drive: scan_sales_offers — indexed: {f['name']!r} → {unit_key}")
+                    parsed = parse_offer_filename(f["name"])
+                    if parsed:
+                        unit_key = f"{parsed['building']}{parsed['unit_number']}"
+                        idx[unit_key] = {**parsed, "file_id": f["id"], "filename": f["name"]}
+                        logger.info(f"Drive: scan_sales_offers — indexed: {f['name']!r} → {unit_key}")
+                    else:
+                        # Non-standard filename — include anyway; metadata extracted from PDF during enrichment
+                        unit_key = f"_raw_{f['id'][:12]}"
+                        idx[unit_key] = {
+                            "project_name": "",
+                            "building": "",
+                            "unit_number": f["name"][:-4],
+                            "floor": None,
+                            "payment_plan": "",
+                            "unit_type": "",
+                            "unit_type_code": "",
+                            "_sheet": "Sales Offers",
+                            "file_id": f["id"],
+                            "filename": f["name"],
+                        }
+                        logger.info(f"Drive: scan_sales_offers — non-standard PDF included: {f['name']!r}")
 
         logger.info(f"Drive: scan_sales_offers → {len(idx)} offers found")
     except Exception:
