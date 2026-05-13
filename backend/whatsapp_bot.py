@@ -293,6 +293,10 @@ _REMOVE_GROUP_RE = re.compile(
     r"\b(remove\s+this\s+group|убери\s+эту\s+группу|exclude\s+this\s+group|delete\s+this\s+group)\b",
     re.IGNORECASE,
 )
+_REMOVE_GROUP_BY_ID_RE = re.compile(
+    r"\b(remove\s+group|убери\s+группу|delete\s+group)\s+(\S+)",
+    re.IGNORECASE,
+)
 _ADD_GROUP_RE = re.compile(
     r"\b(add\s+this\s+group|добавь\s+эту\s+группу|register\s+this\s+group)\b",
     re.IGNORECASE,
@@ -627,6 +631,31 @@ async def handle_update(data: dict, agency: Agency):
                 if _SHOW_GROUPS_RE.search(text):
                     import group_registry
                     await _send_wa(chat_id, group_registry.list_groups(agency.id))
+                elif m := _REMOVE_GROUP_BY_ID_RE.search(text):
+                    import group_registry
+                    target_id = m.group(2).strip()
+                    removed = group_registry.remove(target_id, agency.id)
+                    if removed:
+                        existing = db.query(WhatsAppGroup).filter(
+                            WhatsAppGroup.chat_id == target_id,
+                            WhatsAppGroup.agency_id == agency.id,
+                        ).first()
+                        if existing:
+                            existing.active = False
+                            db.commit()
+                        await _send_wa(
+                            chat_id,
+                            f"Khalas habibi! Group removed from your list ✅\n"
+                            f"ID: `{target_id}`\n"
+                            f"Other agencies are not affected."
+                        )
+                    else:
+                        await _send_wa(
+                            chat_id,
+                            f"Habibi, group not found in your list 🤔\n"
+                            f"ID: `{target_id}`\n"
+                            f"Use *show groups* to see your active groups."
+                        )
                 else:
                     await _handle_admin_message(chat_id, sender_phone, text, db, agency)
             elif is_group and admin_check and (_REMOVE_GROUP_RE.search(text) or _ADD_GROUP_RE.search(text)):
