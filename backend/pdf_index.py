@@ -99,6 +99,12 @@ async def build_index(agency) -> int:
     offers = await asyncio.to_thread(_drive.scan_sales_offers, svc, root_id)
     logger.info(f"Index: found {len(offers)} offer files for agency {agency_id}")
 
+    # Save basic index immediately (unit keys + filenames, no prices yet)
+    # This allows searches to work during the slow enrichment phase
+    if offers:
+        _save_index(agency_id, offers)
+        logger.info(f"Index: basic snapshot saved ({len(offers)} units) — enriching prices...")
+
     # Step 2: extract price/size/view from each PDF (slow — reads bytes)
     units: dict = {}
     for unit_key, offer_data in offers.items():

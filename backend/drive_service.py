@@ -605,6 +605,7 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
             result["price_raw"] = price_num
             result["price"] = f"AED {price_num:,}"
 
+        # Step 1: "Total Area: X sqft" label on same line (generic format)
         m_total = re.search(
             r"Total\s+Area\s*[\(\[]?SQ\.?\s*FT[\)\]]?\s*[\|:]?\s*([\d,\.]+)",
             text, re.IGNORECASE,
@@ -612,9 +613,19 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
         if m_total:
             result["size"] = m_total.group(1).strip() + " sq.ft"
         else:
-            m = _PDF_SIZE_RE.search(text)
-            if m:
-                result["size"] = m.group(0).strip()
+            # Step 2: SAAS Hills table format: "808.48 Sqft  262.10 Sqft  1,070.58 Sqft"
+            # Suite Area, Balcony Area, Total Area — take the LAST (3rd) value
+            m_three = re.search(
+                r"([\d,\.]+)\s*Sqft\s+([\d,\.]+)\s*Sqft\s+([\d,\.]+)\s*Sqft",
+                text, re.IGNORECASE,
+            )
+            if m_three:
+                result["size"] = m_three.group(3).strip() + " sq.ft"
+            else:
+                # Step 3: fallback — first sqft mention
+                m = _PDF_SIZE_RE.search(text)
+                if m:
+                    result["size"] = m.group(0).strip()
 
         m = _PDF_VIEW_RE.search(text)
         if m:

@@ -1071,8 +1071,9 @@ class AdminAgent:
                     seen.add(unit_num)
 
         # SLOW PATH: Drive scan — only when index is empty (first run, rebuild pending)
+        # NOTE: Never enrich PDFs in slow path — concurrent downloads with build_index crash the process.
+        # User should run "update database" first for price-sorted results.
         if not index_units and svc:
-            # Slow path: scan Drive on-the-fly (fallback when index not built yet)
             for proj in (projects if projects else []):
                 try:
                     drive_idx = await asyncio.to_thread(
@@ -1094,27 +1095,17 @@ class AdminAgent:
                         seen.add(unit_key)
             except Exception:
                 pass
-            # Slow path only: enrich PDFs when price/view filters OR price sorting needed
-            _price_sort = sort_by in (
-                "cheapest", "lowest_price", "ascending", "cheap",
-                "most_expensive", "highest_price", "descending", "expensive",
-            )
-            needs_pdf_read = (price_min is not None or price_max is not None or bool(view) or _price_sort)
-            if needs_pdf_read:
-                enriched_units = []
-                for unit_num, unit_data, proj_name in all_units:
-                    if unit_data.get("file_id"):
-                        try:
-                            unit_data = await asyncio.to_thread(
-                                _drive.enrich_offer_from_pdf, svc, unit_data
-                            )
-                        except Exception:
-                            pass
-                    enriched_units.append((unit_num, unit_data, proj_name))
-                all_units = enriched_units
 
         if not all_units:
             return {"error": "No units found in inventory or Drive"}
+
+        # If price sorting is requested but no prices loaded yet, tell admin to update database
+        _price_sort = sort_by in (
+            "cheapest", "lowest_price", "ascending", "cheap",
+            "most_expensive", "highest_price", "descending", "expensive",
+        )
+        if _price_sort and not any(u[1].get("price_raw") for u in all_units):
+            return {"error": "Prices not loaded yet — say 'update database' first to load prices from PDFs 🔍"}
 
         # Apply filters + sort
         filtered = _filter_unit_list(
