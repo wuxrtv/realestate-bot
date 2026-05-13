@@ -605,9 +605,16 @@ def extract_offer_data_from_pdf(pdf_bytes: bytes) -> dict:
             result["price_raw"] = price_num
             result["price"] = f"AED {price_num:,}"
 
-        m = _PDF_SIZE_RE.search(text)
-        if m:
-            result["size"] = m.group(0).strip()
+        m_total = re.search(
+            r"Total\s+Area\s*[\(\[]?SQ\.?\s*FT[\)\]]?\s*[\|:]?\s*([\d,\.]+)",
+            text, re.IGNORECASE,
+        )
+        if m_total:
+            result["size"] = m_total.group(1).strip() + " sq.ft"
+        else:
+            m = _PDF_SIZE_RE.search(text)
+            if m:
+                result["size"] = m.group(0).strip()
 
         m = _PDF_VIEW_RE.search(text)
         if m:
@@ -693,9 +700,11 @@ def scan_sales_offers(svc, agency_root_id: str = "") -> dict:
                         continue
                     parsed = parse_offer_filename(f["name"])
                     if not parsed:
+                        logger.info(f"Drive: scan_sales_offers — PDF skipped (no pattern match): {f['name']!r}")
                         continue
                     unit_key = f"{parsed['building']}{parsed['unit_number']}"
                     idx[unit_key] = {**parsed, "file_id": f["id"], "filename": f["name"]}
+                    logger.info(f"Drive: scan_sales_offers — indexed: {f['name']!r} → {unit_key}")
 
         logger.info(f"Drive: scan_sales_offers → {len(idx)} offers found")
     except Exception:
