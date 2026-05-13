@@ -870,28 +870,15 @@ async def _send_offer_for_agency(
                 )
         return {"error": "no_pdf"}
 
-    # 3. Generate caption ONCE (1 API call)
-    caption = await _generate_offer_caption(unit_key, unit_data, proj_name, agency=agency)
-    if not caption:
-        admin_nums  = getattr(agency, "wa_admin_numbers", []) or []
-        caption = _format_group_card(
-            unit_key, unit_data, proj_name,
-            admin_name=getattr(agency, "name", ""),
-            admin_phone=admin_nums[0] if admin_nums else "",
-        )
-
-    # 4. Send PDF FIRST, then caption to ALL groups
+    # 3-4. Generate caption + send PDF+caption as ONE message to all groups
     groups = _query_groups(db, agency)
-
-    sent_count = 0
-    for i, group in enumerate(groups):
-        if is_cancelled(agency.id):
-            clear_cancel(agency.id)
-            break
-        if i > 0:
-            await asyncio.sleep(group_delay)
-        await _send_wa_file(group.chat_id, pdf_bytes, filename, caption)
-        sent_count += 1
+    sent_count = await send_unit_to_groups(
+        unit_key, unit_data, proj_name,
+        pdf_bytes, filename,
+        [g.chat_id for g in groups],
+        agency,
+        group_delay=group_delay,
+    )
 
     # 5. Notify admin
     if notify_admin:
@@ -2461,4 +2448,40 @@ async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: 
         if ok:
             sent += 1
     logger.info(f"announce_file_to_wa_groups: sent to {sent}/{len(groups)} groups")
+    return sent
+
+
+async def send_unit_to_groups(
+    unit_key: str,
+    unit_data: dict,
+    proj_name: str,
+    pdf_bytes: bytes,
+    filename: str,
+    group_chat_ids: list,
+    agency,
+    group_delay: int = 20,
+) -> int:
+    """Send one unit as PDF + AI-generated caption (ONE message) to multiple groups.
+
+    This is the single authoritative sender for ALL unit broadcasts — scheduled
+    and manual. Generates caption once via Claude Haiku, falls back to
+    _format_group_card() if Claude fails. Returns number of groups sent to.
+    """
+    caption = await _generate_offer_caption(unit_key, unit_data, proj_name, agency=agency)
+    if not caption:
+        admin_nums = getattr(agency, "wa_admin_numbers", []) or []
+        caption = _format_group_card(
+            unit_key, unit_data, proj_name,
+            admin_name=getattr(agency, "name", ""),
+            admin_phone=admin_nums[0] if admin_nums else "",
+        )
+    sent = 0
+    for i, chat_id in enumerate(group_chat_ids):
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            break
+        if i > 0:
+            await asyncio.sleep(group_delay)
+        await _send_wa_file(chat_id, pdf_bytes, filename, caption)
+        sent += 1
     return sent

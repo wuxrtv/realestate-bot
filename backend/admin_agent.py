@@ -960,7 +960,6 @@ class AdminAgent:
                 logger.exception(f"PDF download failed for {filename}")
 
         if not pdf_bytes:
-            # No PDF — notify admin, skip unit (no text-only fallback)
             msg = (
                 f"Habibi PDF not found for *{label}* — can you check Drive? 🙏\n"
                 f"File: {filename or 'no file associated'}"
@@ -969,19 +968,29 @@ class AdminAgent:
                 await whatsapp_bot._send_wa(chat_id, msg)
             return {"error": "no_pdf", "unit": label}
 
-        # Send PDF FIRST
         if send_to == "groups":
-            await whatsapp_bot.announce_file_to_wa_groups(db, pdf_bytes, filename, "", agency)
+            # ALL group sends: PDF + AI caption as ONE message — same format as auto broadcast
+            from models import WhatsAppGroup
+            groups = db.query(WhatsAppGroup).filter(
+                WhatsAppGroup.active == True,
+                WhatsAppGroup.agency_id == agency.id,
+            ).all()
+            sent_count = await whatsapp_bot.send_unit_to_groups(
+                u_num, unit_info, proj_name_found,
+                pdf_bytes, filename,
+                [g.chat_id for g in groups],
+                agency,
+            )
+            if chat_id:
+                await whatsapp_bot._send_wa(
+                    chat_id,
+                    f"Khalas! *{label}* blasted to {sent_count} group(s) wallah 💥✅"
+                )
         else:
-            await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, filename)
-
-        await asyncio.sleep(1)
-
-        # Send confirmation text SECOND
-        if send_to == "groups":
-            await whatsapp_bot.announce_to_wa_groups(db, confirm, agency)
-        else:
+            # Admin chat: confirm text first so they see details, then PDF
             await whatsapp_bot._send_wa(chat_id, confirm)
+            await asyncio.sleep(1)
+            await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, filename)
 
         return {
             "sent": True,
@@ -1137,23 +1146,8 @@ class AdminAgent:
         # Determine destinations
         chat_id = getattr(self, "_chat_id", "")
         if send_to == "admin":
-            # Send to admin private chat only
             if not chat_id:
                 return {"error": "No admin chat_id"}
-            summary_lines = [f"🔥 {len(picks)} unit(s):"]
-            for unit_num, unit_data, proj_name in picks:
-                bld = unit_data.get("building", "")
-                floor_val = unit_data.get("floor") or _get_floor(unit_num, unit_data)
-                u_type = unit_data.get("unit_type", "")
-                price = _parse_price(unit_data)
-                label = f"{bld}-{unit_num}" if bld else unit_num
-                line = f"• {label}"
-                if floor_val: line += f" — Floor {floor_val}"
-                if u_type: line += f" — {u_type}"
-                if price: line += f" — AED {int(price):,}".replace(",", " ")
-                summary_lines.append(line)
-            await whatsapp_bot._send_wa(chat_id, "\n".join(summary_lines))
-            await asyncio.sleep(1)
             sent_count = 0
             for unit_num, unit_data, proj_name in picks:
                 if whatsapp_bot.is_cancelled(agency.id):
@@ -1172,11 +1166,16 @@ class AdminAgent:
                         f"Habibi PDF not found for *{unit_num}* — skipping 😅 Check Drive 🙏"
                     )
                     continue
-                # PDF FIRST
-                await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname)
-                await asyncio.sleep(1)
-                # Unit card SECOND
-                await whatsapp_bot._send_wa(chat_id, format_unit_card(unit_num, unit_data, proj_name))
+                # PDF + caption as ONE message (same format as groups)
+                caption = await whatsapp_bot._generate_offer_caption(unit_num, unit_data, proj_name, agency=agency)
+                if not caption:
+                    admin_nums = getattr(agency, "wa_admin_numbers", []) or []
+                    caption = whatsapp_bot._format_group_card(
+                        unit_num, unit_data, proj_name,
+                        admin_name=getattr(agency, "name", ""),
+                        admin_phone=admin_nums[0] if admin_nums else "",
+                    )
+                await whatsapp_bot._send_wa_file(chat_id, pdf_bytes, fname, caption)
                 await asyncio.sleep(2)
                 sent_count += 1
             return {"sent_to_admin": True, "units_sent": sent_count, "units": [u[0] for u in picks]}
@@ -1216,6 +1215,20 @@ class AdminAgent:
         if not ready_units:
             return {"error": "No units with downloadable PDFs found — check Drive"}
 
+        # Pre-generate captions ONCE per unit (not repeated per group)
+        units_with_captions = []
+        for unit_num, unit_data, proj_name, pdf_bytes, fname in ready_units:
+            caption = await whatsapp_bot._generate_offer_caption(unit_num, unit_data, proj_name, agency=agency)
+            if not caption:
+                admin_nums = getattr(agency, "wa_admin_numbers", []) or []
+                caption = whatsapp_bot._format_group_card(
+                    unit_num, unit_data, proj_name,
+                    admin_name=getattr(agency, "name", ""),
+                    admin_phone=admin_nums[0] if admin_nums else "",
+                )
+            units_with_captions.append((unit_num, pdf_bytes, fname, caption))
+
+        # Send to groups: PDF + caption as ONE message per unit — no header, no separate text
         whatsapp_bot.clear_cancel(agency.id)
         sent_groups = 0
         for i, group in enumerate(groups):
@@ -1224,34 +1237,9 @@ class AdminAgent:
                 break
             if i > 0:
                 await asyncio.sleep(30)
-
-            # Summary header
-            summary_lines = [f"🔥 {len(ready_units)} unit(s) incoming:"]
-            for unit_num, unit_data, proj_name, _, _ in ready_units:
-                bld = unit_data.get("building", "")
-                floor_val = unit_data.get("floor") or _get_floor(unit_num, unit_data)
-                u_type = unit_data.get("unit_type", "")
-                price = _parse_price(unit_data)
-                label = f"{bld}-{unit_num}" if bld else unit_num
-                line = f"• {label}"
-                if floor_val:
-                    line += f" — Floor {floor_val}"
-                if u_type:
-                    line += f" — {u_type}"
-                if price:
-                    line += f" — AED {int(price):,}".replace(",", " ")
-                summary_lines.append(line)
-            await whatsapp_bot._send_wa(group.chat_id, "\n".join(summary_lines))
-            await asyncio.sleep(2)
-
-            # Send PDF FIRST, unit card SECOND for each unit
-            for unit_num, unit_data, proj_name, pdf_bytes, fname in ready_units:
-                await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname)
-                await asyncio.sleep(1)
-                card = format_unit_card(unit_num, unit_data, proj_name)
-                await whatsapp_bot._send_wa(group.chat_id, card)
-                await asyncio.sleep(2)
-
+            for unit_num, pdf_bytes, fname, caption in units_with_captions:
+                await whatsapp_bot._send_wa_file(group.chat_id, pdf_bytes, fname, caption)
+                await asyncio.sleep(3)
             sent_groups += 1
 
         return {
