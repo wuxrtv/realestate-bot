@@ -2357,6 +2357,7 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
             all_units = [
                 (key, data, data.get("project_name", "Unknown"))
                 for key, data in offers.items()
+                if not key.startswith("_raw_")  # skip non-standard entries without metadata
             ]
             # Type filter: check type columns first, then search all values
             if requested_type and all_units:

@@ -177,6 +177,8 @@ def search_units(
     units = load_index(agency_id)
     results = []
     for unit_key, data in units.items():
+        if unit_key.startswith("_raw_"):
+            continue  # not yet re-keyed — skip until build_index completes
         proj_name = data.get("project_name", "Unknown")
 
         if query:
