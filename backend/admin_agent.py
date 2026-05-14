@@ -17,6 +17,24 @@ from sqlalchemy.orm.attributes import flag_modified
 
 from models import AdminConversation, ToniProject
 
+# Broadcast dedup: {agency_id: {date_str: set(unit_keys)}}
+_broadcast_sent: dict[int, dict[str, set]] = {}
+
+
+def _get_sent_today(agency_id: int) -> set:
+    from datetime import date
+    today = date.today().isoformat()
+    return set(_broadcast_sent.get(agency_id, {}).get(today, set()))
+
+
+def _record_sent(agency_id: int, unit_keys: list):
+    from datetime import date
+    today = date.today().isoformat()
+    agency_data = _broadcast_sent.setdefault(agency_id, {})
+    for old in [d for d in list(agency_data.keys()) if d != today]:
+        del agency_data[old]
+    agency_data.setdefault(today, set()).update(unit_keys)
+
 
 def _get_floor(unit_num: str, unit_data: dict) -> Optional[int]:
     """Get floor for a unit: explicit column first, then calculated from unit number.
@@ -1128,6 +1146,19 @@ class AdminAgent:
             if view: criteria.append(f"view={view}")
             return {"error": f"No units match criteria: {', '.join(criteria)}"}
 
+        # ── Dedup: skip units already broadcast to groups today ───────────────
+        skipped_dedup = 0
+        all_already_sent = False
+        if send_to == "groups":
+            sent_today = _get_sent_today(agency.id)
+            if sent_today:
+                fresh = [u for u in filtered if u[0] not in sent_today]
+                skipped_dedup = len(filtered) - len(fresh)
+                if fresh:
+                    filtered = fresh
+                else:
+                    all_already_sent = True  # all matching units sent today — proceed anyway
+
         if send_all:
             picks = filtered
         elif sort_by:
@@ -1257,11 +1288,20 @@ class AdminAgent:
                 await asyncio.sleep(3)
             sent_groups += 1
 
-        return {
+        # Record sent units for future dedup
+        if ready_units:
+            _record_sent(agency.id, [u[0] for u in ready_units])
+
+        result: dict = {
             "sent_to_groups": sent_groups,
             "units_sent": len(ready_units),
             "units": [u[0] for u in ready_units],
         }
+        if skipped_dedup:
+            result["skipped_already_sent_today"] = skipped_dedup
+        if all_already_sent:
+            result["note"] = "All matching units were already sent today — sent again anyway"
+        return result
 
     def _list_projects(self, db: Session, agency) -> dict:
         projects = (
