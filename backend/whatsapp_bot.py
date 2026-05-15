@@ -328,6 +328,162 @@ _REALESTATE_TRIGGERS = re.compile(
 _AUDIO_TYPES = frozenset({"audioMessage", "pttMessage"})
 _WA_BASE = "https://api.green-api.com"
 
+# ─── Availability broadcast helpers ───────────────────────────────────────────
+
+_TYPE_ALIASES = {
+    "studio": "Studio",
+    "st": "Studio",
+    "1b": "1 Bedroom",
+    "1br": "1 Bedroom",
+    "1bed": "1 Bedroom",
+    "1 bed": "1 Bedroom",
+    "1 bedroom": "1 Bedroom",
+    "2b": "2 Bedroom",
+    "2br": "2 Bedroom",
+    "2bed": "2 Bedroom",
+    "2 bed": "2 Bedroom",
+    "2 bedroom": "2 Bedroom",
+    "3b": "3 Bedroom",
+    "3br": "3 Bedroom",
+    "3bed": "3 Bedroom",
+    "3 bed": "3 Bedroom",
+    "3 bedroom": "3 Bedroom",
+    "4b": "4 Bedroom",
+    "4br": "4 Bedroom",
+    "4 bedroom": "4 Bedroom",
+    "sky villa": "Sky Villa",
+    "penthouse": "Sky Villa",
+    "ph": "Sky Villa",
+    "villa": "Sky Villa",
+}
+
+_TYPE_ORDER = ["Studio", "1 Bedroom", "2 Bedroom", "3 Bedroom", "4 Bedroom", "Sky Villa"]
+
+
+def _classify_unit_type(unit_data: dict) -> str:
+    """Return canonical type label from unit dict."""
+    for k, v in unit_data.items():
+        if any(kw in k.lower() for kw in ("type", "тип", "bed", "room", "layout", "unit_type")):
+            raw = str(v).lower().strip()
+            if raw in _TYPE_ALIASES:
+                return _TYPE_ALIASES[raw]
+            for alias, canonical in _TYPE_ALIASES.items():
+                if alias in raw:
+                    return canonical
+    # fallback: scan all values
+    combined = " ".join(str(v).lower() for v in unit_data.values())
+    for alias, canonical in _TYPE_ALIASES.items():
+        if alias in combined:
+            return canonical
+    return "Other"
+
+
+def _build_availability_summary(unit_index: dict) -> dict:
+    """Return {type_label: {count, min_price}} from unit_index."""
+    from admin_agent import _parse_price
+    summary: dict[str, dict] = {}
+    for unit_num, unit_data in unit_index.items():
+        label = _classify_unit_type(unit_data)
+        price = _parse_price(unit_data)
+        if label not in summary:
+            summary[label] = {"count": 0, "min_price": None}
+        summary[label]["count"] += 1
+        if price and (summary[label]["min_price"] is None or price < summary[label]["min_price"]):
+            summary[label]["min_price"] = price
+    return summary
+
+
+async def _generate_availability_broadcast(
+    project_name: str,
+    summary: dict,
+    admin_name: str,
+    admin_phone: str,
+) -> str:
+    """Ask Claude to generate Tony-style availability broadcast text."""
+    lines = []
+    for label in _TYPE_ORDER + [k for k in summary if k not in _TYPE_ORDER]:
+        if label not in summary:
+            continue
+        d = summary[label]
+        price_str = f"from AED {d['min_price']:,.0f}" if d["min_price"] else "price on request"
+        lines.append(f"{label}: {d['count']} units — {price_str}")
+    total = sum(d["count"] for d in summary.values())
+    summary_text = "\n".join(lines)
+
+    prompt = (
+        f"You are Tony — Dubai real estate AI sales assistant.\n"
+        f"Generate a WhatsApp broadcast message for agents in groups.\n\n"
+        f"Project: {project_name or 'our project'}\n"
+        f"Availability:\n{summary_text}\nTotal: {total} units\n\n"
+        f"Admin contact: {admin_name} — {admin_phone}\n\n"
+        f"Rules:\n"
+        f"- Tony character: habibi, wallah, yalla — max 2 per message\n"
+        f"- Motivating, energetic, sales-focused\n"
+        f"- Show each type with count and min price on separate line with emoji\n"
+        f"- Total units at bottom\n"
+        f"- One motivating closing line\n"
+        f"- End with admin contact\n"
+        f"- English only\n"
+        f"- Max 20 lines\n"
+        f"- Output ONLY the message text — no JSON, no quotes, no explanation"
+    )
+    try:
+        ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+        resp = await ai.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=600,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip()
+    except Exception:
+        logger.exception("_generate_availability_broadcast: Claude error")
+        # Fallback: plain text summary
+        contact_line = f"\n📞 {admin_name}: {admin_phone}" if admin_phone else ""
+        return (
+            f"🔥 Fresh inventory — {project_name}!\n\n"
+            + summary_text
+            + f"\n\nTotal: {total} units available 💎"
+            + contact_line
+        )
+
+
+async def _broadcast_availability(
+    chat_id: str,
+    file_bytes: bytes,
+    file_name: str,
+    project_name: str,
+    unit_index: dict,
+    agency,
+    db,
+) -> tuple[int, str]:
+    """Send availability summary text → then PDF to all groups.
+    Returns (groups_count, broadcast_text).
+    """
+    admin_nums = getattr(agency, "wa_admin_numbers", []) or []
+    admin_phone = f"+{str(admin_nums[0]).lstrip('+')}" if admin_nums else ""
+    admin_name = getattr(agency, "name", "") or "Admin"
+
+    summary = _build_availability_summary(unit_index)
+    broadcast_text = await _generate_availability_broadcast(
+        project_name, summary, admin_name, admin_phone
+    )
+
+    groups = _query_groups(db, agency)
+    sent = 0
+    for i, g in enumerate(groups):
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            break
+        if i > 0:
+            await asyncio.sleep(5)
+        await _send_wa(g.chat_id, broadcast_text)
+        await asyncio.sleep(1)
+        await _send_wa_file(g.chat_id, file_bytes, file_name)
+        sent += 1
+
+    return sent, broadcast_text
+
+
 # ─── Discount / Lead notification system ──────────────────────────────────────
 
 _SPECIALIST_PHONE = "+971 58 581 6776"
@@ -1416,10 +1572,12 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                        "Tony will find it automatically 🔥")
         return
 
-    # ── 3. Availability / inventory PDF → auto broadcast ALL groups + save ──────
-    #    No questions. Admin sent it = broadcast it. Khalas.
+    # ── 3. Availability / inventory PDF → parse → Claude summary → broadcast + save
     if is_pdf and is_inventory:
-        await _send_wa(chat_id, "Got it habibi! Sending now 🔥")
+        # Instant ack — within 3 seconds
+        await _send_wa(chat_id,
+                       "Got it habibi! 📥 Reading the file...\n"
+                       "Blasting to groups right after khalas 🔥")
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 file_bytes = (await client.get(download_url)).content
@@ -1427,51 +1585,61 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
             await _send_wa(chat_id, "❌ Download failed habibi 😅")
             return
 
-        n = await announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
-        await _send_wa(chat_id,
-                       f"✅ Availability sent to {n} group(s) khalas!\n"
-                       "Saving to database now 📖")
-
-        # Save to DB (parse table data — silent if PDF has no parseable table)
+        # Parse to extract unit counts + prices
         try:
             sheets_data = parse_pdf(file_bytes)
         except Exception:
             sheets_data = {}
+        unit_index = build_unit_index(sheets_data) if sheets_data else {}
+        proj_name = _project_name_from_file(file_name)
 
-        if sheets_data:
-            unit_index = build_unit_index(sheets_data)
-            if unit_index:
-                name = _project_name_from_file(file_name)
-                existing = (db.query(ToniProject)
-                            .filter(ToniProject.project_name == name,
-                                    ToniProject.is_active == True,
-                                    ToniProject.agency_id == agency.id)
-                            .first())
-                if existing:
-                    diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
-                    report = format_diff_report(diff, name)
-                    new_ver = existing.version + 1
-                    existing.is_active = False
-                    db.flush()
-                    db.add(ToniProject(project_name=name, version=new_ver,
-                                       sheet_count=len(sheets_data), unit_count=len(unit_index),
-                                       sheets_data=sheets_data, unit_index=unit_index,
-                                       is_active=True, uploaded_at=_dt.now(),
-                                       uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
-                    db.commit()
-                    await _send_wa(chat_id,
-                                   f"📊 *{name}* updated → v{new_ver}\n"
-                                   f"Units: {len(unit_index)}\n\n{report}")
-                else:
-                    db.add(ToniProject(project_name=name, version=1,
-                                       sheet_count=len(sheets_data), unit_count=len(unit_index),
-                                       sheets_data=sheets_data, unit_index=unit_index,
-                                       is_active=True, uploaded_at=_dt.now(),
-                                       uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
-                    db.commit()
-                    await _send_wa(chat_id, f"📊 *{name}* saved! {len(unit_index)} units 🔥")
-                import drive_service as _drive
-                _drive.clear_cache()
+        if unit_index:
+            # Broadcast: Claude-generated summary text first, then PDF
+            n, broadcast_text = await _broadcast_availability(
+                chat_id, file_bytes, file_name, proj_name, unit_index, agency, db
+            )
+        else:
+            # No parseable table — send PDF directly
+            n = await announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
+            broadcast_text = ""
+
+        # Save to DB
+        if unit_index:
+            existing = (db.query(ToniProject)
+                        .filter(ToniProject.project_name == proj_name,
+                                ToniProject.is_active == True,
+                                ToniProject.agency_id == agency.id)
+                        .first())
+            if existing:
+                diff = diff_unit_indexes(existing.unit_index or {}, unit_index)
+                report = format_diff_report(diff, proj_name)
+                new_ver = existing.version + 1
+                existing.is_active = False
+                db.flush()
+                db.add(ToniProject(project_name=proj_name, version=new_ver,
+                                   sheet_count=len(sheets_data), unit_count=len(unit_index),
+                                   sheets_data=sheets_data, unit_index=unit_index,
+                                   is_active=True, uploaded_at=_dt.now(),
+                                   uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
+            else:
+                report = ""
+                db.add(ToniProject(project_name=proj_name, version=1,
+                                   sheet_count=len(sheets_data), unit_count=len(unit_index),
+                                   sheets_data=sheets_data, unit_index=unit_index,
+                                   is_active=True, uploaded_at=_dt.now(),
+                                   uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
+            db.commit()
+            import drive_service as _drive
+            _drive.clear_cache()
+
+        # Report to admin
+        admin_report = (
+            f"✅ Sent to {n} groups wallah! 🔥\n"
+            f"Here's what went out 👇\n\n"
+            f"{broadcast_text}" if broadcast_text
+            else f"✅ Sent to {n} groups khalas! 🔥"
+        )
+        await _send_wa(chat_id, admin_report)
         return
 
     # ── 4. PDF — admin says "send" → forward to groups ───────────────────────
@@ -1544,6 +1712,12 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                            "Check the table format — need Unit No, Price columns 🙏")
             return
 
+        # Broadcast: Claude-generated summary text first, then file
+        n, broadcast_text = await _broadcast_availability(
+            chat_id, file_bytes, file_name, name, unit_index, agency, db
+        )
+
+        # Save to DB
         existing = (db.query(ToniProject)
                     .filter(ToniProject.project_name == name,
                             ToniProject.is_active == True,
@@ -1561,9 +1735,7 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                                is_active=True, uploaded_at=_dt.now(),
                                uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
             db.commit()
-            await _send_wa(chat_id,
-                           f"🔄 *{name}* updated → v{new_ver}\n"
-                           f"Units: {len(unit_index)}\n\n{report}")
+            db_note = f"📊 *{name}* updated → v{new_ver} ({len(unit_index)} units)\n\n{report}"
         else:
             db.add(ToniProject(project_name=name, version=1,
                                sheet_count=len(sheets_data), unit_count=len(unit_index),
@@ -1571,10 +1743,19 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                                is_active=True, uploaded_at=_dt.now(),
                                uploaded_by=f"wa_{sender_phone}", agency_id=agency.id))
             db.commit()
-            await _send_wa(chat_id, f"✅ *{name}* saved! {len(unit_index)} units 🔥")
+            db_note = f"📊 *{name}* saved — {len(unit_index)} units in database 🔥"
 
         import drive_service as _drive
         _drive.clear_cache()
+
+        # Report to admin: groups sent + what went out + DB note
+        admin_report = (
+            f"✅ Sent to {n} groups wallah! 🔥\n"
+            f"Here's what went out 👇\n\n"
+            f"{broadcast_text}\n\n"
+            f"━━━\n{db_note}"
+        )
+        await _send_wa(chat_id, admin_report)
         return
 
     # ── 6. Unknown PDF — ask clearly, remember file for next message ────────────
