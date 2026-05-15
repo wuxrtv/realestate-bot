@@ -1001,17 +1001,18 @@ async def _friday_broadcast_for_agency(agency: Agency, db: Session):
         if i > 0:
             await asyncio.sleep(20)  # 20-sec interval between groups
 
-        for proj_name, loc_text, media_files in packages:
-            greeting = (
-                f"🕌 Happy Friday habibi!\n"
-                f"Here's everything you need about {proj_name} 👇\n"
-                f"Khalas — save it, share it, use it! 🔥"
-            )
-            await _send_wa(group.chat_id, greeting)
+        await _send_wa(
+            group.chat_id,
+            "🕌 Happy Friday habibi!\n"
+            "Here's everything you need 👇\n"
+            "Khalas — save it, share it, use it! 🔥"
+        )
+        await asyncio.sleep(1)
 
+        for proj_name, loc_text, media_files in packages:
             if loc_text:
-                await asyncio.sleep(1)
                 await _send_wa(group.chat_id, loc_text)
+                await asyncio.sleep(1)
 
             for file_id, file_name, export_mime in media_files:
                 file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
