@@ -1029,22 +1029,41 @@ async def _friday_broadcast_for_agency(agency: Agency, db: Session):
         logger.info(f"Friday broadcast: agency={agency.slug} groups={groups_sent}")
 
 
+def _friday_flag_path(agency_id: int, date_str: str) -> str:
+    data_dir = os.path.join(os.path.dirname(__file__), "data")
+    os.makedirs(data_dir, exist_ok=True)
+    return os.path.join(data_dir, f"friday_sent_{agency_id}_{date_str}.flag")
+
+
+def _friday_already_sent(agency_id: int, date_str: str) -> bool:
+    return os.path.exists(_friday_flag_path(agency_id, date_str))
+
+
+def _mark_friday_sent(agency_id: int, date_str: str):
+    path = _friday_flag_path(agency_id, date_str)
+    try:
+        with open(path, "w") as f:
+            f.write(datetime.utcnow().isoformat())
+    except Exception:
+        logger.warning(f"Could not write friday flag: {path}")
+
+
 async def send_friday_broadcast():
     """Friday 13:00 Dubai time — full project package to all groups."""
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
+
     db = SessionLocal()
     try:
         agencies = db.query(Agency).filter(Agency.is_active == True).all()
         for agency in agencies:
             if not os.getenv("WA_INSTANCE_ID"):
                 continue
-            # Dedup: skip if already sent today (handles scheduler firing multiple times)
-            from datetime import datetime as _dt
-            today = _dt.now().strftime("%Y-%m-%d")
-            flag_key = f"friday_sent_{agency.id}_{today}"
-            if _day_state(agency.id).get(flag_key):
+            # Persistent file flag — survives Railway restarts
+            if _friday_already_sent(agency.id, today):
                 logger.info(f"Friday broadcast already sent today for agency {agency.id} — skipping")
                 continue
-            _day_state(agency.id)[flag_key] = True  # mark BEFORE sending
+            _mark_friday_sent(agency.id, today)  # write flag BEFORE sending
 
             clear_cancel(agency.id)
             try:
