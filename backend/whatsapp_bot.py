@@ -1037,6 +1037,15 @@ async def send_friday_broadcast():
         for agency in agencies:
             if not os.getenv("WA_INSTANCE_ID"):
                 continue
+            # Dedup: skip if already sent today (handles scheduler firing multiple times)
+            from datetime import datetime as _dt
+            today = _dt.now().strftime("%Y-%m-%d")
+            flag_key = f"friday_sent_{agency.id}_{today}"
+            if _day_state(agency.id).get(flag_key):
+                logger.info(f"Friday broadcast already sent today for agency {agency.id} — skipping")
+                continue
+            _day_state(agency.id)[flag_key] = True  # mark BEFORE sending
+
             clear_cancel(agency.id)
             try:
                 await _friday_broadcast_for_agency(agency, db)

@@ -83,7 +83,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(whatsapp_bot.send_daily_offer_11am,     "cron", hour=11, minute=0,  id="wa_offer_11am")
     scheduler.add_job(whatsapp_bot.send_daily_offer_14pm,     "cron", hour=14, minute=0,  id="wa_offer_14pm")
     scheduler.add_job(whatsapp_bot.send_daily_offer_17pm,     "cron", hour=17, minute=0,  id="wa_offer_17pm")
-    scheduler.add_job(whatsapp_bot.send_friday_broadcast,     "cron", day_of_week="fri", hour=13, minute=0, id="wa_friday_broadcast")
+    scheduler.add_job(whatsapp_bot.send_friday_broadcast,     "cron", day_of_week="fri", hour=13, minute=0, id="wa_friday_broadcast", coalesce=True, max_instances=1, misfire_grace_time=60)
     scheduler.add_job(_rebuild_all_indexes,                    "cron", hour=7,  minute=0,  id="rebuild_index")
     scheduler.start()
     logger.info("Scheduler started")
