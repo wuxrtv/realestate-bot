@@ -64,12 +64,46 @@ def _day_state(agency_id: int) -> dict:
     from datetime import datetime as _dt
     key = f"{agency_id}_{_dt.now().strftime('%Y-%m-%d')}"
     if key not in _daily:
-        _daily[key] = {"morning_replied": False, "follow_up_sent": False}
+        _daily[key] = {
+            "morning_replied": False,
+            "follow_up_sent": False,
+            "broadcasts_sent": [],       # [{slot, type, unit, groups, time}]
+            "questions_count": 0,
+            "hot_leads": [],             # [{group, question}]
+            "group_activity": {},        # {group_name: count}
+            "availability_sent": False,
+            "availability_groups": [],   # [group_title, ...]
+        }
     return _daily[key]
 
 
 def mark_admin_active(agency_id: int):
     _day_state(agency_id)["morning_replied"] = True
+
+
+def _track_broadcast(agency_id: int, slot: str, unit_type: str, unit_key: str, groups_count: int):
+    from datetime import datetime as _dt
+    _day_state(agency_id)["broadcasts_sent"].append({
+        "slot": slot, "type": unit_type, "unit": unit_key,
+        "groups": groups_count, "time": _dt.now().strftime("%H:%M"),
+    })
+
+
+def _track_availability(agency_id: int, group_names: list):
+    state = _day_state(agency_id)
+    state["availability_sent"] = True
+    state["availability_groups"] = list(group_names)
+
+
+def _track_question(agency_id: int, group_name: str):
+    state = _day_state(agency_id)
+    state["questions_count"] = state.get("questions_count", 0) + 1
+    gact = state.setdefault("group_activity", {})
+    gact[group_name] = gact.get(group_name, 0) + 1
+
+
+def _track_hot_lead(agency_id: int, group_name: str, question: str):
+    _day_state(agency_id)["hot_leads"].append({"group": group_name, "question": question[:100]})
 
 
 # ─── Group conversation context (RAM only, max 3 exchanges, no DB) ────────────
@@ -378,6 +412,68 @@ def _classify_unit_type(unit_data: dict) -> str:
     return "Other"
 
 
+def parse_availability_summary(pdf_bytes: bytes) -> dict:
+    """Parse availability PDF table directly with pdfplumber.
+    Groups rows by bedroom/type column, counts units and finds min price per type.
+    Returns {type_label: {count, min_price}, "total": N} or {} if not parseable.
+    """
+    try:
+        import pdfplumber
+        import io as _io
+    except ImportError:
+        return {}
+
+    summary: dict = {}
+    _TYPE_KWS = ("bedroom", "bedrooms", "type", "unit type", "br", "layout")
+    _PRICE_KWS = ("price", "aed", "amount", "total price", "value", "selling")
+
+    try:
+        with pdfplumber.open(_io.BytesIO(pdf_bytes)) as pdf:
+            for page in pdf.pages:
+                for table in (page.extract_tables() or []):
+                    if not table or len(table) < 2:
+                        continue
+                    header = [str(c or "").strip().lower() for c in table[0]]
+                    type_col = next((i for i, h in enumerate(header) if any(k in h for k in _TYPE_KWS)), None)
+                    price_col = next((i for i, h in enumerate(header) if any(k in h for k in _PRICE_KWS)), None)
+                    if type_col is None:
+                        continue
+                    for row in table[1:]:
+                        if not row or len(row) <= type_col:
+                            continue
+                        raw = str(row[type_col] or "").strip()
+                        if not raw or raw.lower() in ("", "nan", "none", "-", "type"):
+                            continue
+                        label = _TYPE_ALIASES.get(raw.lower(), "")
+                        if not label:
+                            for alias, canonical in _TYPE_ALIASES.items():
+                                if alias in raw.lower():
+                                    label = canonical
+                                    break
+                        if not label:
+                            label = raw.title()
+                        price = None
+                        if price_col is not None and len(row) > price_col:
+                            try:
+                                price = float(re.sub(r"[^\d.]", "", str(row[price_col] or "")))
+                                if price < 10_000:
+                                    price = None
+                            except (ValueError, TypeError):
+                                pass
+                        if label not in summary:
+                            summary[label] = {"count": 0, "min_price": None}
+                        summary[label]["count"] += 1
+                        if price and (summary[label]["min_price"] is None or price < summary[label]["min_price"]):
+                            summary[label]["min_price"] = price
+    except Exception:
+        logger.exception("parse_availability_summary error")
+        return {}
+
+    if summary:
+        summary["total"] = sum(v["count"] for v in summary.values() if isinstance(v, dict))
+    return summary
+
+
 def _build_availability_summary(unit_index: dict) -> dict:
     """Return {type_label: {count, min_price}} from unit_index."""
     from admin_agent import _parse_price
@@ -401,13 +497,16 @@ async def _generate_availability_broadcast(
 ) -> str:
     """Ask Claude to generate Tony-style availability broadcast text."""
     lines = []
-    for label in _TYPE_ORDER + [k for k in summary if k not in _TYPE_ORDER]:
+    type_keys = [k for k in summary if k != "total"]
+    for label in _TYPE_ORDER + [k for k in type_keys if k not in _TYPE_ORDER]:
         if label not in summary:
             continue
         d = summary[label]
+        if not isinstance(d, dict):
+            continue
         price_str = f"from AED {d['min_price']:,.0f}" if d["min_price"] else "price on request"
         lines.append(f"{label}: {d['count']} units — {price_str}")
-    total = sum(d["count"] for d in summary.values())
+    total = summary.get("total") or sum(d["count"] for d in summary.values() if isinstance(d, dict))
     summary_text = "\n".join(lines)
 
     prompt = (
@@ -463,13 +562,18 @@ async def _broadcast_availability(
     admin_phone = f"+{str(admin_nums[0]).lstrip('+')}" if admin_nums else ""
     admin_name = getattr(agency, "name", "") or "Admin"
 
-    summary = _build_availability_summary(unit_index)
+    # Try direct PDF table parsing first (more accurate for availability sheets)
+    summary = parse_availability_summary(file_bytes) if file_bytes else {}
+    if not summary:
+        summary = _build_availability_summary(unit_index)
+
     broadcast_text = await _generate_availability_broadcast(
         project_name, summary, admin_name, admin_phone
     )
 
     groups = _query_groups(db, agency)
     sent = 0
+    sent_group_names: list[str] = []
     for i, g in enumerate(groups):
         if is_cancelled(agency.id):
             clear_cancel(agency.id)
@@ -480,7 +584,9 @@ async def _broadcast_availability(
         await asyncio.sleep(1)
         await _send_wa_file(g.chat_id, file_bytes, file_name)
         sent += 1
+        sent_group_names.append(g.title or g.chat_id)
 
+    _track_availability(agency.id, sent_group_names)
     return sent, broadcast_text
 
 
@@ -1053,6 +1159,7 @@ async def _send_offer_for_agency(
             for phone in (agency.wa_admin_numbers or []):
                 await _send_wa(f"{phone}@c.us", admin_msg)
 
+    _track_broadcast(agency.id, slot_label, unit_type, unit_key, sent_count)
     logger.info(f"Daily offer [{slot_label}]: unit={unit_key} sent to {sent_count} groups")
     return {"unit": unit_key, "caption": caption, "sent": sent_count}
 
@@ -2072,6 +2179,11 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                 }
                 logger.info(f"Pending brochure set: chat={chat_id} project={project_name}")
 
+    if intent != "off_topic":
+        _track_question(agency.id, group_title)
+        if intent == "discount_inquiry":
+            _track_hot_lead(agency.id, group_title, text)
+
     history.append({"role": "assistant", "content": raw})
     _save_group_context(agency.id, chat_id, history)
 
@@ -2605,6 +2717,114 @@ async def _respond_search(chat_id: str, keywords: list, projects: list, agency: 
     # ── Nothing found ────────────────────────────────────────────────────────
     type_hint = f" {requested_type.upper()}" if requested_type else ""
     await _send_wa(chat_id, f"Habibi no{type_hint} units found 😅 Contact {contact} 🙏")
+
+
+# ─── Daily report ────────────────────────────────────────────────────────────
+
+_DAILY_REPORT_CLOSINGS = [
+    "Wallah habibi good day 💪 Inshallah tomorrow even better 🤲",
+    "Khalas habibi — Tony did his job 😎 8AM we go again 🔥",
+    "Quiet day wallah 😅 But we showed up — yalla tomorrow! 💪",
+    "Habibi we moved — that's what matters. See you at 8 inshallah 🙏",
+    "Wallah another day done. Tony never sleeps habibi 👀 8AM sharp 🔥",
+    "Yalla habibi — solid day. Rest up, tomorrow we go harder 💪",
+    "Khalas — the work is done. Inshallah big deals tomorrow 🤲",
+]
+
+
+async def _send_daily_report_for_agency(agency, db):
+    import pdf_index as _idx
+    from datetime import datetime as _dt
+
+    state = _day_state(agency.id)
+    now = _dt.now()
+    day_str = now.strftime("%A, %d %B %Y")
+
+    avail_sent = state.get("availability_sent", False)
+    avail_groups = state.get("availability_groups", [])
+    broadcasts = state.get("broadcasts_sent", [])
+    questions = state.get("questions_count", 0)
+    hot_leads = state.get("hot_leads", [])
+    group_activity = state.get("group_activity", {})
+    most_active = max(group_activity, key=group_activity.get) if group_activity else "—"
+
+    # Availability block
+    avail_block = "📋 Availability: " + ("✅ Sent" if avail_sent else "❌ Not sent today")
+    if avail_sent and avail_groups:
+        avail_block += f"\n▪️ Groups: {len(avail_groups)}"
+        for g in avail_groups:
+            avail_block += f"\n▪️ {g}"
+
+    # Offer slots
+    slot_map: dict = {}
+    for b in broadcasts:
+        s = b.get("slot", "")
+        if "11AM" in s or "11" in s:
+            slot_map.setdefault("11AM", b)
+        elif "2PM" in s or "14" in s:
+            slot_map.setdefault("2PM", b)
+        elif "5PM" in s or "17" in s:
+            slot_map.setdefault("5PM", b)
+
+    def _slot_line(key: str, emoji: str) -> str:
+        b = slot_map.get(key)
+        if b:
+            return f"{emoji} {key} — {b['type']}: {b['unit']}\n▪️ Sent to {b['groups']} groups"
+        return f"{emoji} {key} — Not sent today"
+
+    # DB info
+    info = _idx.index_info(agency.id)
+    units_count = info.get("count", 0)
+    built_at = (info.get("built_at", "") or "")[:16].replace("T", " ")
+
+    closing = random.choice(_DAILY_REPORT_CLOSINGS)
+
+    report = (
+        f"📊 Daily Report — {day_str}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📤 BROADCASTS TODAY\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"{avail_block}\n\n"
+        f"{_slot_line('11AM', '🏠')}\n\n"
+        f"{_slot_line('2PM', '🛏️')}\n\n"
+        f"{_slot_line('5PM', '🛏️🛏️')}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"💬 GROUP ACTIVITY\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"❓ Questions received: {questions}\n"
+        f"🔥 Hot leads: {len(hot_leads)}\n"
+        f"📱 Most active: {most_active}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"🗄️ DATABASE\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"✅ Units in database: {units_count}\n"
+        f"🕐 Last updated: {built_at or 'not updated today'}\n\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"{closing}\n"
+        f"━━━━━━━━━━━━━━━"
+    )
+
+    for phone in (getattr(agency, "wa_admin_numbers", []) or []):
+        await _send_wa(f"{phone}@c.us", report)
+    logger.info(f"Daily report sent for agency {agency.id}")
+
+
+async def send_daily_report():
+    """20:00 — daily summary report to all admin phones."""
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not os.getenv("WA_INSTANCE_ID"):
+                continue
+            try:
+                await _send_daily_report_for_agency(agency, db)
+            except Exception:
+                logger.exception(f"Daily report failed for agency {agency.id}")
+    except Exception:
+        logger.exception("send_daily_report error")
+    finally:
+        db.close()
 
 
 # ─── Broadcast to all WA groups ──────────────────────────────────────────────
