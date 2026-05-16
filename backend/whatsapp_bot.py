@@ -495,53 +495,36 @@ async def _generate_availability_broadcast(
     admin_name: str,
     admin_phone: str,
 ) -> str:
-    """Ask Claude to generate Tony-style availability broadcast text."""
-    lines = []
-    type_keys = [k for k in summary if k != "total"]
-    for label in _TYPE_ORDER + [k for k in type_keys if k not in _TYPE_ORDER]:
-        if label not in summary:
-            continue
-        d = summary[label]
-        if not isinstance(d, dict):
-            continue
-        price_str = f"from AED {d['min_price']:,.0f}" if d["min_price"] else "price on request"
-        lines.append(f"{label}: {d['count']} units — {price_str}")
-    total = summary.get("total") or sum(d["count"] for d in summary.values() if isinstance(d, dict))
-    summary_text = "\n".join(lines)
-
+    """Ask Claude to generate Tony-style caption for availability PDF."""
     prompt = (
         f"You are Tony — Dubai real estate AI sales assistant.\n"
-        f"Generate a WhatsApp broadcast message for agents in groups.\n\n"
+        f"Write a short motivating WhatsApp caption to send ABOVE an availability PDF.\n\n"
         f"Project: {project_name or 'our project'}\n"
-        f"Availability:\n{summary_text}\nTotal: {total} units\n\n"
         f"Admin contact: {admin_name} — {admin_phone}\n\n"
         f"Rules:\n"
-        f"- Tony character: habibi, wallah, yalla — max 2 per message\n"
-        f"- Motivating, energetic, sales-focused\n"
-        f"- Show each type with count and min price on separate line with emoji\n"
-        f"- Total units at bottom\n"
-        f"- One motivating closing line\n"
-        f"- End with admin contact\n"
+        f"- DO NOT mention unit counts or prices — the PDF has all details\n"
+        f"- Short: 4-6 lines max\n"
+        f"- Tony character: habibi, wallah, yalla — max 1-2 words\n"
+        f"- Motivating, energetic — push agents to share with clients\n"
+        f"- End with admin contact on last line\n"
         f"- English only\n"
-        f"- Max 20 lines\n"
-        f"- Output ONLY the message text — no JSON, no quotes, no explanation"
+        f"- Output ONLY the caption — no JSON, no quotes, no explanation"
     )
     try:
         ai = anthropic.AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
         resp = await ai.messages.create(
             model="claude-haiku-4-5-20251001",
-            max_tokens=600,
+            max_tokens=300,
             messages=[{"role": "user", "content": prompt}],
         )
         return resp.content[0].text.strip()
     except Exception:
         logger.exception("_generate_availability_broadcast: Claude error")
-        # Fallback: plain text summary
         contact_line = f"\n📞 {admin_name}: {admin_phone}" if admin_phone else ""
         return (
-            f"🔥 Fresh inventory — {project_name}!\n\n"
-            + summary_text
-            + f"\n\nTotal: {total} units available 💎"
+            f"🔥 Fresh availability just dropped — {project_name or 'check it out'}!\n"
+            f"See the full list inside habibi 👇\n"
+            f"Best units go first — yalla! 💎"
             + contact_line
         )
 
