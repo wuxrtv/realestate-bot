@@ -563,9 +563,7 @@ async def _broadcast_availability(
             break
         if i > 0:
             await asyncio.sleep(5)
-        await _send_wa(g.chat_id, broadcast_text)
-        await asyncio.sleep(1)
-        await _send_wa_file(g.chat_id, file_bytes, file_name)
+        await _send_wa_file(g.chat_id, file_bytes, file_name, broadcast_text)
         sent += 1
         sent_group_names.append(g.title or g.chat_id)
 
