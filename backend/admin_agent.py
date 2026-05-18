@@ -711,12 +711,23 @@ class AdminAgent:
         conv, history = self._load_history(db, agency.id, user_id)
         history.append({"role": "user", "content": message})
 
-        # Build system prompt: client-specific character + base rules
+        # Build system prompt: client-specific character + base rules + project knowledge
         client_character = getattr(agency, "bot_character", "") or ""
         if client_character.strip():
             system = client_character.strip() + "\n\n" + ADMIN_SYSTEM_PROMPT
         else:
             system = ADMIN_SYSTEM_PROMPT
+
+        try:
+            import project_kb as _kb
+            proj_names = [p.project_name for p in db.query(ToniProject).filter(
+                ToniProject.is_active == True, ToniProject.agency_id == agency.id
+            ).all()]
+            knowledge = _kb.get_knowledge(proj_names)
+            if knowledge:
+                system += "\n\n" + knowledge
+        except Exception:
+            pass
 
         # Cache system prompt + tools — 90% discount on repeated calls (5-min TTL)
         cached_system = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]

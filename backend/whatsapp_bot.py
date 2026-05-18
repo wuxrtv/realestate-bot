@@ -2038,6 +2038,14 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
     else:
         system = _SYSTEM_BASE + f"\n\nAdmin contact: {contact}\nNo projects loaded yet."
 
+    try:
+        import project_kb as _kb
+        knowledge = _kb.get_knowledge([p.project_name for p in projects])
+        if knowledge:
+            system += "\n\n" + knowledge
+    except Exception:
+        pass
+
     history = _load_group_context(agency.id, chat_id)
     history.append({"role": "user", "content": f"[{sender_name}]: {text}"})
 
