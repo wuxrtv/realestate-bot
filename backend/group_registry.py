@@ -106,6 +106,25 @@ def remove(chat_id: str, agency_id: int) -> bool:
     return found
 
 
+def is_intro_sent(chat_id: str, agency_id: int) -> bool:
+    """Check if Tony's group intro was already sent."""
+    data = _load()
+    for g in data.get("groups", []):
+        if g["id"] == chat_id and g.get("agency_id") == agency_id:
+            return g.get("intro_sent", False)
+    return False
+
+
+def mark_intro_sent(chat_id: str, agency_id: int):
+    """Mark Tony's intro as sent for this group (one-time only)."""
+    data = _load()
+    for g in data.get("groups", []):
+        if g["id"] == chat_id and g.get("agency_id") == agency_id:
+            g["intro_sent"] = True
+            _save(data)
+            return
+
+
 def list_groups(agency_id: int) -> str:
     """Return a formatted string listing active groups for admin."""
     groups = get_groups(agency_id)

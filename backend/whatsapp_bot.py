@@ -183,28 +183,42 @@ def _save_group_context(agency_id: int, chat_id: str, history: list):
 # ─── Scheduled message texts ──────────────────────────────────────────────────
 
 _MORNING_GREETINGS = [
-    "Morning habibi! Yalla what are we dropping today? 🔥",
-    "Morning boss! Wallah ready when you are — what's the plan? 💼",
-    "Rise and shine habibi! What files are we sending out today? ☀️",
-    "Good morning! Yalla yalla — what are we working with today? 🔥",
-    "Morning habibi! The groups are waiting — what do we broadcast? 💪",
-    "Hey, morning! Wallah got everything ready — what do we do today? 🤲",
-    "Morning! Yalla habibi — what are we dropping today? 💼🔥",
+    "Good morning habibi! 🌅\nYalla — send me today's availability\nand I'll blast it to all groups right after! 🔥",
+    "Morning! ☀️ Ready to go wallah.\nDrop me the latest inventory\nand Tony handles the rest khalas 💪",
+    "Sabah el khair habibi! 🌄\nSend me today's availability file —\ngroups will have it in minutes 🚀",
+    "Good morning! Yalla let's start strong 🔥\nWhat's the inventory looking like today?\nSend it over and I'll take care of the groups 📤",
+    "Morning habibi! 🌅\nGroups are waiting — send me today's availability\nand we're blasting in minutes 🚀",
+    "Rise and shine! ☀️\nYalla habibi — drop me the availability file\nand I'll handle the groups from here 💪",
+    "Good morning wallah! 🌄\nReady when you are — send today's availability\nand groups will have it instantly 📤",
 ]
 
 _MORNING_GREETINGS_FRIDAY = [
-    "Habibi it's FRIDAY wallah 🕌\nYalla what are we dropping before Jumaa? 🔥",
-    "Friday vibes habibi ☀️\nQuick blast before people disappear to brunch? 😂",
-    "Bro it's Friday wallah 🕌\nGroups go quiet after 12 you know the drill 😄\nYalla let's move fast! 💪",
+    "Habibi it's FRIDAY wallah 🕌\nSend me today's availability before Jumaa —\nI'll blast it while everyone's still awake! 🔥",
+    "Sabah el khair habibi! 🌄 Happy Friday 🕌\nDrop me the inventory file —\ngroups will have it in minutes before brunch 🔥",
+    "Friday vibes habibi ☀️\nYalla — send me today's availability fast\nbefore everyone disappears to Jumaa 😄 📤",
 ]
 
 _FOLLOWUP_MSGS = [
-    "Habibi you awake? ☕ Yalla let's go 💪",
-    "Hey habibi — still here whenever you're ready! Anything to push out? 🔥",
-    "Just a nudge habibi — let me know what projects we're focusing on today! 💼",
-    "Bro, you there? Wallah ready when you are 🙌",
-    "Hey habibi, no rush — just checking in. Anything for the groups today? 🤲",
+    "Hey habibi, no rush 🤲\nJust need today's availability file\nand we're good to go! 📋",
+    "Still here wallah 😄\nDrop me the inventory whenever you're ready —\ngroups are waiting habibi 📤",
+    "Habibi you awake? ☕\nSend me today's availability\nand Tony blasts it right away 🔥",
+    "Hey habibi — just checking in 🤲\nSend the availability file when ready\nKhalas I'll handle the rest 💪",
+    "Morning follow-up habibi! ☀️\nStill waiting on today's inventory —\ngroups are ready whenever you are 📤",
 ]
+
+_GROUP_INTRO_MSGS = [
+    "Yalla habibi! 👋\n\nTony here — AI sales assistant for {admin_name}.\nI work 24/7 so you always get instant answers.\n\nUnits, prices, floors, availability — just ask and I'll find it in seconds 🔥",
+    "Hey everyone! 🤖\n\nI'm Tony — {admin_name}'s AI assistant.\nAlways here, always ready, never sleeps wallah 💪\n\nNeed anything about the project — just ask! 🔥",
+    "Wallah glad to be here! 👋\n\nTony here — working with {admin_name}\nto keep you updated 24/7.\n\nUnits, offers, availability — ask me anything khalas 🔥",
+    "Yalla, Tony's in the building! 🏢\n\nAI assistant for {admin_name}, always on.\nWallah no question goes unanswered 💪\n\nJust ask — I'll find what you need in seconds 🔥",
+    "Sabah el khair everyone! 🌅\n\nTony here — {admin_name}'s AI sidekick.\nPrices, floors, units, availability — 24/7 habibi.\n\nYalla let's go 🔥",
+]
+
+_HI_TONY_RE = re.compile(
+    r"^\s*(hi|hello|hey|привет|салам)\s+tony\s*$"
+    r"|^\s*tony\s*[,!]?\s*(hi|hello|hey|привет)\s*$",
+    re.IGNORECASE,
+)
 
 _MIDDAY_MSGS = [
     "Hey habibi, any offers worth sharing this afternoon? 👀",
@@ -939,7 +953,7 @@ async def handle_update(data: dict, agency: Agency):
                 await _handle_admin_message(chat_id, sender_phone, f"[Voice] {text}", db, agency)
             elif is_group and (_is_tony_mentioned(text) or _is_realestate_query(text)):
                 group_title = sender_data.get("chatName", chat_id)
-                await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
+                await _handle_group_message(chat_id, group_title, sender_name, text, db, agency, sender_phone)
 
         # ── Text messages ────────────────────────────────────────────────────────
         elif msg_type == "textMessage":
@@ -985,7 +999,7 @@ async def handle_update(data: dict, agency: Agency):
                 await _handle_group_admin_command(chat_id, group_title, text, db, agency)
             elif is_group and (_is_tony_mentioned(text) or _is_realestate_query(text)):
                 group_title = sender_data.get("chatName", chat_id)
-                await _handle_group_message(chat_id, group_title, sender_name, text, db, agency)
+                await _handle_group_message(chat_id, group_title, sender_name, text, db, agency, sender_phone)
             elif not is_group and not admin_check:
                 await _handle_stranger_message(chat_id, agency, text)
             else:
@@ -2468,7 +2482,8 @@ async def _send_group_brochure(chat_id: str, project_name: str, agency: Agency):
 # ─── Group message ────────────────────────────────────────────────────────────
 
 async def _handle_group_message(chat_id: str, group_title: str, sender_name: str,
-                                text: str, db: Session, agency: Agency):
+                                text: str, db: Session, agency: Agency,
+                                sender_phone: str = ""):
     import group_registry
 
     # Auto-register group — non-fatal: if file write fails, still respond
@@ -2509,6 +2524,16 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
                        "Yalla habibi! 👋 Tony here —\n"
                        "wallah happy to be part of this group 😎\n"
                        "Saved permanently — I'm ready to go! 🔥")
+
+    # ── Admin writes "hi tony" in group → send branded intro (once per group) ─
+    is_admin_sender = sender_phone and sender_phone in (agency.wa_admin_numbers or [])
+    if is_admin_sender and _HI_TONY_RE.search(text.strip()):
+        if not group_registry.is_intro_sent(chat_id, agency.id):
+            admin_name = agency.name or "your agency"
+            intro = random.choice(_GROUP_INTRO_MSGS).format(admin_name=admin_name)
+            await _send_wa(chat_id, intro)
+            group_registry.mark_intro_sent(chat_id, agency.id)
+        return
 
     # Lead generation — someone asking about Tony or wants him for their team
     if _LEAD_SIGNAL_RE.search(text):
