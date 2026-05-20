@@ -508,6 +508,7 @@ When Admin asks for brochure / photo / video / media / any project file:
 → ALWAYS call send_drive_file tool immediately — no questions, no explanations
 → If Admin says "send to groups" / "в группы" / "blast to groups" → send_to="groups"
 → If Admin says "send me" / "show me" / no destination mentioned → send_to="admin"
+→ After tool returns {"brochure_sent": true, "extras_asked": true}: say NOTHING — the brochure and follow-up message were already sent directly, do NOT add more text
 → After tool returns {"sent_to_groups": N}: say "Khalas! Blasted to N groups wallah 💥✅"
 → After tool returns {"sent_to_admin": true}: say "Sent habibi! 📄🔥"
 → NEVER say file was sent to groups unless tool returned sent_to_groups > 0
@@ -877,6 +878,7 @@ class AdminAgent:
         try:
             import drive_service as _drive
             import whatsapp_bot
+            import time as _t
             svc = _drive.get_service()
             if not svc:
                 return {
@@ -900,18 +902,64 @@ class AdminAgent:
                     "hint": "Make sure project folder in Drive has a 'media' subfolder with files.",
                 }
 
-            sent_count = 0
-            for file_id, file_name, export_mime in media_files:
-                file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
-                if not file_bytes:
-                    continue
-                if send_to == "groups":
+            # ── Groups: broadcast all files (no one-at-a-time limit) ─────────
+            if send_to == "groups":
+                sent_count = 0
+                for file_id, file_name, export_mime in media_files:
+                    file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
+                    if not file_bytes:
+                        continue
                     await whatsapp_bot.announce_file_to_wa_groups(db, file_bytes, file_name, "", agency)
-                else:
-                    await whatsapp_bot._send_wa_file(chat_id, file_bytes, file_name)
-                sent_count += 1
+                    sent_count += 1
+                return {"sent": sent_count, "total": len(media_files), "destination": "groups", "project": project_name}
 
-            return {"sent": sent_count, "total": len(media_files), "destination": send_to, "project": project_name}
+            # ── Admin chat: one-at-a-time — send brochure only, ask about rest ─
+            brochure = next(
+                ((fid, fn, em) for fid, fn, em in media_files if _drive._media_sort_key(fn) == 0),
+                None,
+            )
+            if not brochure:
+                brochure = media_files[0]
+
+            file_bytes = await asyncio.to_thread(_drive.download_file, svc, brochure[0], brochure[2])
+            if not file_bytes:
+                return {"error": "Failed to download file — try again"}
+
+            await whatsapp_bot._send_wa_file(chat_id, file_bytes, brochure[1])
+
+            # Detect what else is available
+            has_payment = any(_drive._media_sort_key(fn) == 1 for _, fn, _ in media_files)
+            has_video   = any(_drive._media_sort_key(fn) == 4 for _, fn, _ in media_files)
+            has_photos  = any(_drive._media_sort_key(fn) == 3 for _, fn, _ in media_files)
+            has_loc     = bool(await asyncio.to_thread(_drive.get_location_text, svc, project_name, root_id))
+
+            remaining: list[str] = []
+            if has_loc:     remaining.append("location")
+            if has_payment: remaining.append("payment")
+            if has_video or has_photos: remaining.append("video")
+
+            if remaining:
+                _label_map = {
+                    "location": "📍 Location info",
+                    "payment": "📋 Payment plan",
+                    "video": "🎬 Photos/Videos",
+                }
+                extras_lines = "\n".join(f"▪️ {_label_map[k]}" for k in remaining if k in _label_map)
+                await whatsapp_bot._send_wa(
+                    chat_id,
+                    f"Here's the {project_name} brochure habibi 📄\n"
+                    f"Need anything else?\n{extras_lines}\n\nJust say what you need 🤝"
+                )
+                whatsapp_bot._pending_group_media[chat_id] = {
+                    "project_name": project_name,
+                    "remaining": remaining,
+                    "video_offset": 0,
+                    "stored_at": _t.time(),
+                    "agency_id": agency.id,
+                }
+                return {"brochure_sent": True, "extras_asked": True, "project": project_name}
+
+            return {"sent": 1, "total": len(media_files), "destination": "admin", "project": project_name}
         except Exception as e:
             logger.exception("send_drive_file tool error")
             return {"error": str(e)}

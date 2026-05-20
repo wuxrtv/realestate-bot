@@ -2163,6 +2163,17 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
         asyncio.create_task(run_test_schedule(chat_id, agency.id))
         return
 
+    # ── Pending media follow-up (one-at-a-time) ──────────────────────────────
+    _pmedia = _pending_group_media.get(chat_id)
+    if _pmedia:
+        if _time.time() - _pmedia["stored_at"] > 600:
+            _pending_group_media.pop(chat_id, None)
+        else:
+            handled = await _handle_media_followup(chat_id, text, _pmedia, agency)
+            if handled:
+                return
+            _pending_group_media.pop(chat_id, None)
+
     # ── Pending file: admin replied with instruction ──────────────────────────
     if agency.id in _pending_files:
         from datetime import datetime as _dt
