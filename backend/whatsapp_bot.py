@@ -1286,21 +1286,27 @@ async def _respond_location_request(chat_id: str, project_name: str,
     if available_extras:
         extras_lines = "\n".join(f"▪️ {e}" for e in available_extras)
         await _send_wa(chat_id,
-                       f"Here's the brochure habibi 📄\n"
-                       f"Want me to also send:\n{extras_lines}\n\n"
-                       f"Just say yes or tell me what you need 🤝")
+                       f"Here's the {project_name} brochure habibi 📄\n"
+                       f"Need anything else?\n{extras_lines}\n\n"
+                       f"Just say what you need 🤝")
+        remaining: list[str] = []
+        if has_loc:
+            remaining.append("location")
+        if has_payment:
+            remaining.append("payment")
+        if has_video or has_photos:
+            remaining.append("video")
         _pending_group_media[chat_id] = {
             "project_name": project_name,
-            "has_location": has_loc,
-            "has_payment": has_payment,
-            "has_media": has_video or has_photos,
+            "remaining": remaining,
+            "video_offset": 0,
             "stored_at": _time.time(),
             "agency_id": agency.id,
         }
 
 
 async def _handle_media_followup(chat_id: str, text: str, pending: dict, agency) -> bool:
-    """Handle follow-up after one-at-a-time brochure send. Returns True if handled."""
+    """Handle follow-up after one-at-a-time send. Returns True if consumed."""
     import drive_service as _drive
     svc = _drive.get_service()
     if not svc:
@@ -1308,48 +1314,106 @@ async def _handle_media_followup(chat_id: str, text: str, pending: dict, agency)
 
     proj = pending["project_name"]
     root_id = getattr(agency, "drive_root_id", "") or ""
-    text_l = text.lower()
 
+    # Migrate old structure (has_* booleans) → new (remaining list)
+    remaining = list(pending.get("remaining", []))
+    if not remaining:
+        if pending.get("has_location"):
+            remaining.append("location")
+        if pending.get("has_payment"):
+            remaining.append("payment")
+        if pending.get("has_media"):
+            remaining.append("video")
+    video_offset = pending.get("video_offset", 0)
+
+    # "no" → clear and done
+    if _NO_RE.search(text):
+        _pending_group_media.pop(chat_id, None)
+        return True
+
+    text_l = text.lower()
     wants_payment  = bool(_PAYMENT_PLAN_RE.search(text_l))
     wants_media    = bool(_VIDEO_RE.search(text_l))
     wants_location = bool(_LOCATION_RE.search(text_l))
-    wants_all      = bool(_YES_RE.search(text)) and not (wants_payment or wants_media or wants_location)
+    wants_next     = bool(_YES_RE.search(text)) and not (wants_payment or wants_media or wants_location)
 
-    if not (wants_payment or wants_media or wants_location or wants_all):
+    if not (wants_payment or wants_media or wants_location or wants_next):
         return False  # not a follow-up reply — let Claude handle it
 
     _pending_group_media.pop(chat_id, None)
 
+    # Determine what to send (one item only)
+    to_send: str | None = None
+    if wants_location and "location" in remaining:
+        to_send = "location"
+    elif wants_payment and "payment" in remaining:
+        to_send = "payment"
+    elif wants_media and "video" in remaining:
+        to_send = "video"
+    elif wants_next:
+        for item in ["location", "payment", "video"]:
+            if item in remaining:
+                to_send = item
+                break
+
+    if to_send is None:
+        await _send_wa(chat_id, "Habibi couldn't find that 😅 Try again later 🙏")
+        return True
+
     media_files = await asyncio.to_thread(_drive.find_all_media, svc, proj, 20, root_id)
     sent = False
 
-    if (wants_all or wants_location) and pending.get("has_location"):
+    if to_send == "location":
         loc_text = await asyncio.to_thread(_drive.get_location_text, svc, proj, root_id)
         if loc_text:
             await _send_wa(chat_id, loc_text)
-            await asyncio.sleep(1)
             sent = True
+        remaining = [r for r in remaining if r != "location"]
 
-    if (wants_all or wants_payment) and pending.get("has_payment"):
-        payment_files = [(fid, fn, em) for fid, fn, em in media_files if _drive._media_sort_key(fn) == 1]
-        for fid, fn, em in payment_files:
+    elif to_send == "payment":
+        payment_files = [f for f in media_files if _drive._media_sort_key(f[1]) == 1]
+        if payment_files:
+            fid, fn, em = payment_files[0]
             fb = await asyncio.to_thread(_drive.download_file, svc, fid, em)
             if fb:
                 await _send_wa_file(chat_id, fb, fn)
-                await asyncio.sleep(1)
                 sent = True
+        remaining = [r for r in remaining if r != "payment"]
 
-    if (wants_all or wants_media) and pending.get("has_media"):
-        media_only = [(fid, fn, em) for fid, fn, em in media_files if _drive._media_sort_key(fn) in (3, 4)]
-        for fid, fn, em in media_only:
+    elif to_send == "video":
+        media_only = [f for f in media_files if _drive._media_sort_key(f[1]) in (3, 4)]
+        if video_offset < len(media_only):
+            fid, fn, em = media_only[video_offset]
             fb = await asyncio.to_thread(_drive.download_file, svc, fid, em)
             if fb:
                 await _send_wa_file(chat_id, fb, fn)
-                await asyncio.sleep(1)
                 sent = True
+            video_offset += 1
+        # Remove "video" from remaining only when all files are exhausted
+        if video_offset >= len(media_only):
+            remaining = [r for r in remaining if r != "video"]
 
     if not sent:
         await _send_wa(chat_id, "Habibi couldn't find that 😅 Try again later 🙏")
+        return True
+
+    # More items left? Ask again
+    if remaining:
+        _label_map = {
+            "location": "📍 Location info",
+            "payment": "📋 Payment plan",
+            "video": "🎬 Photos/Videos",
+        }
+        extras_lines = "\n".join(f"▪️ {_label_map[k]}" for k in remaining if k in _label_map)
+        await _send_wa(chat_id,
+                       f"Done habibi ✅ Anything else?\n{extras_lines}\n\nJust say what you need 🤝")
+        _pending_group_media[chat_id] = {
+            "project_name": proj,
+            "remaining": remaining,
+            "video_offset": video_offset,
+            "stored_at": _time.time(),
+            "agency_id": agency.id,
+        }
 
     return True
 
@@ -2339,24 +2403,25 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
             await _send_wa(chat_id, msg)
         elif svc:
             media_files = await asyncio.to_thread(_drive.find_all_media, svc, search_name, 15, root_id)
-            if media_files:
-                # One-at-a-time rule: send only the FIRST file, ask about the rest
-                first_fid, first_fn, first_em = media_files[0]
+            # For media_request: photos/videos first, fall back to all files
+            media_only = [f for f in media_files if _drive._media_sort_key(f[1]) in (3, 4)]
+            send_list = media_only or media_files
+            if send_list:
+                # One-at-a-time: send only first file
+                first_fid, first_fn, first_em = send_list[0]
                 fb = await asyncio.to_thread(_drive.download_file, svc, first_fid, first_em)
                 if fb:
                     await _send_wa_file(chat_id, fb, first_fn)
                     sent = True
-                    if len(media_files) > 1:
-                        remaining = len(media_files) - 1
+                    if len(send_list) > 1:
                         await _send_wa(chat_id,
                                        f"Here you go habibi 📸\n"
-                                       f"I have {remaining} more file(s) — want me to send them?\n"
+                                       f"I have {len(send_list) - 1} more — want me to send them?\n"
                                        f"Just say *yes* 🤝")
                         _pending_group_media[chat_id] = {
                             "project_name": search_name,
-                            "has_location": False,
-                            "has_payment": any(_drive._media_sort_key(fn) == 1 for _, fn, _ in media_files),
-                            "has_media": len(media_files) > 1,
+                            "remaining": ["video"],
+                            "video_offset": 1,
                             "stored_at": _time.time(),
                             "agency_id": agency.id,
                         }
