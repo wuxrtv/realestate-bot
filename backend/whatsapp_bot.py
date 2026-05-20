@@ -44,6 +44,32 @@ _pending_group_media: dict[str, dict] = {}
 # agency_id → {chat_id, download_url, file_name, sender_phone}
 _pending_avail_confirm: dict[int, dict] = {}
 
+# ─── Smart random offer history (persisted to disk) ──────────────────────────
+_SMART_HISTORY_PATH = "smart_offer_history.json"
+
+# Pool of angle+type combinations for smart random offer
+_SMART_OFFER_POOL = [
+    {"angle": "cheapest",      "unit_type": "studio"},
+    {"angle": "cheapest",      "unit_type": "1b"},
+    {"angle": "cheapest",      "unit_type": "2b"},
+    {"angle": "cheapest",      "unit_type": "3b"},
+    {"angle": "highest_floor", "unit_type": "studio"},
+    {"angle": "highest_floor", "unit_type": "1b"},
+    {"angle": "highest_floor", "unit_type": "2b"},
+    {"angle": "best_view",     "unit_type": None},
+    {"angle": "random",        "unit_type": "studio"},
+    {"angle": "random",        "unit_type": "1b"},
+    {"angle": "random",        "unit_type": "2b"},
+    {"angle": "random",        "unit_type": "3b"},
+]
+
+_ANGLE_HINTS = {
+    "cheapest":      "Best entry price available in this project — wallah incredible value",
+    "highest_floor": "Highest floor available — panoramic views, exclusive lifestyle",
+    "best_view":     "Premium view, rare find — khalas this is a special one",
+    "random":        "",
+}
+
 # ─── Pending brochure confirmations in groups ─────────────────────────────────
 # chat_id → {project_name, stored_at}; expires in 10 minutes
 
@@ -1029,7 +1055,7 @@ async def _handle_stranger_message(chat_id: str, agency: Agency, text: str = "")
 # ─── Daily broadcast — optimized (1 API call per slot, N groups free) ─────────
 
 async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: str,
-                                   agency=None) -> str:
+                                   agency=None, angle_hint: str = "") -> str:
     """Generate a WhatsApp sales caption via Claude Haiku — 1 call per broadcast slot."""
     try:
         from admin_agent import _parse_price, _get_floor
@@ -1057,11 +1083,16 @@ async def _generate_offer_caption(unit_key: str, unit_data: dict, project_name: 
         floor_line   = f"🏢 Floor: {floor_val}\n" if floor_val else ""
         view_line    = f"👁️ View: {view}\n" if view else ""
 
+        punchy_placeholder = (
+            angle_hint if angle_hint
+            else "[One unique punchy line about why this unit is special — view/floor/type/value]"
+        )
+
         prompt = (
             "Write a WhatsApp sales caption. Follow this EXACT structure — plain text, NO asterisks, NO markdown:\n\n"
             f"🏙️ {project_name}{loc_str}\n"
             "\n"
-            "[One unique punchy line about why this unit is special — view/floor/type/value]\n"
+            f"{punchy_placeholder}\n"
             "\n"
             f"📍 Unit: {label}\n"
             f"{floor_line}"
@@ -1540,6 +1571,202 @@ async def send_daily_offer_17pm():
     await _send_daily_offer_slot("2 Bedroom", "5PM 🌆")
 
 
+# ─── Smart random offer ────────────────────────────────────────────────────────
+
+def _load_smart_history(agency_id: int) -> list:
+    """Load sent history for last 7 days (in-memory cache + disk)."""
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=7)).isoformat()
+    try:
+        with open(_SMART_HISTORY_PATH) as f:
+            data = json.load(f)
+        entries = data.get(str(agency_id), [])
+        return [e for e in entries if e.get("date", "") >= cutoff]
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_smart_history(agency_id: int, new_entries: list):
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=7)).isoformat()
+    try:
+        try:
+            with open(_SMART_HISTORY_PATH) as f:
+                data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {}
+        data[str(agency_id)] = [e for e in new_entries if e.get("date", "") >= cutoff]
+        with open(_SMART_HISTORY_PATH, "w") as f:
+            json.dump(data, f)
+    except Exception:
+        logger.exception("_save_smart_history error")
+
+
+def _pick_smart_angle(history: list) -> Optional[dict]:
+    """Pick an angle+type not used today (type) or this week (angle+type)."""
+    from datetime import date
+    today = date.today().isoformat()
+    types_today  = {e["unit_type"] for e in history if e.get("date") == today}
+    angles_week  = {f"{e['angle']}_{e['unit_type']}" for e in history}
+
+    pool = list(_SMART_OFFER_POOL)
+    random.shuffle(pool)
+
+    # First pass: avoid both same-type-today AND same-angle-this-week
+    for item in pool:
+        ut = item["unit_type"]
+        ak = f"{item['angle']}_{ut}"
+        if ut in types_today:
+            continue
+        if ak in angles_week:
+            continue
+        return item
+
+    # Relax: only avoid same type today
+    for item in pool:
+        if item["unit_type"] not in types_today:
+            return item
+
+    # Final fallback: anything goes
+    return random.choice(_SMART_OFFER_POOL)
+
+
+async def _pick_smart_unit(
+    agency_id: int, angle: str, unit_type: Optional[str], history: list, svc
+) -> Optional[tuple]:
+    """Find a unit matching angle+type with a downloadable PDF. Returns (key, data, proj, pdf, fname)."""
+    import pdf_index as _idx
+    import drive_service as _drive
+
+    sent_keys = {e["unit_key"] for e in history}
+
+    sort_map = {"cheapest": "cheapest", "highest_floor": "highest_floor"}
+    candidates = _idx.search_units(
+        agency_id,
+        unit_type=unit_type or "",
+        sort_by=sort_map.get(angle, ""),
+    )
+
+    if angle == "best_view":
+        # Only units with non-empty view
+        candidates = [(k, d, p) for k, d, p in candidates if d.get("view", "").strip()]
+        random.shuffle(candidates)
+    elif angle == "random":
+        random.shuffle(candidates)
+    # cheapest / highest_floor already sorted
+
+    # Prefer fresh units (not sent in last 7 days)
+    fresh = [c for c in candidates if c[0] not in sent_keys]
+    ordered = fresh if fresh else candidates
+
+    for c_key, c_data, c_proj in ordered[:8]:
+        file_id = c_data.get("file_id", "")
+        if not file_id or not svc:
+            continue
+        try:
+            pdf_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id)
+            if pdf_bytes:
+                return c_key, c_data, c_proj, pdf_bytes, c_data.get("filename", f"{c_key}.pdf")
+        except Exception:
+            logger.exception(f"_pick_smart_unit: PDF download failed for {c_key}")
+
+    return None
+
+
+async def _smart_offer_for_agency(agency, db, slot_label: str = "Smart Offer 🎯") -> dict:
+    """Core: pick angle → pick unit from availability → send to all groups."""
+    if is_broadcast_stopped(agency.id):
+        logger.info(f"smart_offer: broadcast stopped for agency {agency.id} — skipping")
+        return {"error": "broadcast_stopped"}
+
+    import drive_service as _drive
+    svc = _drive.get_service()
+    if not svc:
+        return {"error": "no_drive"}
+
+    history = _load_smart_history(agency.id)
+    angle_item = _pick_smart_angle(history)
+    if not angle_item:
+        return {"error": "no_angle"}
+
+    angle     = angle_item["angle"]
+    unit_type = angle_item["unit_type"]
+
+    result = await _pick_smart_unit(agency.id, angle, unit_type, history, svc)
+    if not result:
+        logger.warning(f"smart_offer: no unit found for angle={angle} type={unit_type} agency={agency.id}")
+        return {"error": "no_unit"}
+
+    unit_key, unit_data, proj_name, pdf_bytes, filename = result
+
+    caption = await _generate_offer_caption(
+        unit_key, unit_data, proj_name, agency=agency,
+        angle_hint=_ANGLE_HINTS.get(angle, ""),
+    )
+
+    # Send to all groups
+    groups = _query_groups(db, agency)
+    sent_count = 0
+    for i, group in enumerate(groups):
+        if is_cancelled(agency.id) or is_broadcast_stopped(agency.id):
+            clear_cancel(agency.id)
+            break
+        if i > 0:
+            await asyncio.sleep(20)
+        await _send_wa_file(group.chat_id, pdf_bytes, filename, caption)
+        sent_count += 1
+
+    # Persist to history
+    from datetime import date as _date
+    history.append({
+        "unit_key": unit_key,
+        "date": _date.today().isoformat(),
+        "angle": angle,
+        "unit_type": unit_type or "any",
+    })
+    _save_smart_history(agency.id, history)
+
+    # Notify admin
+    from admin_agent import _parse_price
+    building  = unit_data.get("building", "")
+    label     = f"{building}-{unit_key}" if building else unit_key
+    price_raw = _parse_price(unit_data)
+    price_str = f"AED {int(price_raw):,}".replace(",", " ") if price_raw else "price TBD"
+    for phone in (agency.wa_admin_numbers or []):
+        await _send_wa(
+            f"{phone}@c.us",
+            f"📤 {slot_label} done habibi!\n"
+            f"Angle: {angle} | Type: {unit_type or 'any'}\n"
+            f"Unit {label} — {price_str}\n"
+            f"Sent to {sent_count} group(s) ✅"
+        )
+
+    _track_broadcast(agency.id, slot_label, unit_type or "any", unit_key, sent_count)
+    logger.info(f"smart_offer [{slot_label}]: angle={angle} unit={unit_key} sent={sent_count}")
+    return {"unit": unit_key, "angle": angle, "unit_type": unit_type, "sent": sent_count, "caption": caption}
+
+
+async def send_smart_random_offer():
+    """13:30 and 17:00 — smart random offer across all active agencies."""
+    from datetime import datetime as _dt
+    slot_label = "13:30 🎯" if _dt.now().hour < 15 else "17:00 🎯"
+    db = SessionLocal()
+    try:
+        agencies = db.query(Agency).filter(Agency.is_active == True).all()
+        for agency in agencies:
+            if not os.getenv("WA_INSTANCE_ID"):
+                continue
+            clear_cancel(agency.id)
+            try:
+                await _smart_offer_for_agency(agency, db, slot_label)
+            except Exception:
+                logger.exception(f"send_smart_random_offer failed for agency {agency.id}")
+    except Exception:
+        logger.exception("send_smart_random_offer error")
+    finally:
+        db.close()
+
+
 # ─── Test schedule mode ────────────────────────────────────────────────────────
 
 async def run_test_schedule(chat_id: str, agency_id: int):
@@ -1572,39 +1799,36 @@ async def run_test_schedule(chat_id: str, agency_id: int):
         await _send_wa(chat_id, f"📲 *[08:45 TEST]* Follow-up:\n\n{random.choice(_FOLLOWUP_MSGS)}")
         await asyncio.sleep(10)
 
-        # ── Steps 3–5: Offer slots — same logic as real schedule, 3-sec group gap ─
-        slots = [
-            ("11:00", "Studio",     "11AM 🌅 TEST"),
-            ("14:00", "1 Bedroom",  "2PM ☀️ TEST"),
-            ("17:00", "2 Bedroom",  "5PM 🌆 TEST"),
-        ]
+        # ── Steps 3–4: Smart offer slots (13:30 + 17:00) — 3-sec group gap ─────
         groups = db.query(WhatsAppGroup).filter(
             WhatsAppGroup.active == True,
             WhatsAppGroup.agency_id == agency_id,
         ).all()
 
-        for t_str, unit_type, slot_lbl in slots:
-            await _send_wa(chat_id, f"📦 *[{t_str} TEST]* Generating {unit_type} caption (1 API call)...")
-            result = await _send_offer_for_agency(
-                agency, db, unit_type, slot_lbl,
-                notify_admin=False, group_delay=3,
-            )
+        for t_str, slot_lbl in [("13:30", "13:30 🎯 TEST"), ("17:00", "17:00 🎯 TEST")]:
+            await _send_wa(chat_id, f"📦 *[{t_str} TEST]* Running smart random offer...")
+            result = await _smart_offer_for_agency(agency, db, slot_lbl)
             if result.get("error"):
-                await _send_wa(chat_id, f"⚠️ No units in index — run 'update database' first!\nSkipping {unit_type} step.")
+                await _send_wa(
+                    chat_id,
+                    f"⚠️ Smart offer failed: {result['error']}\n"
+                    "Check Drive + 'update database' first 🔍"
+                )
             else:
                 await _send_wa(
                     chat_id,
-                    f"✅ {unit_type} sent to {result['sent']} group(s)\n"
-                    f"Caption preview:\n\n{result['caption']}"
+                    f"✅ Angle: {result.get('angle')} | Type: {result.get('unit_type')}\n"
+                    f"Unit: {result.get('unit')} → sent to {result['sent']} group(s)\n"
+                    f"Caption preview:\n\n{result.get('caption', '')}"
                 )
             await asyncio.sleep(10)
 
-        # ── Step 6: 20:00 — End of day report → admin only ────────────────────
+        # ── Step 5: 20:00 — End of day report → admin only ───────────────────
         info = _idx.index_info(agency_id)
         built_at = (info.get("built_at", "") or "")[:16].replace("T", " ")
         report = (
             f"🌙 *[20:00 TEST]* End of day report:\n\n"
-            f"📦 3 offers sent (Studio + 1BR + 2BR)\n"
+            f"📦 2 smart offers sent (13:30 + 17:00)\n"
             f"👥 Groups: {len(groups)}\n"
             f"🏢 Units in index: {info.get('count', 0)}\n"
             f"🕐 Index built: {built_at or 'not built yet'}\n\n"
