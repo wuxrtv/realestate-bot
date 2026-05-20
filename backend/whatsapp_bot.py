@@ -113,21 +113,77 @@ def clear_cancel(agency_id: int):
     _cancel_flags.pop(agency_id, None)
 
 
+_DAY_STATE_PATH = os.path.join(
+    os.getenv("DATA_DIR") or os.path.join(os.path.dirname(__file__), "data"),
+    "day_state.json",
+)
+
+
+def _load_day_state_from_disk(agency_id: int, today: str) -> dict | None:
+    """Load today's persisted state for this agency. Returns None if no file or different day."""
+    try:
+        with open(_DAY_STATE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") != today:
+            return None
+        return data.get("agencies", {}).get(str(agency_id))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _persist_day_state(agency_id: int, today: str, state: dict):
+    """Write current day state to disk (called after each tracking update)."""
+    try:
+        try:
+            with open(_DAY_STATE_PATH, encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("date") != today:
+                data = {"date": today, "agencies": {}}
+        except (FileNotFoundError, json.JSONDecodeError):
+            data = {"date": today, "agencies": {}}
+        # Serialise: convert datetime objects to strings
+        serialisable = {
+            k: (v.isoformat() if hasattr(v, "isoformat") else v)
+            for k, v in state.items()
+        }
+        data["agencies"][str(agency_id)] = serialisable
+        os.makedirs(os.path.dirname(_DAY_STATE_PATH), exist_ok=True)
+        tmp = _DAY_STATE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(tmp, _DAY_STATE_PATH)
+    except Exception:
+        logger.exception("_persist_day_state error")
+
+
 def _day_state(agency_id: int) -> dict:
     from datetime import datetime as _dt
-    key = f"{agency_id}_{_dt.now().strftime('%Y-%m-%d')}"
+    today = _dt.now().strftime("%Y-%m-%d")
+    key = f"{agency_id}_{today}"
     if key not in _daily:
-        _daily[key] = {
-            "morning_replied": False,
-            "follow_up_sent": False,
-            "broadcasts_sent": [],       # [{slot, type, unit, groups, time}]
-            "questions_count": 0,
-            "hot_leads": [],             # [{group, question}]
-            "group_activity": {},        # {group_name: count}
-            "availability_sent": False,
-            "availability_groups": [],   # [group_title, ...]
-            "availability_sent_at": None,  # datetime of last availability broadcast
-        }
+        # Try to restore from disk (survives container restarts / redeployments)
+        persisted = _load_day_state_from_disk(agency_id, today)
+        if persisted:
+            # Re-parse availability_sent_at string → datetime
+            if isinstance(persisted.get("availability_sent_at"), str):
+                try:
+                    from datetime import datetime as _dt2
+                    persisted["availability_sent_at"] = _dt2.fromisoformat(persisted["availability_sent_at"])
+                except Exception:
+                    persisted["availability_sent_at"] = None
+            _daily[key] = persisted
+        else:
+            _daily[key] = {
+                "morning_replied": False,
+                "follow_up_sent": False,
+                "broadcasts_sent": [],
+                "questions_count": 0,
+                "hot_leads": [],
+                "group_activity": {},
+                "availability_sent": False,
+                "availability_groups": [],
+                "availability_sent_at": None,
+            }
     return _daily[key]
 
 
@@ -135,20 +191,29 @@ def mark_admin_active(agency_id: int):
     _day_state(agency_id)["morning_replied"] = True
 
 
-def _track_broadcast(agency_id: int, slot: str, unit_type: str, unit_key: str, groups_count: int):
+def _track_broadcast(agency_id: int, slot: str, unit_type: str, unit_key: str,
+                     groups_count: int, angle: str = ""):
     from datetime import datetime as _dt
-    _day_state(agency_id)["broadcasts_sent"].append({
+    today = _dt.now().strftime("%Y-%m-%d")
+    state = _day_state(agency_id)
+    entry = {
         "slot": slot, "type": unit_type, "unit": unit_key,
         "groups": groups_count, "time": _dt.now().strftime("%H:%M"),
-    })
+    }
+    if angle:
+        entry["angle"] = angle
+    state["broadcasts_sent"].append(entry)
+    _persist_day_state(agency_id, today, state)
 
 
 def _track_availability(agency_id: int, group_names: list):
     from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
     state = _day_state(agency_id)
     state["availability_sent"] = True
     state["availability_groups"] = list(group_names)
     state["availability_sent_at"] = _dt.now()
+    _persist_day_state(agency_id, today, state)
 
 
 def _track_question(agency_id: int, group_name: str):
@@ -1755,7 +1820,7 @@ async def _smart_offer_for_agency(agency, db, slot_label: str = "Smart Offer �
             f"Sent to {sent_count} group(s) ✅"
         )
 
-    _track_broadcast(agency.id, slot_label, unit_type or "any", unit_key, sent_count)
+    _track_broadcast(agency.id, slot_label, unit_type or "any", unit_key, sent_count, angle=angle)
     logger.info(f"smart_offer [{slot_label}]: angle={angle} unit={unit_key} sent={sent_count}")
     return {"unit": unit_key, "angle": angle, "unit_type": unit_type, "sent": sent_count, "caption": caption}
 
@@ -3297,21 +3362,31 @@ async def _send_daily_report_for_agency(agency, db):
         for g in avail_groups:
             avail_block += f"\n▪️ {g}"
 
-    # Offer slots
+    # Smart offer slots (13:30 and 17:00)
     slot_map: dict = {}
     for b in broadcasts:
         s = b.get("slot", "")
-        if "11AM" in s or "11" in s:
-            slot_map.setdefault("11AM", b)
+        # Match new smart offer labels
+        if "13:30" in s or "13" in s:
+            slot_map.setdefault("13:30", b)
+        elif "17" in s or "5PM" in s:
+            slot_map.setdefault("17:00", b)
+        # Legacy labels (keep for historical entries)
+        elif "11AM" in s or ("11" in s and "13" not in s):
+            slot_map.setdefault("13:30", b)
         elif "2PM" in s or "14" in s:
-            slot_map.setdefault("2PM", b)
-        elif "5PM" in s or "17" in s:
-            slot_map.setdefault("5PM", b)
+            slot_map.setdefault("13:30", b)
 
     def _slot_line(key: str, emoji: str) -> str:
         b = slot_map.get(key)
         if b:
-            return f"{emoji} {key} — {b['type']}: {b['unit']}\n▪️ Sent to {b['groups']} groups"
+            u_type = b.get("type", "")
+            angle = b.get("angle", "")
+            angle_str = f" ({angle})" if angle else ""
+            return (
+                f"{emoji} {key}{angle_str} — {u_type}: {b['unit']}\n"
+                f"▪️ Sent to {b['groups']} groups at {b.get('time', '')}"
+            )
         return f"{emoji} {key} — Not sent today"
 
     # DB info
@@ -3327,9 +3402,8 @@ async def _send_daily_report_for_agency(agency, db):
         f"📤 BROADCASTS TODAY\n"
         f"━━━━━━━━━━━━━━━\n\n"
         f"{avail_block}\n\n"
-        f"{_slot_line('11AM', '🏠')}\n\n"
-        f"{_slot_line('2PM', '🛏️')}\n\n"
-        f"{_slot_line('5PM', '🛏️🛏️')}\n\n"
+        f"{_slot_line('13:30', '🎯')}\n\n"
+        f"{_slot_line('17:00', '🎯')}\n\n"
         f"━━━━━━━━━━━━━━━\n"
         f"💬 GROUP ACTIVITY\n"
         f"━━━━━━━━━━━━━━━\n\n"
