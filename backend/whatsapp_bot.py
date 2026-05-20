@@ -36,6 +36,44 @@ _pending_files: dict[int, dict] = {}
 # ─── Global broadcast stop flag (persists until "go" or next day) ────────────
 _broadcast_stopped: dict[int, bool] = {}
 
+# ─── Owner error log (cross-agency, persisted to disk) ───────────────────────
+_ERROR_LOG_PATH = os.path.join(
+    os.getenv("DATA_DIR") or os.path.join(os.path.dirname(__file__), "data"),
+    "error_log.json",
+)
+_error_buffer: list[dict] = []
+
+
+def _log_owner_error(msg: str, agency_id: int = 0, agency_name: str = ""):
+    """Append an error entry to the owner's error log (max 100 entries)."""
+    from datetime import datetime as _dt
+    entry = {
+        "time": _dt.now().strftime("%Y-%m-%d %H:%M"),
+        "agency_id": agency_id,
+        "agency": agency_name,
+        "msg": str(msg)[:300],
+    }
+    _error_buffer.append(entry)
+    if len(_error_buffer) > 100:
+        _error_buffer.pop(0)
+    try:
+        os.makedirs(os.path.dirname(_ERROR_LOG_PATH), exist_ok=True)
+        tmp = _ERROR_LOG_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_error_buffer[-100:], f, ensure_ascii=False)
+        os.replace(tmp, _ERROR_LOG_PATH)
+    except Exception:
+        pass
+
+
+def _load_error_log() -> list:
+    try:
+        with open(_ERROR_LOG_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
 # ─── Pending media follow-up (one-file-at-a-time in groups) ──────────────────
 # chat_id → {project_name, available: list[str], stored_at: float, agency_id: int}
 _pending_group_media: dict[str, dict] = {}
@@ -1028,6 +1066,12 @@ async def handle_update(data: dict, agency: Agency):
                 return
             if not is_group and admin_check:
                 mark_admin_active(agency.id)
+                # Owner super-admin: cross-agency commands handled first
+                import client_registry as _cr
+                if _cr.is_owner(sender_phone):
+                    _owner_result = await _handle_owner_message(chat_id, text, db)
+                    if _owner_result is not False:
+                        return
                 # "show groups" — handled here, not in AdminAgent
                 if _SHOW_GROUPS_RE.search(text):
                     import group_registry
@@ -1071,6 +1115,7 @@ async def handle_update(data: dict, agency: Agency):
                 logger.info(f"WA message not handled: is_group={is_group} is_admin={admin_check} tony_mentioned={_is_tony_mentioned(text)}")
     except Exception:
         logger.exception("WA handle_update error")
+        _log_owner_error(f"handle_update crashed: {chat_id}", agency_id=getattr(agency, 'id', 0), agency_name=getattr(agency, 'name', ''))
     finally:
         db.close()
 
@@ -2414,6 +2459,145 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
                    "• *brochure* — it's a media file, I'll skip it 📁")
 
 
+# ─── Owner (Umar) cross-agency dashboard ─────────────────────────────────────
+
+_OWNER_AGENCY_RE  = re.compile(r"\b(agencies|агентств|admins|клиент|all agents|все)\b", re.IGNORECASE)
+_OWNER_REPORT_RE  = re.compile(r"\b(report|отчет|отчёт)\b\s+(\S+)", re.IGNORECASE)
+_OWNER_GROUPS_RE  = re.compile(r"\b(groups|группы)\b\s+(\S+)", re.IGNORECASE)
+_OWNER_ERRORS_RE  = re.compile(r"\b(errors|ошибки|error log|логи)\b", re.IGNORECASE)
+_OWNER_ACTIVITY_RE = re.compile(r"\b(activity|активность|stats|stat)\b\s*(\S*)", re.IGNORECASE)
+
+
+def _find_agency_fuzzy(query: str, db) -> "Agency | None":
+    from models import Agency
+    q = query.lower().strip()
+    agencies = db.query(Agency).filter(Agency.is_active == True).all()
+    # Exact slug
+    for ag in agencies:
+        if ag.slug.lower() == q:
+            return ag
+    # Partial slug or name
+    for ag in agencies:
+        if q in ag.slug.lower() or q in (ag.name or "").lower():
+            return ag
+    return None
+
+
+async def _handle_owner_message(chat_id: str, text: str, db: Session):
+    """Platform owner commands — cross-agency visibility."""
+    import group_registry
+    import pdf_index as _idx
+    from models import Agency
+
+    text_s = text.strip()
+
+    # ── HELP ─────────────────────────────────────────────────────────────────
+    if text_s.lower() in ("help", "помощь", "/help", "commands"):
+        await _send_wa(
+            chat_id,
+            "🔑 *Owner commands habibi:*\n\n"
+            "• *agencies* — all agencies + stats\n"
+            "• *report [name]* — full daily report for an agency\n"
+            "• *groups [name]* — list all groups for an agency\n"
+            "• *activity [name]* — today's questions + hot leads\n"
+            "• *errors* — last 20 system errors\n\n"
+            "Example: `report hamidulloh` | `groups khamid` | `agencies`"
+        )
+        return
+
+    # ── ALL AGENCIES ─────────────────────────────────────────────────────────
+    if _OWNER_AGENCY_RE.search(text_s):
+        agencies = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.name).all()
+        lines = [f"📊 *All agencies ({len(agencies)}):*\n"]
+        for ag in agencies:
+            groups  = group_registry.get_groups(ag.id)
+            idx_info = _idx.index_info(ag.id)
+            state   = _day_state(ag.id)
+            bcast   = state.get("broadcasts_sent", [])
+            avail   = "✅" if state.get("availability_sent") else "❌"
+            lines.append(
+                f"━━━\n"
+                f"🏢 *{ag.name}* (`{ag.slug}`)\n"
+                f"📱 Groups: {len(groups)}\n"
+                f"🗄️ Units indexed: {idx_info.get('count', 0)}\n"
+                f"📋 Availability today: {avail}\n"
+                f"📤 Broadcasts today: {len(bcast)}\n"
+                f"❓ Questions today: {state.get('questions_count', 0)}\n"
+                f"🔥 Hot leads today: {len(state.get('hot_leads', []))}"
+            )
+        await _send_wa(chat_id, "\n".join(lines))
+        return
+
+    # ── REPORT for specific agency ────────────────────────────────────────────
+    m = _OWNER_REPORT_RE.search(text_s)
+    if m:
+        ag = _find_agency_fuzzy(m.group(2), db)
+        if not ag:
+            await _send_wa(chat_id, f"Habibi agency '{m.group(2)}' not found 😅\nTry: `agencies` to see all names")
+            return
+        await _send_daily_report_for_agency(ag, db, override_chat_id=chat_id)
+        return
+
+    # ── GROUPS for specific agency ────────────────────────────────────────────
+    m = _OWNER_GROUPS_RE.search(text_s)
+    if m:
+        ag = _find_agency_fuzzy(m.group(2), db)
+        if not ag:
+            await _send_wa(chat_id, f"Habibi agency '{m.group(2)}' not found 😅")
+            return
+        groups = group_registry.get_groups(ag.id)
+        if not groups:
+            await _send_wa(chat_id, f"No groups registered for *{ag.name}* habibi 😅")
+            return
+        lines = [f"📱 *{ag.name}* — {len(groups)} group(s):\n"]
+        for g in groups:
+            intro = "✅" if g.get("intro_sent") else "—"
+            lines.append(f"• {g['name']}\n  Added: {g.get('added_date','?')} | Intro: {intro}")
+        await _send_wa(chat_id, "\n".join(lines))
+        return
+
+    # ── ACTIVITY for specific agency (or all) ─────────────────────────────────
+    m = _OWNER_ACTIVITY_RE.search(text_s)
+    if m:
+        name_arg = m.group(2).strip()
+        agencies = [_find_agency_fuzzy(name_arg, db)] if name_arg else \
+                   db.query(Agency).filter(Agency.is_active == True).all()
+        agencies = [a for a in agencies if a]
+        lines = ["📈 *Activity today:*\n"]
+        for ag in agencies:
+            state = _day_state(ag.id)
+            hot = state.get("hot_leads", [])
+            gact = state.get("group_activity", {})
+            most_active = max(gact, key=gact.get) if gact else "—"
+            lines.append(
+                f"━━━\n🏢 *{ag.name}*\n"
+                f"❓ Questions: {state.get('questions_count', 0)}\n"
+                f"🔥 Hot leads: {len(hot)}\n"
+                f"📱 Most active group: {most_active}"
+            )
+            for lead in hot[-3:]:
+                lines.append(f"  ↳ {lead.get('group', '?')}: {str(lead.get('question', ''))[:60]}")
+        await _send_wa(chat_id, "\n".join(lines))
+        return
+
+    # ── ERROR LOG ─────────────────────────────────────────────────────────────
+    if _OWNER_ERRORS_RE.search(text_s):
+        errors = _load_error_log()[-20:]
+        if not errors:
+            await _send_wa(chat_id, "Khalas habibi — no errors logged 🎉")
+            return
+        lines = [f"⚠️ *Last {len(errors)} errors:*\n"]
+        for e in reversed(errors):
+            ag_label = f"[{e['agency']}] " if e.get("agency") else ""
+            lines.append(f"🕐 {e['time']} {ag_label}\n{e['msg'][:150]}\n")
+        await _send_wa(chat_id, "\n".join(lines))
+        return
+
+    # ── FALLBACK → AdminAgent for own agency ─────────────────────────────────
+    # Owner also has their own agency (umar) — fall through to normal admin flow
+    return False  # signal: not handled, use normal admin flow
+
+
 # ─── Admin private message ────────────────────────────────────────────────────
 
 async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
@@ -3339,7 +3523,7 @@ _DAILY_REPORT_CLOSINGS = [
 ]
 
 
-async def _send_daily_report_for_agency(agency, db):
+async def _send_daily_report_for_agency(agency, db, override_chat_id: str = ""):
     import pdf_index as _idx
     from datetime import datetime as _dt
 
@@ -3420,8 +3604,12 @@ async def _send_daily_report_for_agency(agency, db):
         f"━━━━━━━━━━━━━━━"
     )
 
-    for phone in (getattr(agency, "wa_admin_numbers", []) or []):
-        await _send_wa(f"{phone}@c.us", report)
+    if override_chat_id:
+        targets = [override_chat_id]
+    else:
+        targets = [f"{phone}@c.us" for phone in (getattr(agency, "wa_admin_numbers", []) or [])]
+    for target in targets:
+        await _send_wa(target, report)
     logger.info(f"Daily report sent for agency {agency.id}")
 
 

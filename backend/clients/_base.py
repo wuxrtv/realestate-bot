@@ -9,3 +9,4 @@ class ClientConfig:
     drive_root_id: str = ""         # ID папки Google Drive
     contact: str = "@support"       # контакт когда юнит не найден
     bot_character: str = ""         # характер Tony (пустой = стандартный)
+    is_owner: bool = False          # платформенный владелец — доступ ко всем агентствам

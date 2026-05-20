@@ -46,6 +46,12 @@ def find_by_phone(phone: str) -> ClientConfig | None:
     return _by_slug.get(slug) if slug else None
 
 
+def is_owner(phone: str) -> bool:
+    """Return True if this phone belongs to the platform owner."""
+    cfg = find_by_phone(phone)
+    return bool(cfg and cfg.is_owner)
+
+
 def get(slug: str) -> ClientConfig | None:
     return _by_slug.get(slug)
 
