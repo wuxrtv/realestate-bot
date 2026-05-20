@@ -33,6 +33,17 @@ _cancel_flags: dict[int, bool] = {}
 
 _pending_files: dict[int, dict] = {}
 
+# ─── Global broadcast stop flag (persists until "go" or next day) ────────────
+_broadcast_stopped: dict[int, bool] = {}
+
+# ─── Pending media follow-up (one-file-at-a-time in groups) ──────────────────
+# chat_id → {project_name, available: list[str], stored_at: float, agency_id: int}
+_pending_group_media: dict[str, dict] = {}
+
+# ─── Pending availability re-send confirmation ────────────────────────────────
+# agency_id → {chat_id, download_url, file_name, sender_phone}
+_pending_avail_confirm: dict[int, dict] = {}
+
 # ─── Pending brochure confirmations in groups ─────────────────────────────────
 # chat_id → {project_name, stored_at}; expires in 10 minutes
 
@@ -40,6 +51,10 @@ _pending_group_brochure: dict[str, dict] = {}
 _YES_RE = re.compile(
     r"\b(yes|yeah|yep|sure|ok|okay|yalla|send|go|go ahead|do it|send it|please"
     r"|да|ок|окей|ладно|давай|отправь)\b",
+    re.IGNORECASE,
+)
+_NO_RE = re.compile(
+    r"\b(no|нет|cancel|skip|не\s+надо|отмена|❌)\b",
     re.IGNORECASE,
 )
 _BROCHURE_OFFER_RE = re.compile(
@@ -54,6 +69,18 @@ def set_cancel(agency_id: int):
 
 def is_cancelled(agency_id: int) -> bool:
     return _cancel_flags.get(agency_id, False)
+
+
+def is_broadcast_stopped(agency_id: int) -> bool:
+    return _broadcast_stopped.get(agency_id, False)
+
+
+def set_broadcast_stopped(agency_id: int):
+    _broadcast_stopped[agency_id] = True
+
+
+def clear_broadcast_stopped(agency_id: int):
+    _broadcast_stopped.pop(agency_id, None)
 
 
 def clear_cancel(agency_id: int):
@@ -73,6 +100,7 @@ def _day_state(agency_id: int) -> dict:
             "group_activity": {},        # {group_name: count}
             "availability_sent": False,
             "availability_groups": [],   # [group_title, ...]
+            "availability_sent_at": None,  # datetime of last availability broadcast
         }
     return _daily[key]
 
@@ -90,9 +118,11 @@ def _track_broadcast(agency_id: int, slot: str, unit_type: str, unit_key: str, g
 
 
 def _track_availability(agency_id: int, group_names: list):
+    from datetime import datetime as _dt
     state = _day_state(agency_id)
     state["availability_sent"] = True
     state["availability_groups"] = list(group_names)
+    state["availability_sent_at"] = _dt.now()
 
 
 def _track_question(agency_id: int, group_name: str):
@@ -315,6 +345,22 @@ _STOP_RE = re.compile(
     r"|^нет[\s,!]*стоп"
     r"|^не\s+надо$"
     r"|^нет\s+не\s+надо",
+    re.IGNORECASE,
+)
+_GO_RE = re.compile(
+    r"^(go|resume|continue|продолжай|давай|start\s+again|go\s+ahead|возобновить)[\s!.?]*$",
+    re.IGNORECASE,
+)
+_PAYMENT_PLAN_RE = re.compile(
+    r"\b(payment\s*plan|payment|plan|рассрочк|installment|план\s*оплат|план)\b",
+    re.IGNORECASE,
+)
+_VIDEO_RE = re.compile(
+    r"\b(video|видео|tour|ролик|clip|clips|фото|photo|photos|render|renders|gallery)\b",
+    re.IGNORECASE,
+)
+_LOCATION_RE = re.compile(
+    r"\b(location|локация|where|где|address|адрес|map|карта)\b",
     re.IGNORECASE,
 )
 _TEST_SCHEDULE_RE = re.compile(
@@ -557,11 +603,15 @@ async def _broadcast_availability(
         project_name, summary, admin_name, admin_phone
     )
 
+    if is_broadcast_stopped(agency.id):
+        logger.info(f"_broadcast_availability: stopped for agency {agency.id} — skipping")
+        return 0, broadcast_text
+
     groups = _query_groups(db, agency)
     sent = 0
     sent_group_names: list[str] = []
     for i, g in enumerate(groups):
-        if is_cancelled(agency.id):
+        if is_cancelled(agency.id) or is_broadcast_stopped(agency.id):
             clear_cancel(agency.id)
             break
         if i > 0:
@@ -1063,6 +1113,10 @@ async def _send_offer_for_agency(
 
     Cost: 1 Claude API call per slot regardless of group count.
     """
+    if is_broadcast_stopped(agency.id):
+        logger.info(f"Daily offer [{slot_label}]: broadcast stopped for agency {agency.id} — skipping")
+        return {"error": "broadcast_stopped"}
+
     import pdf_index as _idx
     import drive_service as _drive
     from admin_agent import _parse_price
@@ -1191,32 +1245,121 @@ async def _respond_location_request(chat_id: str, project_name: str,
         return
 
     sent_something = False
+    available_extras: list[str] = []
 
     if svc:
-        # 1. text_location.txt — plain text, never as file
-        loc_text = await asyncio.to_thread(_drive.get_location_text, svc, project_name, root_id)
-        if loc_text:
-            await _send_wa(chat_id, loc_text)
-            await asyncio.sleep(1)
-            sent_something = True
-
-        # 2-4. Brochure PDF → Payment plan PDF → Videos
         media_files = await asyncio.to_thread(_drive.find_all_media, svc, project_name, 20, root_id)
-        for file_id, file_name, export_mime in media_files:
-            file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
-            if file_bytes:
-                await _send_wa_file(chat_id, file_bytes, file_name)
-                await asyncio.sleep(1)
+
+        # Send ONLY the brochure (sort_key=0 = first PDF with brochure keywords)
+        brochure = next(
+            ((fid, fn, em) for fid, fn, em in media_files if _drive._media_sort_key(fn) == 0),
+            None,
+        )
+        if not brochure and media_files:
+            brochure = media_files[0]  # fallback: first available file
+
+        if brochure:
+            fb = await asyncio.to_thread(_drive.download_file, svc, brochure[0], brochure[2])
+            if fb:
+                await _send_wa_file(chat_id, fb, brochure[1])
                 sent_something = True
+
+        # Detect what else is available to offer
+        has_payment = any(_drive._media_sort_key(fn) == 1 for _, fn, _ in media_files)
+        has_video   = any(_drive._media_sort_key(fn) == 4 for _, fn, _ in media_files)
+        has_photos  = any(_drive._media_sort_key(fn) == 3 for _, fn, _ in media_files)
+        has_loc     = bool(await asyncio.to_thread(_drive.get_location_text, svc, project_name, root_id))
+
+        if has_loc:
+            available_extras.append("📍 Location info")
+        if has_payment:
+            available_extras.append("📋 Payment plan")
+        if has_video or has_photos:
+            available_extras.append("🎬 Photos/Videos")
 
     if not sent_something:
         await _send_wa(chat_id,
                        f"Habibi no materials found for {project_name} 😅 Contact {contact} 🙏")
+        return
+
+    # Ask about extras (one-at-a-time rule)
+    if available_extras:
+        extras_lines = "\n".join(f"▪️ {e}" for e in available_extras)
+        await _send_wa(chat_id,
+                       f"Here's the brochure habibi 📄\n"
+                       f"Want me to also send:\n{extras_lines}\n\n"
+                       f"Just say yes or tell me what you need 🤝")
+        _pending_group_media[chat_id] = {
+            "project_name": project_name,
+            "has_location": has_loc,
+            "has_payment": has_payment,
+            "has_media": has_video or has_photos,
+            "stored_at": _time.time(),
+            "agency_id": agency.id,
+        }
+
+
+async def _handle_media_followup(chat_id: str, text: str, pending: dict, agency) -> bool:
+    """Handle follow-up after one-at-a-time brochure send. Returns True if handled."""
+    import drive_service as _drive
+    svc = _drive.get_service()
+    if not svc:
+        return False
+
+    proj = pending["project_name"]
+    root_id = getattr(agency, "drive_root_id", "") or ""
+    text_l = text.lower()
+
+    wants_payment  = bool(_PAYMENT_PLAN_RE.search(text_l))
+    wants_media    = bool(_VIDEO_RE.search(text_l))
+    wants_location = bool(_LOCATION_RE.search(text_l))
+    wants_all      = bool(_YES_RE.search(text)) and not (wants_payment or wants_media or wants_location)
+
+    if not (wants_payment or wants_media or wants_location or wants_all):
+        return False  # not a follow-up reply — let Claude handle it
+
+    _pending_group_media.pop(chat_id, None)
+
+    media_files = await asyncio.to_thread(_drive.find_all_media, svc, proj, 20, root_id)
+    sent = False
+
+    if (wants_all or wants_location) and pending.get("has_location"):
+        loc_text = await asyncio.to_thread(_drive.get_location_text, svc, proj, root_id)
+        if loc_text:
+            await _send_wa(chat_id, loc_text)
+            await asyncio.sleep(1)
+            sent = True
+
+    if (wants_all or wants_payment) and pending.get("has_payment"):
+        payment_files = [(fid, fn, em) for fid, fn, em in media_files if _drive._media_sort_key(fn) == 1]
+        for fid, fn, em in payment_files:
+            fb = await asyncio.to_thread(_drive.download_file, svc, fid, em)
+            if fb:
+                await _send_wa_file(chat_id, fb, fn)
+                await asyncio.sleep(1)
+                sent = True
+
+    if (wants_all or wants_media) and pending.get("has_media"):
+        media_only = [(fid, fn, em) for fid, fn, em in media_files if _drive._media_sort_key(fn) in (3, 4)]
+        for fid, fn, em in media_only:
+            fb = await asyncio.to_thread(_drive.download_file, svc, fid, em)
+            if fb:
+                await _send_wa_file(chat_id, fb, fn)
+                await asyncio.sleep(1)
+                sent = True
+
+    if not sent:
+        await _send_wa(chat_id, "Habibi couldn't find that 😅 Try again later 🙏")
+
+    return True
 
 
 # ─── Friday broadcast ─────────────────────────────────────────────────────────
 
 async def _friday_broadcast_for_agency(agency: Agency, db: Session):
+    if is_broadcast_stopped(agency.id):
+        logger.info(f"Friday broadcast: stopped for agency {agency.id} — skipping")
+        return
     import drive_service as _drive
     svc = _drive.get_service()
     root_id = getattr(agency, "drive_root_id", "") or ""
@@ -1426,7 +1569,8 @@ async def send_wa_morning_greeting():
         for agency in agencies:
             if not os.getenv("WA_INSTANCE_ID"):
                 continue
-            clear_cancel(agency.id)  # new day = fresh start, yesterday's "stop" is gone
+            clear_cancel(agency.id)           # new day = fresh start
+            clear_broadcast_stopped(agency.id)  # "go" restored automatically at 08:00
             pool = _MORNING_GREETINGS_FRIDAY if is_friday else _MORNING_GREETINGS
             greeting = random.choice(pool)
             for phone in (agency.wa_admin_numbers or []):
@@ -1603,7 +1747,8 @@ _INVENTORY_EXTS = (".xlsx", ".xls", ".csv")
 
 
 async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: str,
-                                 file_name: str, caption: str, db: Session, agency: Agency):
+                                 file_name: str, caption: str, db: Session, agency: Agency,
+                                 _skip_dedup: bool = False):
     """
     Smart file handler. Decision tree:
 
@@ -1665,6 +1810,25 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 
     # ── 3. Availability / inventory PDF → parse → Claude summary → broadcast + save
     if is_pdf and is_inventory:
+        # Dedup check: if already broadcast within 30 min → ask before re-sending
+        if not _skip_dedup:
+            from datetime import datetime as _dt
+            state = _day_state(agency.id)
+            sent_at = state.get("availability_sent_at")
+            if sent_at:
+                elapsed_min = int((_dt.now() - sent_at).total_seconds() / 60)
+                if elapsed_min < 30:
+                    _pending_avail_confirm[agency.id] = {
+                        "chat_id": chat_id,
+                        "download_url": download_url,
+                        "file_name": file_name,
+                        "sender_phone": sender_phone,
+                    }
+                    await _send_wa(chat_id,
+                                   f"Habibi I just sent that {elapsed_min} min ago wallah 😅\n"
+                                   "Want me to send again? ✅❌")
+                    return
+
         # Instant ack — within 3 seconds
         await _send_wa(chat_id,
                        "Got it habibi! 📥 Reading the file...\n"
@@ -1902,11 +2066,32 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
                        "Khalas habibi — memory cleared! Fresh start 🔄🔥")
         return
 
-    # Stop/cancel: halt any running broadcast immediately
+    # Stop/cancel: halt all broadcasts immediately + block future ones until "go"
     if _STOP_RE.search(text.strip()):
         set_cancel(agency.id)
+        set_broadcast_stopped(agency.id)
         _pending_files.pop(agency.id, None)
-        await _send_wa(chat_id, "Khalas habibi — stopped! ✋🔥")
+        _pending_avail_confirm.pop(agency.id, None)
+        await _send_wa(chat_id, "Stopped habibi. Nothing more going out. 🛑")
+        return
+
+    # "go" / "продолжай" — resume broadcasts after stop
+    if _GO_RE.match(text.strip()):
+        clear_broadcast_stopped(agency.id)
+        await _send_wa(chat_id, "Back online habibi 🔥 Broadcasts resumed!")
+        return
+
+    # Pending availability re-send confirmation (YES/NO)
+    if agency.id in _pending_avail_confirm:
+        pconf = _pending_avail_confirm.pop(agency.id)
+        if _YES_RE.search(text):
+            await _handle_admin_document(
+                pconf["chat_id"], pconf["sender_phone"],
+                pconf["download_url"], pconf["file_name"], "", db, agency,
+                _skip_dedup=True,
+            )
+        else:
+            await _send_wa(chat_id, "Khalas habibi — skipped ✅")
         return
 
     # Test schedule mode: simulate full day in ~60 seconds
@@ -2031,6 +2216,18 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         await _send_wa(chat_id, _tony_pitch())
         return
 
+    # ── Pending media follow-up (one-at-a-time) ──────────────────────────────
+    _pmedia = _pending_group_media.get(chat_id)
+    if _pmedia:
+        if _time.time() - _pmedia["stored_at"] > 600:
+            _pending_group_media.pop(chat_id, None)
+        else:
+            handled = await _handle_media_followup(chat_id, text, _pmedia, agency)
+            if handled:
+                return
+            # Not a media follow-up reply — clear and continue to Claude
+            _pending_group_media.pop(chat_id, None)
+
     # ── Pending brochure confirmation ─────────────────────────────────────────
     _pending = _pending_group_brochure.get(chat_id)
     if _pending:
@@ -2132,26 +2329,38 @@ async def _handle_group_message(chat_id: str, group_title: str, sender_name: str
         svc = _drive.get_service()
         sent = False
         root_id = getattr(agency, "drive_root_id", "") or ""
-        search_name = project_name  # must be an explicit project — never use random keywords
+        search_name = project_name
 
         if not search_name:
-            # Project not clear — ask which one
             proj_list = "\n".join(f"• {p.project_name}" for p in projects)
             msg = "Habibi which project? 😊"
             if proj_list:
                 msg += f"\nWe have:\n{proj_list}"
             await _send_wa(chat_id, msg)
         elif svc:
-            media_files = _drive.find_all_media(svc, search_name, limit=15, agency_root_id=root_id)
+            media_files = await asyncio.to_thread(_drive.find_all_media, svc, search_name, 15, root_id)
             if media_files:
-                await _send_wa(chat_id, f"Yalla habibi — {search_name} media incoming 📸🎬👇")
-                for file_id, file_name, export_mime in media_files:
-                    file_bytes = await asyncio.to_thread(_drive.download_file, svc, file_id, export_mime)
-                    if file_bytes:
-                        await _send_wa_file(chat_id, file_bytes, file_name)
-                sent = True
+                # One-at-a-time rule: send only the FIRST file, ask about the rest
+                first_fid, first_fn, first_em = media_files[0]
+                fb = await asyncio.to_thread(_drive.download_file, svc, first_fid, first_em)
+                if fb:
+                    await _send_wa_file(chat_id, fb, first_fn)
+                    sent = True
+                    if len(media_files) > 1:
+                        remaining = len(media_files) - 1
+                        await _send_wa(chat_id,
+                                       f"Here you go habibi 📸\n"
+                                       f"I have {remaining} more file(s) — want me to send them?\n"
+                                       f"Just say *yes* 🤝")
+                        _pending_group_media[chat_id] = {
+                            "project_name": search_name,
+                            "has_location": False,
+                            "has_payment": any(_drive._media_sort_key(fn) == 1 for _, fn, _ in media_files),
+                            "has_media": len(media_files) > 1,
+                            "stored_at": _time.time(),
+                            "agency_id": agency.id,
+                        }
             if not sent:
-                # Media not found in Drive — notify all admins
                 await _send_wa(chat_id, "Give me a sec habibi 🙏")
                 admin_numbers = getattr(agency, "wa_admin_numbers", []) or []
                 notif = (
@@ -2859,10 +3068,13 @@ def _query_groups(db: Session, agency: Agency):
 
 
 async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> int:
+    if is_broadcast_stopped(agency.id):
+        logger.info(f"announce_to_wa_groups: stopped for agency {agency.id} — skipping")
+        return 0
     groups = _query_groups(db, agency)
     sent = 0
     for i, g in enumerate(groups):
-        if is_cancelled(agency.id):
+        if is_cancelled(agency.id) or is_broadcast_stopped(agency.id):
             clear_cancel(agency.id)
             break
         if i > 0:
@@ -2875,10 +3087,13 @@ async def announce_to_wa_groups(db: Session, message: str, agency: Agency) -> in
 async def announce_file_to_wa_groups(db: Session, file_bytes: bytes, file_name: str,
                                      caption: str, agency: Agency) -> int:
     """Send a file to all active WhatsApp groups."""
+    if is_broadcast_stopped(agency.id):
+        logger.info(f"announce_file_to_wa_groups: stopped for agency {agency.id} — skipping")
+        return 0
     groups = _query_groups(db, agency)
     sent = 0
     for i, g in enumerate(groups):
-        if is_cancelled(agency.id):
+        if is_cancelled(agency.id) or is_broadcast_stopped(agency.id):
             clear_cancel(agency.id)
             break
         if i > 0:
