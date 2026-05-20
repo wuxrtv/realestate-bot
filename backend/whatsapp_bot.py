@@ -2461,16 +2461,36 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
 
 # ─── Owner (Umar) cross-agency dashboard ─────────────────────────────────────
 
-_OWNER_AGENCY_RE  = re.compile(r"\b(agencies|агентств|admins|клиент|all agents|все)\b", re.IGNORECASE)
-_OWNER_REPORT_RE  = re.compile(r"\b(report|отчет|отчёт)\b\s+(\S+)", re.IGNORECASE)
-_OWNER_GROUPS_RE  = re.compile(r"\b(groups|группы)\b\s+(\S+)", re.IGNORECASE)
-_OWNER_ERRORS_RE  = re.compile(r"\b(errors|ошибки|error log|логи)\b", re.IGNORECASE)
-_OWNER_ACTIVITY_RE = re.compile(r"\b(activity|активность|stats|stat)\b\s*(\S*)", re.IGNORECASE)
+# Intent detection — matches anywhere in natural language text
+_OWNER_INTENT_GROUPS   = re.compile(r"\b(группы|групп|group|groups)\b", re.IGNORECASE)
+_OWNER_INTENT_REPORT   = re.compile(r"\b(отчет|отчёт|report)\b", re.IGNORECASE)
+_OWNER_INTENT_ACTIVITY = re.compile(r"\b(активность|активности|activity|запросы|лиды|leads|stats|вопросы)\b", re.IGNORECASE)
+_OWNER_INTENT_AGENCIES = re.compile(r"\b(агентства|агентств|агентствах|agencies|admins|клиентов|все агентства|всех агентств)\b", re.IGNORECASE)
+_OWNER_INTENT_ERRORS   = re.compile(r"\b(ошибки|ошибок|ошибку|errors|error|логи|крашился|упал)\b", re.IGNORECASE)
+
+# Stop words stripped before agency name extraction
+_OWNER_STOP_WORDS = {
+    "покажи", "покажь", "дай", "дайте", "посмотри", "посмотрите", "проверь",
+    "у", "для", "по", "от", "на", "за", "с", "в", "к", "об", "из",
+    "мне", "пожалуйста", "плиз", "пж",
+    "все", "всех", "всем",
+    "группы", "групп", "группа", "group", "groups",
+    "отчет", "отчёт", "отчета", "report",
+    "активность", "activity", "запросы", "лиды", "leads", "вопросы", "stats",
+    "агентства", "агентств", "agencies", "admins", "клиентов",
+    "ошибки", "ошибок", "errors", "error", "логи",
+    "сколько", "какие", "что", "как", "есть", "нет",
+    "show", "get", "list", "check", "give", "tell",
+    "tony", "тони", "бот", "bot",
+    "hi", "hello", "hey", "please",
+}
 
 
 def _find_agency_fuzzy(query: str, db) -> "Agency | None":
     from models import Agency
     q = query.lower().strip()
+    if not q:
+        return None
     agencies = db.query(Agency).filter(Agency.is_active == True).all()
     # Exact slug
     for ag in agencies:
@@ -2479,6 +2499,29 @@ def _find_agency_fuzzy(query: str, db) -> "Agency | None":
     # Partial slug or name
     for ag in agencies:
         if q in ag.slug.lower() or q in (ag.name or "").lower():
+            return ag
+    # Prefix match (e.g. "hamid" → "hamidulloh")
+    for ag in agencies:
+        if ag.slug.lower().startswith(q) or (ag.name or "").lower().startswith(q):
+            return ag
+    return None
+
+
+def _extract_agency_from_text(text: str, db) -> "Agency | None":
+    """Extract agency name from natural language by trying words/bigrams after removing stop words."""
+    words = re.split(r"[\s,!?]+", text.lower())
+    # Filter stop words
+    candidates = [w for w in words if w and w not in _OWNER_STOP_WORDS and len(w) > 2]
+    # Try each candidate word
+    for w in candidates:
+        ag = _find_agency_fuzzy(w, db)
+        if ag:
+            return ag
+    # Try bigrams (consecutive pairs)
+    for i in range(len(candidates) - 1):
+        phrase = f"{candidates[i]} {candidates[i+1]}"
+        ag = _find_agency_fuzzy(phrase, db)
+        if ag:
             return ag
     return None
 
@@ -2492,88 +2535,99 @@ async def _handle_owner_message(chat_id: str, text: str, db: Session):
     text_s = text.strip()
 
     # ── HELP ─────────────────────────────────────────────────────────────────
-    if text_s.lower() in ("help", "помощь", "/help", "commands"):
+    if re.search(r"\b(help|помощь|команды|commands)\b", text_s, re.IGNORECASE) and len(text_s) < 30:
         await _send_wa(
             chat_id,
             "🔑 *Owner commands habibi:*\n\n"
-            "• *agencies* — all agencies + stats\n"
-            "• *report [name]* — full daily report for an agency\n"
-            "• *groups [name]* — list all groups for an agency\n"
-            "• *activity [name]* — today's questions + hot leads\n"
-            "• *errors* — last 20 system errors\n\n"
-            "Example: `report hamidulloh` | `groups khamid` | `agencies`"
+            "• *агентства* / agencies — все агентства и статистика\n"
+            "• *отчет [имя]* / report [name] — отчет по агентству\n"
+            "• *группы [имя]* / groups [name] — группы агентства\n"
+            "• *активность [имя]* / activity [name] — запросы и лиды\n"
+            "• *ошибки* / errors — последние 20 ошибок\n\n"
+            "Пишешь как хочешь — покажи группы hamida, сколько групп у khamid, дай отчет umar"
         )
         return
 
+    # ── DETECT INTENT ─────────────────────────────────────────────────────────
+    want_groups   = bool(_OWNER_INTENT_GROUPS.search(text_s))
+    want_report   = bool(_OWNER_INTENT_REPORT.search(text_s))
+    want_activity = bool(_OWNER_INTENT_ACTIVITY.search(text_s))
+    want_agencies = bool(_OWNER_INTENT_AGENCIES.search(text_s))
+    want_errors   = bool(_OWNER_INTENT_ERRORS.search(text_s))
+
     # ── ALL AGENCIES ─────────────────────────────────────────────────────────
-    if _OWNER_AGENCY_RE.search(text_s):
+    # Triggered when asking about all agencies with no specific agency name,
+    # or when explicitly asking about all agencies
+    if want_agencies and not want_groups and not want_report and not want_activity:
         agencies = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.name).all()
-        lines = [f"📊 *All agencies ({len(agencies)}):*\n"]
+        lines = [f"📊 *Все агентства ({len(agencies)}):*\n"]
         for ag in agencies:
-            groups  = group_registry.get_groups(ag.id)
+            groups   = group_registry.get_groups(ag.id)
             idx_info = _idx.index_info(ag.id)
-            state   = _day_state(ag.id)
-            bcast   = state.get("broadcasts_sent", [])
-            avail   = "✅" if state.get("availability_sent") else "❌"
+            state    = _day_state(ag.id)
+            bcast    = state.get("broadcasts_sent", [])
+            avail    = "✅" if state.get("availability_sent") else "❌"
             lines.append(
                 f"━━━\n"
                 f"🏢 *{ag.name}* (`{ag.slug}`)\n"
-                f"📱 Groups: {len(groups)}\n"
-                f"🗄️ Units indexed: {idx_info.get('count', 0)}\n"
-                f"📋 Availability today: {avail}\n"
-                f"📤 Broadcasts today: {len(bcast)}\n"
-                f"❓ Questions today: {state.get('questions_count', 0)}\n"
-                f"🔥 Hot leads today: {len(state.get('hot_leads', []))}"
+                f"📱 Групп: {len(groups)}\n"
+                f"🗄️ Юнитов в базе: {idx_info.get('count', 0)}\n"
+                f"📋 Availability сегодня: {avail}\n"
+                f"📤 Broadcasts сегодня: {len(bcast)}\n"
+                f"❓ Вопросов сегодня: {state.get('questions_count', 0)}\n"
+                f"🔥 Горячих лидов: {len(state.get('hot_leads', []))}"
             )
         await _send_wa(chat_id, "\n".join(lines))
         return
 
-    # ── REPORT for specific agency ────────────────────────────────────────────
-    m = _OWNER_REPORT_RE.search(text_s)
-    if m:
-        ag = _find_agency_fuzzy(m.group(2), db)
+    # ── GROUPS for specific agency ────────────────────────────────────────────
+    if want_groups:
+        ag = _extract_agency_from_text(text_s, db)
         if not ag:
-            await _send_wa(chat_id, f"Habibi agency '{m.group(2)}' not found 😅\nTry: `agencies` to see all names")
+            # No agency found — show all agencies group counts
+            agencies = db.query(Agency).filter(Agency.is_active == True).order_by(Agency.name).all()
+            lines = ["📱 *Группы по агентствам:*\n"]
+            for a in agencies:
+                gs = group_registry.get_groups(a.id)
+                lines.append(f"🏢 *{a.name}*: {len(gs)} групп")
+            await _send_wa(chat_id, "\n".join(lines))
+            return
+        groups = group_registry.get_groups(ag.id)
+        if not groups:
+            await _send_wa(chat_id, f"У *{ag.name}* нет зарегистрированных групп 😅")
+            return
+        lines = [f"📱 *{ag.name}* — {len(groups)} групп:\n"]
+        for g in groups:
+            intro = "✅" if g.get("intro_sent") else "—"
+            lines.append(f"• {g['name']}\n  Добавлено: {g.get('added_date','?')} | Интро: {intro}")
+        await _send_wa(chat_id, "\n".join(lines))
+        return
+
+    # ── REPORT for specific agency ────────────────────────────────────────────
+    if want_report:
+        ag = _extract_agency_from_text(text_s, db)
+        if not ag:
+            await _send_wa(chat_id, "Habibi, не понял агентство 😅\nНапиши: *отчет hamidulloh* или *agencies* чтобы посмотреть все")
             return
         await _send_daily_report_for_agency(ag, db, override_chat_id=chat_id)
         return
 
-    # ── GROUPS for specific agency ────────────────────────────────────────────
-    m = _OWNER_GROUPS_RE.search(text_s)
-    if m:
-        ag = _find_agency_fuzzy(m.group(2), db)
-        if not ag:
-            await _send_wa(chat_id, f"Habibi agency '{m.group(2)}' not found 😅")
-            return
-        groups = group_registry.get_groups(ag.id)
-        if not groups:
-            await _send_wa(chat_id, f"No groups registered for *{ag.name}* habibi 😅")
-            return
-        lines = [f"📱 *{ag.name}* — {len(groups)} group(s):\n"]
-        for g in groups:
-            intro = "✅" if g.get("intro_sent") else "—"
-            lines.append(f"• {g['name']}\n  Added: {g.get('added_date','?')} | Intro: {intro}")
-        await _send_wa(chat_id, "\n".join(lines))
-        return
-
     # ── ACTIVITY for specific agency (or all) ─────────────────────────────────
-    m = _OWNER_ACTIVITY_RE.search(text_s)
-    if m:
-        name_arg = m.group(2).strip()
-        agencies = [_find_agency_fuzzy(name_arg, db)] if name_arg else \
-                   db.query(Agency).filter(Agency.is_active == True).all()
-        agencies = [a for a in agencies if a]
-        lines = ["📈 *Activity today:*\n"]
-        for ag in agencies:
-            state = _day_state(ag.id)
+    if want_activity:
+        ag = _extract_agency_from_text(text_s, db)
+        targets = [ag] if ag else db.query(Agency).filter(Agency.is_active == True).all()
+        targets = [a for a in targets if a]
+        lines = ["📈 *Активность сегодня:*\n"]
+        for a in targets:
+            state = _day_state(a.id)
             hot = state.get("hot_leads", [])
             gact = state.get("group_activity", {})
             most_active = max(gact, key=gact.get) if gact else "—"
             lines.append(
-                f"━━━\n🏢 *{ag.name}*\n"
-                f"❓ Questions: {state.get('questions_count', 0)}\n"
-                f"🔥 Hot leads: {len(hot)}\n"
-                f"📱 Most active group: {most_active}"
+                f"━━━\n🏢 *{a.name}*\n"
+                f"❓ Вопросов: {state.get('questions_count', 0)}\n"
+                f"🔥 Горячих лидов: {len(hot)}\n"
+                f"📱 Самая активная группа: {most_active}"
             )
             for lead in hot[-3:]:
                 lines.append(f"  ↳ {lead.get('group', '?')}: {str(lead.get('question', ''))[:60]}")
@@ -2581,12 +2635,12 @@ async def _handle_owner_message(chat_id: str, text: str, db: Session):
         return
 
     # ── ERROR LOG ─────────────────────────────────────────────────────────────
-    if _OWNER_ERRORS_RE.search(text_s):
+    if want_errors:
         errors = _load_error_log()[-20:]
         if not errors:
-            await _send_wa(chat_id, "Khalas habibi — no errors logged 🎉")
+            await _send_wa(chat_id, "Khalas habibi — ошибок нет 🎉")
             return
-        lines = [f"⚠️ *Last {len(errors)} errors:*\n"]
+        lines = [f"⚠️ *Последние {len(errors)} ошибок:*\n"]
         for e in reversed(errors):
             ag_label = f"[{e['agency']}] " if e.get("agency") else ""
             lines.append(f"🕐 {e['time']} {ag_label}\n{e['msg'][:150]}\n")
