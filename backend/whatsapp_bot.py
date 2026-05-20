@@ -311,7 +311,10 @@ logger = logging.getLogger(__name__)
 
 _BOT_NAMES = re.compile(r"\bтони\b|\btoni\b|\btony\b", re.IGNORECASE)
 _STOP_RE = re.compile(
-    r"^(stop|стоп|стопп|cancel|отмена|отмени|хватит|достаточно|stop it|нет не надо)[\s!.?]*$",
+    r"\b(stop|стоп+|cancel|отмена|отмени|хватит|достаточно)\b"
+    r"|^нет[\s,!]*стоп"
+    r"|^не\s+надо$"
+    r"|^нет\s+не\s+надо",
     re.IGNORECASE,
 )
 _TEST_SCHEDULE_RE = re.compile(
@@ -1665,7 +1668,14 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
         # Instant ack — within 3 seconds
         await _send_wa(chat_id,
                        "Got it habibi! 📥 Reading the file...\n"
-                       "Blasting to groups right after khalas 🔥")
+                       "Blasting to groups right after khalas 🔥\n"
+                       "_(send *стоп* now to cancel)_")
+        # 4-second window: admin can send "стоп" before broadcast starts
+        await asyncio.sleep(4)
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            await _send_wa(chat_id, "Khalas habibi — cancelled! ✋🔥")
+            return
         try:
             async with httpx.AsyncClient(timeout=60) as client:
                 file_bytes = (await client.get(download_url)).content
@@ -1757,7 +1767,15 @@ async def _handle_admin_document(chat_id: str, sender_phone: str, download_url: 
             else _project_name_from_file(file_name) if is_pdf
             else normalize_project_name(file_name)
         )
-        await _send_wa(chat_id, f"📊 Got it — reading *{file_name}* for *{detected_name}*...")
+        await _send_wa(chat_id,
+                       f"📊 Got it — reading *{file_name}* for *{detected_name}*...\n"
+                       "_(send *стоп* now to cancel)_")
+        # 4-second window: admin can send "стоп" before broadcast starts
+        await asyncio.sleep(4)
+        if is_cancelled(agency.id):
+            clear_cancel(agency.id)
+            await _send_wa(chat_id, "Khalas habibi — cancelled! ✋🔥")
+            return
 
         try:
             async with httpx.AsyncClient(timeout=60) as client:
@@ -1885,8 +1903,9 @@ async def _handle_admin_message(chat_id: str, sender_phone: str, text: str,
         return
 
     # Stop/cancel: halt any running broadcast immediately
-    if _STOP_RE.match(text.strip()):
+    if _STOP_RE.search(text.strip()):
         set_cancel(agency.id)
+        _pending_files.pop(agency.id, None)
         await _send_wa(chat_id, "Khalas habibi — stopped! ✋🔥")
         return
 
